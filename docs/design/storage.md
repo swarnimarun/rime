@@ -445,22 +445,28 @@ pub const Store = struct {
     pub fn putFile(store: *Store, io: Io, src: Io.File, kind: Kind) PutError!Digest;
     pub fn putBytes(store: *Store, io: Io, bytes: []const u8, kind: Kind) PutError!Digest;
 
-    pub fn exists(store: *Store, digest: Digest) bool;
+    pub fn exists(store: *Store, io: Io, digest: Digest) bool;
     pub fn readObject(store: *Store, io: Io, digest: Digest, gpa: Allocator) ReadError![]u8;
 
     /// clone-or-copy into dest; never hardlinks. Returns how it was written.
-    pub fn materialize(store: *Store, io: Io, digest: Digest, dest: MaterializeDest) MaterializeError!MaterializeMethod;
+    /// `mode` is the final file mode (e.g. 0o755 for executables, 0o444 otherwise).
+    pub fn materialize(store: *Store, io: Io, digest: Digest, dest_path: []const u8, mode: u32) MaterializeError!MaterializeMethod;
 
     pub fn putManifest(store: *Store, io: Io, manifest: Manifest) PutError!Digest;
     pub fn getManifest(store: *Store, io: Io, gpa: Allocator, digest: Digest) ReadError!Manifest;
 
-    pub fn pin(store: *Store, io: Io, digest: Digest, name: []const u8) StateError!void;
+    pub fn pin(store: *Store, io: Io, name: []const u8, digest: Digest) StateError!void;
     pub fn unpin(store: *Store, io: Io, name: []const u8) StateError!void;
-    pub fn lease(store: *Store, io: Io, build_id: BuildId) StateError!Lease;
+    pub fn leasePut(store: *Store, io: Io, build_id: []const u8, digests: []const Digest) StateError!void;
+    pub fn leaseRenew(store: *Store, io: Io, build_id: []const u8) StateError!void;
+    pub fn leaseDrop(store: *Store, io: Io, build_id: []const u8) StateError!void;
     pub fn retainProject(store: *Store, io: Io, project: ProjectId, manifests: []const Digest) StateError!void;
 
     pub fn gc(store: *Store, io: Io, gpa: Allocator, policy: GcPolicy) GcError!GcReport;
     pub fn stats(store: *Store, io: Io, gpa: Allocator) StatsError!Stats;
+
+    // Also implemented (see src/store/root.zig): verifyObject, putAction/getAction,
+    // demote/promote (cold tier), tryGcLock/unlock (GC exclusion, §8.2).
 };
 ```
 
