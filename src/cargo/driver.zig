@@ -416,7 +416,7 @@ test "unit graph rejects non lib-bin targets loudly" {
     // Inject a test-only target (the manifest surface never produces one:
     // [test]/[bench]/[example] sections parse-and-ignore in M1, so this
     // pins the driver's loud rejection for when the surface grows).
-    var weird = [_]manifest_mod.TargetDesc{.{ .name = "weird", .path = null, .kind = .@"test" }};
+    var weird = [_]manifest_mod.TargetDesc{.{ .name = "weird", .path = null, .kind = .@"test", .proc_macro = false }};
     ws.members[0].manifest.targets = &weird;
 
     const v = try @import("semver.zig").Version.parse("0.1.0");

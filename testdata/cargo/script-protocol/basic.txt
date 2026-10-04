@@ -1,0 +1,10 @@
+some noise from cc
+cargo::rustc-cfg=has_build_script
+cargo::rustc-check-cfg=cfg(has_build_script)
+cargo::rustc-link-lib=foo
+cargo::rustc-link-search=native=/tmp/lib
+cargo:rustc-env=OLD_VAR=1
+cargo:mykey=myvalue
+cargo::rerun-if-changed=build.rs
+cargo::rerun-if-env-changed=MY_ENV
+cargo::warning=be careful

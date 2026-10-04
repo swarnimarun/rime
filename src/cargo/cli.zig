@@ -11,6 +11,8 @@ const workspace_mod = @import("workspace.zig");
 const view_mod = @import("view.zig");
 const pipeline_mod = @import("pipeline.zig");
 const toolchain_mod = @import("toolchain.zig");
+const script_mod = @import("script.zig");
+const profile_mod = @import("profile.zig");
 
 const Workspace = workspace_mod.Workspace;
 
@@ -242,6 +244,66 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, opts: Options, stdout: *std.Io.Wr
     return runBuild(gpa, io, opts, stdout, stderr);
 }
 
+/// M5 build-script plan options for `--dry-run` display planning: no
+/// toolchain probe (no spawn), so the toolchain-bound fields are
+/// placeholders the M4 driver resolves for real runs (runPipelineBuild
+/// below overwrites them with probed values). Units built from these never
+/// execute — they feed unit-plan envelopes + links checks only.
+fn scriptPlanOptions(opts: Options) script_mod.PlanOptions {
+    const prof = profile_mod.profileFor(opts.profile);
+    return .{
+        .target_triple = opts.target_triple,
+        .host_triple = opts.target_triple orelse "unknown-host",
+        .profile_name = opts.profile,
+        .opt_level = prof.opt_level,
+        .debug_assertions = prof.debug_assertions,
+        .toolchain_id = "unknown-toolchain",
+        .project_tag = "unknown-project",
+    };
+}
+
+/// Cargo-exact links-conflict report (exit 101): names both packages from
+/// the first conflicting pair; falls back to a nameless line when the
+/// re-scan itself fails (error path only).
+fn reportLinksConflict(gpa: std.mem.Allocator, io: std.Io, ws: *const Workspace, stderr: *std.Io.Writer) u8 {
+    const pair = script_mod.findLinksConflict(gpa, io, ws) catch null;
+    if (pair) |p| {
+        defer p.deinit(gpa);
+        stderr.print("error: multiple packages link to native library '{s}': {s} v{s}, {s} v{s}\n", .{ p.links, p.a_package, p.a_version, p.b_package, p.b_version }) catch {};
+    } else {
+        stderr.print("error: multiple packages link to the same native library\n", .{}) catch {};
+    }
+    return ExitCode.build_failed;
+}
+
+/// `links` key with no build script (and no M6 `[target.<triple>] links`
+/// override surface): loud `need links-override`, exit 1 (same D5 shape as
+/// the M1 `need source` error). Null means continue.
+fn scriptPrechecks(gpa: std.mem.Allocator, io: std.Io, ws: *const Workspace, units: []const script_mod.ScriptUnit, stderr: *std.Io.Writer) ?u8 {
+    const missing = script_mod.linksWithoutScript(gpa, io, ws, units) catch |e| {
+        stderr.print("error: cannot plan build scripts: {t}\n", .{e}) catch {};
+        return ExitCode.usage;
+    };
+    defer if (missing) |m| gpa.free(m);
+    if (missing) |links| {
+        stderr.print("need links-override: {s} requires M6 config parsing\n", .{links}) catch {};
+        return ExitCode.usage;
+    }
+    return null;
+}
+
+/// First workspace member whose `[lib]` target sets `proc-macro = true`, or
+/// null. M5 boundary: non-dry-run builds on such workspaces stop loud until
+/// M4 passes `--extern` to rustc (the dylib ingest itself is Task-7 tested).
+fn findProcMacroLib(ws: *const Workspace) ?[]const u8 {
+    for (ws.members) |*m| {
+        for (m.manifest.targets) |t| {
+            if (t.kind == .lib and t.proc_macro) return m.name;
+        }
+    }
+    return null;
+}
+
 fn runBuild(gpa: std.mem.Allocator, io: std.Io, opts: Options, stdout: *std.Io.Writer, stderr: *std.Io.Writer) u8 {
     var ws = loadWorkspace(gpa, io, opts, stderr) orelse return ExitCode.usage;
     defer ws.deinit();
@@ -290,6 +352,40 @@ fn runBuild(gpa: std.mem.Allocator, io: std.Io, opts: Options, stdout: *std.Io.W
             };
         } else {
             stderr.print("Compiling {s} v{s} ({s})\n", .{ u.package, u.version, u.target }) catch {};
+        }
+    }
+
+    // M5 scripts (additive): workspace-derived script units print as
+    // unit-plan envelopes (target `build-script-<pkg>`); nothing runs under
+    // --dry-run. Links conflicts fail 101 cargo-exact; links-without-script
+    // needs M6 overrides (exit 1).
+    const script_units = script_mod.planScripts(gpa, io, &ws, scriptPlanOptions(opts), stderr) catch |e| {
+        if (e == error.DuplicateLinks) return reportLinksConflict(gpa, io, &ws, stderr);
+        stderr.print("error: cannot plan build scripts: {t}\n", .{e}) catch {};
+        return ExitCode.usage;
+    };
+    defer script_mod.deinitPlanUnits(gpa, script_units);
+    if (scriptPrechecks(gpa, io, &ws, script_units, stderr)) |code| return code;
+    for (script_units) |su| {
+        const target = std.fmt.allocPrint(gpa, "build-script-{s}", .{su.package}) catch {
+            stderr.print("error: out of memory\n", .{}) catch {};
+            return ExitCode.usage;
+        };
+        defer gpa.free(target);
+        if (opts.message_format == .json) {
+            const env = JsonEnvelope{
+                .reason = "unit-plan",
+                .package = su.package,
+                .target = target,
+                .profile = opts.profile,
+                .success = true,
+            };
+            env.writeLine(stdout) catch {
+                stderr.print("error: failed to write output\n", .{}) catch {};
+                return ExitCode.usage;
+            };
+        } else {
+            stderr.print("Compiling {s} v{s} ({s})\n", .{ su.package, su.version, target }) catch {};
         }
     }
 
@@ -347,6 +443,29 @@ fn runPipelineBuild(gpa: std.mem.Allocator, io: std.Io, ws: *const Workspace, op
         return ExitCode.usage;
     };
     defer tc.deinit(gpa);
+    // M5 script prechecks with probed toolchain identity (additive early
+    // loud errors; the per-unit compile→runUnit→persist loop is M4's).
+    {
+        const tid = tc.tag(gpa) catch |e| {
+            stderr.print("error: rustc probe failed ({t}); install rustc or set $RUSTC\n", .{e}) catch {};
+            return ExitCode.usage;
+        };
+        defer gpa.free(tid);
+        var popts = scriptPlanOptions(opts);
+        popts.host_triple = tc.host_target;
+        popts.toolchain_id = tid;
+        const sunits = script_mod.planScripts(gpa, io, ws, popts, stderr) catch |e| {
+            if (e == error.DuplicateLinks) return reportLinksConflict(gpa, io, ws, stderr);
+            stderr.print("error: cannot plan build scripts: {t}\n", .{e}) catch {};
+            return ExitCode.usage;
+        };
+        defer script_mod.deinitPlanUnits(gpa, sunits);
+        if (scriptPrechecks(gpa, io, ws, sunits, stderr)) |code| return code;
+        if (findProcMacroLib(ws)) |pkg| {
+            stderr.print("need driver: proc-macro dependents require M4 rustc invocation ({s})\n", .{pkg}) catch {};
+            return ExitCode.usage;
+        }
+    }
     const cache_dir = cacheRoot(gpa) catch {
         stderr.print("error: cannot determine cache directory\n", .{}) catch {};
         return ExitCode.usage;

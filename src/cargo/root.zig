@@ -22,6 +22,7 @@ pub const actionkey = @import("actionkey.zig");
 pub const invoke = @import("invoke.zig");
 pub const compile = @import("compile.zig");
 pub const pipeline = @import("pipeline.zig");
+pub const script = @import("script.zig");
 
 // Same pattern as src/store/root.zig: referencing each submodule from a
 // test block pulls its inline `test "…"` blocks into `zig build test`.
@@ -47,4 +48,5 @@ test {
     _ = @import("invoke.zig");
     _ = @import("compile.zig");
     _ = @import("pipeline.zig");
+    _ = @import("script.zig");
 }

@@ -11,7 +11,16 @@ pub const DependencyKind = union(enum) {
     workspace_inherit: void, // { workspace = true }
 };
 pub const GitSpec = struct { url: []const u8, ref: ?[]const u8 };
-pub const TargetDesc = struct { name: []const u8, path: ?[]const u8, kind: TargetKind };
+// `proc_macro` is `[lib] proc-macro = true` (false everywhere else, including
+// every `[[bin]]` — proc-macro is lib-only). No default: every struct
+// literal must set the field, so the compiler rejects sites that forget it.
+// There is no `[lib]`-key allow-list to extend (M1 `parseManifest` filters
+// only `[package]` keys via `checkPackageKeys`), so unknown `[lib]` keys
+// stay parsed-and-ignored here by construction, not by check.
+// The future workspace-task default synthesis (M1 leaves `targets` empty
+// when no `[lib]`/`[[bin]]` exists) must set `.proc_macro = false` on its
+// synthesized literal — the missing-field error enforces it.
+pub const TargetDesc = struct { name: []const u8, path: ?[]const u8, kind: TargetKind, proc_macro: bool };
 // `test` is a Zig keyword, so the field is declared escaped: its identifier
 // is still `test` (@tagName returns "test"), spelled `.@"test"` at use sites.
 pub const TargetKind = enum { lib, bin, example, @"test", bench };
@@ -185,6 +194,7 @@ pub fn parseManifest(gpa: std.mem.Allocator, text: []const u8) ManifestError!Man
             .name = try targetName(alloc, lt, m.pkg, .lib),
             .path = optionalString(lt, "path"),
             .kind = .lib,
+            .proc_macro = try optionalProcMacro(lt),
         });
     }
     if (doc.root.get("bin")) |bv| {
@@ -196,6 +206,7 @@ pub fn parseManifest(gpa: std.mem.Allocator, text: []const u8) ManifestError!Man
                 .name = try targetName(alloc, bt, m.pkg, .bin),
                 .path = optionalString(bt, "path"),
                 .kind = .bin,
+                .proc_macro = false,
             });
         }
     }
@@ -248,6 +259,14 @@ fn requiredString(t: *const toml.TomlTable, key: []const u8) ManifestError![]con
     const v = t.get(key) orelse return ManifestError.InvalidManifest;
     if (v.* != .string) return ManifestError.InvalidManifest;
     return v.string;
+}
+
+/// `[lib] proc-macro`: `true`/`false` verbatim, absent means `false`,
+/// non-boolean is `InvalidManifest` (cargo rejects it at manifest parse).
+fn optionalProcMacro(t: *const toml.TomlTable) ManifestError!bool {
+    const v = t.get("proc-macro") orelse return false;
+    if (v.* != .boolean) return ManifestError.InvalidManifest;
+    return v.boolean;
 }
 
 fn optionalString(t: *const toml.TomlTable, key: []const u8) ?[]const u8 {
@@ -1484,6 +1503,21 @@ test "resolver field validates" {
     try std.testing.expectError(ManifestSurfaceError.InvalidManifest, parseManifestExt(gpa, "[workspace]\nresolver = \"4\"\n", "Cargo.toml"));
     // from_manifest wording, verbatim.
     try std.testing.expect(std.mem.indexOf(u8, surfaceDiagnostic().?, "`resolver` setting `4` is not valid, valid options are \"1\", \"2\" or \"3\"") != null);
+}
+
+test "lib proc-macro flag parses" {
+    // [lib] proc-macro = true sets the flag; absent means false; bins never
+    // carry it; a non-boolean is InvalidManifest (cargo rejects it at parse).
+    var m = try parseManifest(std.testing.allocator, "[package]\nname = \"m\"\nversion = \"0.1.0\"\n[lib]\nproc-macro = true\n");
+    defer m.deinit();
+    try std.testing.expect(m.targets[0].proc_macro);
+    var plain = try parseManifest(std.testing.allocator, "[package]\nname = \"m\"\nversion = \"0.1.0\"\n[lib]\nname = \"m\"\n");
+    defer plain.deinit();
+    try std.testing.expect(!plain.targets[0].proc_macro);
+    var bins = try parseManifest(std.testing.allocator, "[package]\nname = \"m\"\nversion = \"0.1.0\"\n[[bin]]\nname = \"tool\"\n");
+    defer bins.deinit();
+    try std.testing.expect(!bins.targets[0].proc_macro);
+    try std.testing.expectError(ManifestError.InvalidManifest, parseManifest(std.testing.allocator, "[package]\nname = \"m\"\nversion = \"0.1.0\"\n[lib]\nproc-macro = \"yes\"\n"));
 }
 
 test "manifest parses the validation corpus roots" {

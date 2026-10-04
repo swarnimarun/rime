@@ -1,0 +1,2 @@
+cargo::metadata=root=/tmp/native-root
+cargo::metadata=includedir=/tmp/native-root/include

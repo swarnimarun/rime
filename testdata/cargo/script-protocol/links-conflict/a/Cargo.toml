@@ -1,0 +1,8 @@
+[package]
+name = "a"
+version = "1.0.0"
+edition = "2021"
+links = "native-dup"
+
+[lib]
+path = "src/lib.rs"
