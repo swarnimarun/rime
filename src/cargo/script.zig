@@ -1475,7 +1475,12 @@ pub const ProcMacroArtifact = struct {
 /// because the driver cannot yet attribute the failure to the right unit).
 pub fn planScripts(gpa: std.mem.Allocator, io: Io, ws: *const workspace_mod.Workspace, opts: PlanOptions, stderr: *Io.Writer) PlanError![]ScriptUnit {
     var units: std.ArrayList(ScriptUnit) = .empty;
-    errdefer units.deinit(gpa);
+    errdefer {
+        // Error paths (validateLinks conflicts, OOM) must free the gpa-owned
+        // links dupes of every already-collected unit, not just the buffer.
+        for (units.items) |u| if (u.links) |l| gpa.free(l);
+        units.deinit(gpa);
+    }
     for (ws.members) |*m| {
         const manifest_abs = try std.fs.path.join(gpa, &.{ m.dir, "Cargo.toml" });
         defer gpa.free(manifest_abs);
