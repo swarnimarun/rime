@@ -333,11 +333,11 @@ pub fn writeViewMeta(gpa: std.mem.Allocator, io: std.Io, ws_root: []const u8, pr
     const meta_rel = relPath(gpa, ws_root, meta_path) catch return ViewError.OutOfMemory;
     defer gpa.free(meta_rel);
     {
-        var out: std.Io.Writer.Allocating = .initCapacity(gpa, 1024) catch return ViewError.OutOfMemory;
+        var out: std.Io.Writer.Allocating = try .initCapacity(gpa, 1024);
         defer out.deinit();
         std.json.Stringify.value(meta, .{}, &out.writer) catch return ViewError.OutOfMemory;
         out.writer.writeAll("\n") catch return ViewError.OutOfMemory;
-        const bytes = out.toOwnedSlice() catch return ViewError.OutOfMemory;
+        const bytes = try out.toOwnedSlice();
         defer gpa.free(bytes);
         // Layout paths are absolute (ws_root comes absolutized from
         // discover), so write through cwd with absolute sub-paths.
@@ -348,11 +348,11 @@ pub fn writeViewMeta(gpa: std.mem.Allocator, io: std.Io, ws_root: []const u8, pr
     const last_rel = relPath(gpa, ws_root, last_path) catch return ViewError.OutOfMemory;
     defer gpa.free(last_rel);
     {
-        var out: std.Io.Writer.Allocating = .initCapacity(gpa, 64) catch return ViewError.OutOfMemory;
+        var out: std.Io.Writer.Allocating = try .initCapacity(gpa, 64);
         defer out.deinit();
-        std.json.Stringify.value(LastBuild{ .manifests = &.{} }, .{}, &out.writer) catch return ViewError.OutOfMemory;
+        std.json.Stringify.value(LastBuild{ .manifests = @as([]const []const u8, &.{}) }, .{}, &out.writer) catch return ViewError.OutOfMemory;
         out.writer.writeAll("\n") catch return ViewError.OutOfMemory;
-        const bytes = out.toOwnedSlice() catch return ViewError.OutOfMemory;
+        const bytes = try out.toOwnedSlice();
         defer gpa.free(bytes);
         cwd.writeFile(io, .{ .sub_path = last_rel, .data = bytes }) catch |e| return mapDirError(e);
     }
