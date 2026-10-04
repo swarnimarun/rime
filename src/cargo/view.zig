@@ -234,10 +234,20 @@ fn predictedOutputs(alloc: std.mem.Allocator, target: []const u8, kind: TargetKi
 pub fn materializeOutputs(gpa: std.mem.Allocator, io: std.Io, store: *Store, ws_root: []const u8, profile: []const u8, units: []const UnitPlan) ViewError!void {
     const layout = try layoutPaths(gpa, ws_root, profile);
     defer layout.deinit(gpa);
-    const cwd = std.Io.Dir.cwd();
-    cwd.createDirPath(io, layout.profile_dir) catch |e| return mapDirError(e);
-    cwd.createDirPath(io, layout.deps_dir) catch |e| return mapDirError(e);
-    cwd.createDirPath(io, layout.fingerprint_dir) catch |e| return mapDirError(e);
+    // All view writes go through the workspace-root handle with root-
+    // relative paths (never cwd-relative: --manifest-path runs with an
+    // unrelated cwd). Only Store.materialize dests stay absolute.
+    var root = std.Io.Dir.cwd().openDir(io, ws_root, .{}) catch return ViewError.Io;
+    defer root.close(io);
+    const profile_rel = try relPath(gpa, ws_root, layout.profile_dir);
+    defer gpa.free(profile_rel);
+    const deps_rel = try relPath(gpa, ws_root, layout.deps_dir);
+    defer gpa.free(deps_rel);
+    const fp_rel = try relPath(gpa, ws_root, layout.fingerprint_dir);
+    defer gpa.free(fp_rel);
+    root.createDirPath(io, profile_rel) catch |e| return mapDirError(e);
+    root.createDirPath(io, deps_rel) catch |e| return mapDirError(e);
+    root.createDirPath(io, fp_rel) catch |e| return mapDirError(e);
 
     for (units) |u| {
         if (u.manifest_digest) |md| {
@@ -252,9 +262,12 @@ pub fn materializeOutputs(gpa: std.mem.Allocator, io: std.Io, store: *Store, ws_
                 for (man.outputs) |o| {
                     const dest = std.fs.path.join(gpa, &.{ dest_dir, o.path }) catch return ViewError.OutOfMemory;
                     defer gpa.free(dest);
-                    if (std.fs.path.dirname(dest)) |parent| {
-                        cwd.createDirPath(io, parent) catch |e| return mapDirError(e);
-                    }
+                    // Stage the parent through the root handle, then
+                    // materialize to the absolute destination.
+                    const parent = std.fs.path.dirname(dest) orelse dest_dir;
+                    const parent_rel = try relPath(gpa, ws_root, parent);
+                    defer gpa.free(parent_rel);
+                    root.createDirPath(io, parent_rel) catch |e| return mapDirError(e);
                     _ = store.materialize(io, o.digest, dest, mode) catch return ViewError.StoreRead;
                 }
             }
@@ -267,7 +280,7 @@ pub fn materializeOutputs(gpa: std.mem.Allocator, io: std.Io, store: *Store, ws_
             defer gpa.free(rel);
             const body = std.fmt.allocPrint(gpa, "{{\"package\":\"{s}\",\"version\":\"{s}\",\"complete\":false}}\n", .{ u.package, u.version }) catch return ViewError.OutOfMemory;
             defer gpa.free(body);
-            cwd.writeFile(io, .{ .sub_path = rel, .data = body }) catch |e| return mapDirError(e);
+            root.writeFile(io, .{ .sub_path = rel, .data = body }) catch |e| return mapDirError(e);
         }
     }
 }
@@ -294,8 +307,12 @@ fn mapDirError(e: anyerror) ViewError {
 pub fn writeViewMeta(gpa: std.mem.Allocator, io: std.Io, ws_root: []const u8, profile: []const u8, units: []const UnitPlan) ViewError!void {
     const layout = try layoutPaths(gpa, ws_root, profile);
     defer layout.deinit(gpa);
-    const cwd = std.Io.Dir.cwd();
-    cwd.createDirPath(io, layout.profile_dir) catch |e| return mapDirError(e);
+    // Root-relative writes (see materializeOutputs): never cwd-relative.
+    var root = std.Io.Dir.cwd().openDir(io, ws_root, .{}) catch return ViewError.Io;
+    defer root.close(io);
+    const profile_rel = relPath(gpa, ws_root, layout.profile_dir) catch return ViewError.OutOfMemory;
+    defer gpa.free(profile_rel);
+    root.createDirPath(io, profile_rel) catch |e| return mapDirError(e);
 
     const proj_hex = store_mod.hashBytes(ws_root).toHex();
     const project_id = std.fmt.allocPrint(gpa, "pb3-{s}", .{proj_hex[0..]}) catch return ViewError.OutOfMemory;
@@ -339,9 +356,7 @@ pub fn writeViewMeta(gpa: std.mem.Allocator, io: std.Io, ws_root: []const u8, pr
         out.writer.writeAll("\n") catch return ViewError.OutOfMemory;
         const bytes = try out.toOwnedSlice();
         defer gpa.free(bytes);
-        // Layout paths are absolute (ws_root comes absolutized from
-        // discover), so write through cwd with absolute sub-paths.
-        cwd.writeFile(io, .{ .sub_path = meta_rel, .data = bytes }) catch |e| return mapDirError(e);
+        root.writeFile(io, .{ .sub_path = meta_rel, .data = bytes }) catch |e| return mapDirError(e);
     }
     const last_path = std.fs.path.join(gpa, &.{ layout.profile_dir, "last-build.json" }) catch return ViewError.OutOfMemory;
     defer gpa.free(last_path);
@@ -354,7 +369,7 @@ pub fn writeViewMeta(gpa: std.mem.Allocator, io: std.Io, ws_root: []const u8, pr
         out.writer.writeAll("\n") catch return ViewError.OutOfMemory;
         const bytes = try out.toOwnedSlice();
         defer gpa.free(bytes);
-        cwd.writeFile(io, .{ .sub_path = last_rel, .data = bytes }) catch |e| return mapDirError(e);
+        root.writeFile(io, .{ .sub_path = last_rel, .data = bytes }) catch |e| return mapDirError(e);
     }
 }
 

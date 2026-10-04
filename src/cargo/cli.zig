@@ -301,20 +301,24 @@ fn runBuild(gpa: std.mem.Allocator, io: std.Io, opts: Options, stdout: *std.Io.W
         return ExitCode.usage;
     };
 
-    if (opts.message_format == .json) {
-        const done = JsonEnvelope{
-            .reason = "build-finished",
-            .package = "",
-            .target = "",
-            .profile = opts.profile,
-            .success = true,
-        };
-        done.writeLine(stdout) catch {
-            stderr.print("error: failed to write output\n", .{}) catch {};
-            return ExitCode.usage;
-        };
-    } else {
-        stderr.print("Finished {s} profile\n", .{opts.profile}) catch {};
+    // --dry-run prints only the unit plan above (the golden byte-compares
+    // it); the finished envelope belongs to real runs.
+    if (!opts.dry_run) {
+        if (opts.message_format == .json) {
+            const done = JsonEnvelope{
+                .reason = "build-finished",
+                .package = "",
+                .target = "",
+                .profile = opts.profile,
+                .success = true,
+            };
+            done.writeLine(stdout) catch {
+                stderr.print("error: failed to write output\n", .{}) catch {};
+                return ExitCode.usage;
+            };
+        } else {
+            stderr.print("Finished {s} profile\n", .{opts.profile}) catch {};
+        }
     }
     return ExitCode.ok;
 }
@@ -510,6 +514,46 @@ test "run clean on empty dir reports no workspace" {
     const msg = try err.toOwnedSlice();
     defer std.testing.allocator.free(msg);
     try std.testing.expect(std.mem.indexOf(u8, msg, "could not find") != null);
+}
+
+test "e2e dry-run plan matches golden" {
+    // The golden pins the wire order (dependencies first, envelope field
+    // order as JsonEnvelope.writeLine emits). It carries the profile NAME
+    // (dev); the DIR mapping (debug) lives in view.profileDirName.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var ws = try workspace_mod.discover(std.testing.allocator, io, "testdata/cargo/workspace", null);
+    defer ws.deinit();
+    const units = try view_mod.planUnits(std.testing.allocator, &ws, null);
+    defer std.testing.allocator.free(units);
+    var out: std.Io.Writer.Allocating = try .initCapacity(std.testing.allocator, 256);
+    defer out.deinit();
+    for (units) |u| {
+        const env = JsonEnvelope{ .reason = "unit-plan", .package = u.package, .target = u.target, .profile = "dev", .success = true };
+        try env.writeLine(&out.writer);
+    }
+    const got = try out.toOwnedSlice();
+    defer std.testing.allocator.free(got);
+    // Runtime read (not @embedFile): the golden escapes the module package
+    // path, matching the read convention in manifest/lock tests.
+    const want = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cargo/golden/plan.json", std.testing.allocator, .limited(1 << 20));
+    defer std.testing.allocator.free(want);
+    try std.testing.expectEqualStrings(want, got);
+}
+
+test "e2e dry-run human order lists dependencies first" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var ws = try workspace_mod.discover(std.testing.allocator, io, "testdata/cargo/workspace", null);
+    defer ws.deinit();
+    const units = try view_mod.planUnits(std.testing.allocator, &ws, null);
+    defer std.testing.allocator.free(units);
+    var out: std.Io.Writer.Allocating = try .initCapacity(std.testing.allocator, 256);
+    defer out.deinit();
+    for (units) |u| {
+        try out.writer.print("Compiling {s} v{s}\n", .{ u.package, u.version });
+    }
+    const got = try out.toOwnedSlice();
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("Compiling b v0.1.0\nCompiling a v0.1.0\n", got);
 }
 
 test "run build without dry-run reports need source" {
