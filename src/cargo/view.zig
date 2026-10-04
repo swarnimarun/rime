@@ -11,7 +11,6 @@
 /// long as the workspace. `planUnits` allocates the small predicted-name
 /// strings from the workspace arena via `@constCast` for this reason —
 /// single-threaded CLI/test use only, no aliasing during the call.
-
 const std = @import("std");
 const store_mod = @import("store");
 const manifest_mod = @import("manifest.zig");
@@ -225,6 +224,27 @@ fn predictedOutputs(alloc: std.mem.Allocator, target: []const u8, kind: TargetKi
     return out;
 }
 
+/// M4 driver project identity: `"pb3-" ++ hex(hashBytes(ws_root))`.
+/// Factored out of `writeViewMeta` (same computation, single spelling) so
+/// the pipeline's action-key `project` tag matches the committed view rows.
+/// gpa-owned (free with the same allocator).
+pub fn projectId(gpa: std.mem.Allocator, ws_root: []const u8) ViewError![]u8 {
+    const proj_hex = store_mod.hashBytes(ws_root).toHex();
+    return std.fmt.allocPrint(gpa, "pb3-{s}", .{proj_hex[0..]}) catch return ViewError.OutOfMemory;
+}
+
+/// Spool fallback map (M4 Task 10): `"pkg\x00target" → absolute spool
+/// out_dir` for units whose outputs never reached the store (`StoreFull`:
+/// the artifact stays in spool and the view fills by plain copy). Borrowed
+/// dirs; the map header is caller-owned. Null (or a missing entry) keeps the
+/// M1 stub behavior for plan-only units.
+pub const SpoolMap = std.StringHashMap([]const u8);
+
+/// `"pkg\x00target"` join for `SpoolMap` keys. gpa-owned.
+pub fn spoolKey(gpa: std.mem.Allocator, package: []const u8, target: []const u8) ViewError![]u8 {
+    return std.fmt.allocPrint(gpa, "{s}\x00{s}", .{ package, target }) catch return ViewError.OutOfMemory;
+}
+
 /// Materializes terminal outputs into the view. Units carrying a
 /// `manifest_digest` resolve it via `getManifest` and clone-or-copy each
 /// listed output (`0o755` for bins so the view copy runs, `0o444` for
@@ -232,6 +252,16 @@ fn predictedOutputs(alloc: std.mem.Allocator, target: []const u8, kind: TargetKi
 /// null digest (all of M1) get fingerprint-dir stubs only. Never hardlinks
 /// (delegated to `Store.materialize`).
 pub fn materializeOutputs(gpa: std.mem.Allocator, io: std.Io, store: *Store, ws_root: []const u8, profile: []const u8, units: []const UnitPlan) ViewError!void {
+    return materializeOutputsWithSpool(gpa, io, store, ws_root, profile, units, null);
+}
+
+/// `materializeOutputs` plus the M4 Task-10 spool fallback: null-digest
+/// units WITH a `spool_dirs` entry copy their listed outputs from the spool
+/// dir instead of leaving stubs (the `StoreFull` delivery path — the whole
+/// store is full, but the view still fills from spool). A missing spool file
+/// is `Io` (the pipeline guarantees presence); a missing map entry falls
+/// back to the stub. `spool_dirs` borrows the caller's map.
+pub fn materializeOutputsWithSpool(gpa: std.mem.Allocator, io: std.Io, store: *Store, ws_root: []const u8, profile: []const u8, units: []const UnitPlan, spool_dirs: ?*const SpoolMap) ViewError!void {
     const layout = try layoutPaths(gpa, ws_root, profile);
     defer layout.deinit(gpa);
     // All view writes go through the workspace-root handle with root-
@@ -272,6 +302,38 @@ pub fn materializeOutputs(gpa: std.mem.Allocator, io: std.Io, store: *Store, ws_
                 }
             }
         } else {
+            // Spool fallback (M4): copy real outputs when the pipeline
+            // hands us the spool dir (spool-only delivery under StoreFull).
+            if (spool_dirs) |sm| {
+                const key = try spoolKey(gpa, u.package, u.target);
+                defer gpa.free(key);
+                if (sm.get(key)) |sdir| {
+                    const dest_dir = if (u.kind == .bin) layout.profile_dir else layout.deps_dir;
+                    const mode: u32 = if (u.kind == .bin) 0o755 else 0o444;
+                    for (u.outputs) |fname| {
+                        const src = std.fs.path.join(gpa, &.{ sdir, fname }) catch return ViewError.OutOfMemory;
+                        defer gpa.free(src);
+                        const bytes = std.Io.Dir.cwd().readFileAlloc(io, src, gpa, .limited(1 << 30)) catch |e| {
+                            if (e == error.OutOfMemory) return ViewError.OutOfMemory;
+                            return ViewError.Io;
+                        };
+                        defer gpa.free(bytes);
+                        const dest = std.fs.path.join(gpa, &.{ dest_dir, fname }) catch return ViewError.OutOfMemory;
+                        defer gpa.free(dest);
+                        const parent = std.fs.path.dirname(dest) orelse dest_dir;
+                        const parent_rel = try relPath(gpa, ws_root, parent);
+                        defer gpa.free(parent_rel);
+                        root.createDirPath(io, parent_rel) catch |e| return mapDirError(e);
+                        const dest_rel = try relPath(gpa, ws_root, dest);
+                        defer gpa.free(dest_rel);
+                        root.writeFile(io, .{ .sub_path = dest_rel, .data = bytes }) catch |e| return mapDirError(e);
+                        var out = std.Io.Dir.openFileAbsolute(io, dest, .{ .mode = .write_only }) catch |e| return mapDirError(e);
+                        defer out.close(io);
+                        out.setPermissions(io, .fromMode(@intCast(mode))) catch |e| return mapDirError(e);
+                    }
+                    continue;
+                }
+            }
             // M1 stub: no artifacts exist before the driver, so the unit
             // leaves only a fingerprint-dir marker cargo tooling can see.
             const stub = std.fs.path.join(gpa, &.{ layout.fingerprint_dir, u.target }) catch return ViewError.OutOfMemory;
@@ -371,6 +433,174 @@ pub fn writeViewMeta(gpa: std.mem.Allocator, io: std.Io, ws_root: []const u8, pr
         defer gpa.free(bytes);
         root.writeFile(io, .{ .sub_path = last_rel, .data = bytes }) catch |e| return mapDirError(e);
     }
+}
+
+/// One COMPLETE driver row (M4 Task 10): the plan plus the driver-known tag
+/// values and the recorded output mtime that feeds the next run's `checkFresh`
+/// fast path (Task 13). All strings borrow the caller (pipeline plan/tags);
+/// `manifest_digest` null = spool-only unit (view filled from spool).
+pub const ViewUnitFull = struct {
+    package: []const u8,
+    version: []const u8,
+    target: []const u8,
+    manifest_digest: ?Digest,
+    toolchain: []const u8, // tc.tag() value (storage-v2 §11.3 `toolchain`)
+    features: []const u8, // fh- tag (§11.3 `features`)
+    target_triple: []const u8, // §11.3 `target`
+    output_mtime_ns: i128, // view primary-output mtime, ms×1e6 (checkFresh units)
+};
+
+/// One recorded per-unit mtime row in `last-build.json` (Task-13 amendment
+/// to Task 10: `{manifests: [...], units: [{package, target,
+/// output_mtime_ns}]}`). History for the `checkFresh` fast path; merged
+/// across runs (skipped units keep their previous rows).
+pub const LastBuildUnit = struct {
+    package: []const u8,
+    target: []const u8,
+    output_mtime_ns: i128,
+};
+
+/// Writes `target/<profile>/.rime-view.json` with COMPLETE rows (real
+/// toolchain/features/target tags, `"complete": true`) plus
+/// `last-build.json` (`{manifests: ["b3-<hex>"…], units: [{package,
+/// target, output_mtime_ns}]}`). Same paths as `writeViewMeta` (overwrite).
+/// Manifests list follows units order, skipping null digests.
+pub fn writeViewMetaFull(gpa: std.mem.Allocator, io: std.Io, ws_root: []const u8, profile: []const u8, units: []const ViewUnitFull) ViewError!void {
+    const layout = try layoutPaths(gpa, ws_root, profile);
+    defer layout.deinit(gpa);
+    var root = std.Io.Dir.cwd().openDir(io, ws_root, .{}) catch return ViewError.Io;
+    defer root.close(io);
+    const profile_rel = relPath(gpa, ws_root, layout.profile_dir) catch return ViewError.OutOfMemory;
+    defer gpa.free(profile_rel);
+    root.createDirPath(io, profile_rel) catch |e| return mapDirError(e);
+
+    const project_id = try projectId(gpa, ws_root);
+    defer gpa.free(project_id);
+
+    const entries = gpa.alloc(ViewUnit, units.len) catch return ViewError.OutOfMemory;
+    defer gpa.free(entries);
+    for (units, entries) |u, *slot| {
+        slot.* = .{
+            .package = u.package,
+            .version = u.version,
+            .target = u.target,
+            .tags = .{
+                .crate = u.package,
+                .crate_version = u.version,
+                .toolchain = u.toolchain,
+                .target = u.target_triple,
+                .profile = profile,
+                .features = u.features,
+                .project = project_id,
+                .action = "rustc",
+            },
+        };
+    }
+    const meta = ViewMeta{
+        .version = 1,
+        .complete = true,
+        .project_id = project_id,
+        .profile = profile,
+        .units = entries,
+    };
+    const meta_path = std.fs.path.join(gpa, &.{ layout.profile_dir, ".rime-view.json" }) catch return ViewError.OutOfMemory;
+    defer gpa.free(meta_path);
+    const meta_rel = relPath(gpa, ws_root, meta_path) catch return ViewError.OutOfMemory;
+    defer gpa.free(meta_rel);
+    {
+        var out: std.Io.Writer.Allocating = try .initCapacity(gpa, 2048);
+        defer out.deinit();
+        std.json.Stringify.value(meta, .{}, &out.writer) catch return ViewError.OutOfMemory;
+        out.writer.writeAll("\n") catch return ViewError.OutOfMemory;
+        const bytes = try out.toOwnedSlice();
+        defer gpa.free(bytes);
+        root.writeFile(io, .{ .sub_path = meta_rel, .data = bytes }) catch |e| return mapDirError(e);
+    }
+    var mans: std.ArrayList([]const u8) = .empty;
+    defer mans.deinit(gpa);
+    var rows: std.ArrayList(LastBuildUnit) = .empty;
+    defer rows.deinit(gpa);
+    for (units) |u| {
+        if (u.manifest_digest) |md| {
+            const hex = md.toHex();
+            const s = std.fmt.allocPrint(gpa, "b3-{s}", .{hex[0..]}) catch return ViewError.OutOfMemory;
+            mans.append(gpa, s) catch return ViewError.OutOfMemory;
+        }
+        rows.append(gpa, .{ .package = u.package, .target = u.target, .output_mtime_ns = u.output_mtime_ns }) catch return ViewError.OutOfMemory;
+    }
+    defer for (mans.items) |s| gpa.free(s);
+    const last_path = std.fs.path.join(gpa, &.{ layout.profile_dir, "last-build.json" }) catch return ViewError.OutOfMemory;
+    defer gpa.free(last_path);
+    const last_rel = relPath(gpa, ws_root, last_path) catch return ViewError.OutOfMemory;
+    defer gpa.free(last_rel);
+    {
+        var out: std.Io.Writer.Allocating = try .initCapacity(gpa, 1024);
+        defer out.deinit();
+        std.json.Stringify.value(LastBuildFileOut{ .manifests = mans.items, .units = rows.items }, .{}, &out.writer) catch return ViewError.OutOfMemory;
+        out.writer.writeAll("\n") catch return ViewError.OutOfMemory;
+        const bytes = try out.toOwnedSlice();
+        defer gpa.free(bytes);
+        root.writeFile(io, .{ .sub_path = last_rel, .data = bytes }) catch |e| return mapDirError(e);
+    }
+}
+
+const LastBuildFileOut = struct {
+    manifests: []const []const u8,
+    units: []const LastBuildUnit,
+};
+
+/// History file read-back for the `checkFresh` fast path: `{arena owns all,
+/// manifests: digest strings, units: per-unit rows}`. Missing or malformed
+/// files read as null (no history → full planning path, always correct).
+/// Only `OutOfMemory` propagates; every other failure means "no usable
+/// history", never a failed build.
+pub const LastBuildFile = struct {
+    arena: std.heap.ArenaAllocator,
+    manifests: []const []const u8,
+    units: []const LastBuildUnit,
+    pub fn deinit(self: *LastBuildFile) void {
+        self.arena.deinit();
+    }
+    pub fn mtimeFor(self: *const LastBuildFile, package: []const u8, target: []const u8) ?i128 {
+        for (self.units) |u| {
+            if (std.mem.eql(u8, u.package, package) and std.mem.eql(u8, u.target, target)) return u.output_mtime_ns;
+        }
+        return null;
+    }
+};
+
+pub fn readLastBuildUnits(gpa: std.mem.Allocator, io: std.Io, ws_root: []const u8, profile: []const u8) ViewError!?LastBuildFile {
+    const layout = try layoutPaths(gpa, ws_root, profile);
+    defer layout.deinit(gpa);
+    const last_path = std.fs.path.join(gpa, &.{ layout.profile_dir, "last-build.json" }) catch return ViewError.OutOfMemory;
+    defer gpa.free(last_path);
+    const text = std.Io.Dir.cwd().readFileAlloc(io, last_path, gpa, .limited(1 << 20)) catch |e| {
+        if (e == error.OutOfMemory) return ViewError.OutOfMemory;
+        return null; // missing/unreadable history: plan from scratch
+    };
+    defer gpa.free(text);
+    const parsed = std.json.parseFromSlice(LastBuildFileOut, gpa, text, .{ .allocate = .alloc_always }) catch {
+        return null; // malformed history (e.g. M1 `{manifests: []}` shape): ignore
+    };
+    defer parsed.deinit();
+    // M1 files (`{"manifests":[]}`, no `units` key) fail struct parsing
+    // above and already returned null: no history, plan from scratch.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const alloc = arena.allocator();
+    const mans = alloc.dupe([]const u8, parsed.value.manifests) catch return ViewError.OutOfMemory;
+    for (mans, parsed.value.manifests) |*dst, src| {
+        dst.* = alloc.dupe(u8, src) catch return ViewError.OutOfMemory;
+    }
+    const rows = alloc.alloc(LastBuildUnit, parsed.value.units.len) catch return ViewError.OutOfMemory;
+    for (rows, parsed.value.units) |*dst, src| {
+        dst.* = .{
+            .package = alloc.dupe(u8, src.package) catch return ViewError.OutOfMemory,
+            .target = alloc.dupe(u8, src.target) catch return ViewError.OutOfMemory,
+            .output_mtime_ns = src.output_mtime_ns,
+        };
+    }
+    return .{ .arena = arena, .manifests = mans, .units = rows };
 }
 
 const ViewTags = struct {

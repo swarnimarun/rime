@@ -1,0 +1,1 @@
+[{"package":"full-manifest","version":"0.3.1","target":"full-manifest-tool","kind":"bin","edition":"2021","features":["default","std"],"profile":"dev","triple":"aarch64-apple-darwin","deps":[]},{"package":"full-manifest","version":"0.3.1","target":"full_manifest","kind":"lib","edition":"2021","features":["default","std"],"profile":"dev","triple":"aarch64-apple-darwin","deps":[]}]

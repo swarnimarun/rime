@@ -4,12 +4,13 @@
 /// print the unit plan, and materialize the view skeleton. `run` arg
 /// forwarding and real execution land in M6; until then extra args parse
 /// and are ignored.
-
 const std = @import("std");
 const builtin = @import("builtin");
 const store_mod = @import("store");
 const workspace_mod = @import("workspace.zig");
 const view_mod = @import("view.zig");
+const pipeline_mod = @import("pipeline.zig");
+const toolchain_mod = @import("toolchain.zig");
 
 const Workspace = workspace_mod.Workspace;
 
@@ -24,6 +25,8 @@ pub const Options = struct {
     target_triple: ?[]const u8, // --target
     only_package: ?[]const u8, // -p/--package (limits the plan to the member + its path-deps)
     features: []const []const u8,
+    all_features: bool, // --all-features (takes no value)
+    no_default_features: bool, // --no-default-features (takes no value)
     message_format: MessageFormat,
     offline: bool,
     frozen: bool,
@@ -64,7 +67,7 @@ fn fail(comptime fmt: []const u8, args: anytype) CliError {
 }
 
 pub const JsonEnvelope = struct {
-    reason: []const u8, // "unit-plan" | "build-finished" | "compiler-message"
+    reason: []const u8, // "unit-plan" | "build-finished" | "compiler-message" | "compiler-artifact"
     package: []const u8,
     target: []const u8,
     profile: []const u8,
@@ -106,6 +109,8 @@ pub fn parseArgs(gpa: std.mem.Allocator, argv: []const []const u8) CliError!Opti
         .target_triple = null,
         .only_package = null,
         .features = &.{},
+        .all_features = false,
+        .no_default_features = false,
         .message_format = .human,
         .offline = false,
         .frozen = false,
@@ -156,6 +161,12 @@ pub fn parseArgs(gpa: std.mem.Allocator, argv: []const []const u8) CliError!Opti
             const v = try takeValue(gpa, argv, &i, inline_val, "--features");
             var csv = std.mem.splitScalar(u8, v, ',');
             while (csv.next()) |feat| try features.append(gpa, feat);
+        } else if (std.mem.eql(u8, f, "--all-features")) {
+            if (inline_val != null) return fail("flag '--all-features' takes no value", .{});
+            opts.all_features = true;
+        } else if (std.mem.eql(u8, f, "--no-default-features")) {
+            if (inline_val != null) return fail("flag '--no-default-features' takes no value", .{});
+            opts.no_default_features = true;
         } else if (std.mem.eql(u8, f, "--message-format")) {
             const v = try takeValue(gpa, argv, &i, inline_val, "--message-format");
             if (std.mem.eql(u8, v, "json")) {
@@ -235,6 +246,12 @@ fn runBuild(gpa: std.mem.Allocator, io: std.Io, opts: Options, stdout: *std.Io.W
     var ws = loadWorkspace(gpa, io, opts, stderr) orelse return ExitCode.usage;
     defer ws.deinit();
 
+    // Real builds go through the M4 driver pipeline (fetch → resolve →
+    // compile → materialize); --dry-run keeps the M1 plan-print path below.
+    if (!opts.dry_run) {
+        return runPipelineBuild(gpa, io, &ws, opts, stdout, stderr);
+    }
+
     // --frozen/--locked (M1): require the lockfile only when the workspace
     // actually has registry deps; pure-path workspaces are unaffected.
     if ((opts.frozen or opts.locked) and ws.lock == null and hasExternalDeps(&ws)) {
@@ -276,15 +293,6 @@ fn runBuild(gpa: std.mem.Allocator, io: std.Io, opts: Options, stdout: *std.Io.W
         }
     }
 
-    // D5: declarations parse, but any command needing the source errors
-    // `need source` (exit 1). --dry-run only inspects the plan.
-    if (!opts.dry_run) {
-        if (firstExternalDep(gpa, &ws)) |name| {
-            stderr.print("need source: {s} requires M2 fetch; re-run with --dry-run to inspect the plan\n", .{name}) catch {};
-            return ExitCode.usage;
-        }
-    }
-
     // View skeleton (M1: null digests, so fingerprint stubs + metas only).
     // The store opens lazily here: plan inspection never touches it.
     var holder = openCargoStore(gpa, io) catch {
@@ -321,6 +329,67 @@ fn runBuild(gpa: std.mem.Allocator, io: std.Io, opts: Options, stdout: *std.Io.W
         }
     }
     return ExitCode.ok;
+}
+
+/// M4 driver dispatch (Tasks 10–11): `build`/`test`/`run`/`bench` compile
+/// through the pipeline in build mode, `check` in rmeta-only check mode.
+/// (Binary execution for `run` stays M6; `run` currently verifies the build.)
+/// Exit codes: 0 ok, 101 rustc failure (diagnostics already emitted),
+/// 1 usage/config/fetch/lock failures.
+fn runPipelineBuild(gpa: std.mem.Allocator, io: std.Io, ws: *const Workspace, opts: Options, stdout: *std.Io.Writer, stderr: *std.Io.Writer) u8 {
+    var holder = openCargoStore(gpa, io) catch {
+        stderr.print("error: cannot open store\n", .{}) catch {};
+        return ExitCode.usage;
+    };
+    defer holder.close(io);
+    var tc = toolchain_mod.probeToolchain(gpa, io, null) catch |e| {
+        stderr.print("error: rustc probe failed ({t}); install rustc or set $RUSTC\n", .{e}) catch {};
+        return ExitCode.usage;
+    };
+    defer tc.deinit(gpa);
+    const cache_dir = cacheRoot(gpa) catch {
+        stderr.print("error: cannot determine cache directory\n", .{}) catch {};
+        return ExitCode.usage;
+    };
+    defer gpa.free(cache_dir);
+    const popts = pipeline_mod.PipelineOptions{
+        .manifest_path = opts.manifest_path,
+        .profile_name = opts.profile,
+        .target_triple = opts.target_triple,
+        .features_cli = opts.features,
+        .all_features = opts.all_features,
+        .no_default = opts.no_default_features,
+        .mode = if (opts.cmd == .check) .check else .build,
+        .message_format_json = opts.message_format == .json,
+        .offline = opts.offline,
+        .frozen = opts.frozen,
+        .locked = opts.locked,
+        .only_package = opts.only_package,
+        .cache_dir = cache_dir,
+    };
+    const code = pipeline_mod.buildWorkspace(gpa, io, holder.store(), ws.root_dir, ws, &tc, popts, stdout, stderr) catch |e| {
+        return renderPipelineError(e, stderr);
+    };
+    return code;
+}
+
+fn renderPipelineError(e: pipeline_mod.PipelineError, stderr: *std.Io.Writer) u8 {
+    switch (e) {
+        // Diagnostics already emitted; the code IS the message.
+        error.RustcFailed => return ExitCode.build_failed,
+        error.NeedFetch => {
+            stderr.print("need source: {s}\n", .{pipeline_mod.planDiagnostic() orelse "unknown crate"}) catch {};
+            return ExitCode.usage;
+        },
+        error.LockedViolation, error.Usage => {
+            stderr.print("error: {s}\n", .{pipeline_mod.planDiagnostic() orelse @errorName(e)}) catch {};
+            return ExitCode.usage;
+        },
+        else => {
+            stderr.print("error: build failed: {t}\n", .{e}) catch {};
+            return ExitCode.usage;
+        },
+    }
 }
 
 fn runClean(gpa: std.mem.Allocator, io: std.Io, opts: Options, stderr: *std.Io.Writer) u8 {
@@ -385,26 +454,6 @@ fn hasExternalDeps(ws: *const Workspace) bool {
     return false;
 }
 
-/// Deterministically first external dep name (sorted; map order is not).
-fn firstExternalDep(gpa: std.mem.Allocator, ws: *const Workspace) ?[]const u8 {
-    var names: std.ArrayList([]const u8) = .empty;
-    defer names.deinit(gpa);
-    for (ws.members) |*m| {
-        var it = m.manifest.deps.iterator();
-        while (it.next()) |kv| {
-            if (kv.value_ptr.* == .path) continue;
-            names.append(gpa, kv.key_ptr.*) catch return null;
-        }
-    }
-    if (names.items.len == 0) return null;
-    std.mem.sort([]const u8, names.items, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
-        }
-    }.lt);
-    return names.items[0];
-}
-
 const StoreHolder = struct {
     dir: std.Io.Dir,
     s: store_mod.Store,
@@ -428,9 +477,12 @@ fn openCargoStore(gpa: std.mem.Allocator, io: std.Io) !StoreHolder {
     return .{ .dir = dir, .s = s };
 }
 
-fn openStoreDir(gpa: std.mem.Allocator, io: std.Io) !std.Io.Dir {
+/// Cache root (the rime dir itself): `$RIME_CACHE_DIR`, else
+/// `<cache home>/rime`. gpa-owned (caller frees). The store opens here
+/// and the pipeline derives its spool + fetch-cache dirs from it.
+fn cacheRoot(gpa: std.mem.Allocator) ![]u8 {
     if (std.c.getenv("RIME_CACHE_DIR")) |p| {
-        return std.Io.Dir.cwd().createDirPathOpen(io, std.mem.span(p), .{});
+        return try gpa.dupe(u8, std.mem.span(p));
     }
     const home_z = std.c.getenv("HOME");
     const home: []const u8 = if (home_z) |h| std.mem.span(h) else ".";
@@ -443,9 +495,13 @@ fn openStoreDir(gpa: std.mem.Allocator, io: std.Io) !std.Io.Dir {
         else => @compileError("rime supports macOS and Linux only"),
     };
     defer gpa.free(base);
-    const full = try std.fmt.allocPrint(gpa, "{s}/rime", .{base});
-    defer gpa.free(full);
-    return std.Io.Dir.cwd().createDirPathOpen(io, full, .{});
+    return try std.fmt.allocPrint(gpa, "{s}/rime", .{base});
+}
+
+fn openStoreDir(gpa: std.mem.Allocator, io: std.Io) !std.Io.Dir {
+    const root = try cacheRoot(gpa);
+    defer gpa.free(root);
+    return std.Io.Dir.cwd().createDirPathOpen(io, root, .{});
 }
 
 test "cli parses build with release and json" {
@@ -482,6 +538,25 @@ test "cli parses equals forms and csv features" {
     try std.testing.expectEqualStrings("x86_64-unknown-linux-gnu", opts.target_triple.?);
     try std.testing.expectEqual(@as(usize, 3), opts.features.len);
     try std.testing.expectEqualStrings("x/Cargo.toml", opts.manifest_path.?);
+}
+
+test "cli check dispatches check mode" {
+    const argv = [_][]const u8{ "rime", "check", "--message-format=json" };
+    var opts = try parseArgs(std.testing.allocator, &argv);
+    defer opts.deinit(std.testing.allocator);
+    try std.testing.expect(opts.cmd == .check);
+    try std.testing.expect(opts.message_format == .json);
+}
+
+test "cli parses all-features flags" {
+    const argv = [_][]const u8{ "rime", "build", "--all-features", "--no-default-features", "--features", "a,b" };
+    var opts = try parseArgs(std.testing.allocator, &argv);
+    defer opts.deinit(std.testing.allocator);
+    try std.testing.expect(opts.all_features);
+    try std.testing.expect(opts.no_default_features);
+    try std.testing.expectEqual(@as(usize, 2), opts.features.len);
+    const bad = [_][]const u8{ "rime", "build", "--all-features=x" };
+    try std.testing.expectError(CliError.Usage, parseArgs(std.testing.allocator, &bad));
 }
 
 test "cli envelope writes one line of json" {
@@ -557,9 +632,56 @@ test "e2e dry-run human order lists dependencies first" {
 }
 
 test "run build without dry-run reports need source" {
-    const io = std.Io.Threaded.global_single_threaded.io();
-    // The minimal fixture declares registry `serde`: building (not planning)
-    // must fail loud with exit 1 before touching the store.
+    // Registry-only scratch fixture (minimal/ also declares a DANGLING
+    // path dep, which correctly fails earlier — see the next test):
+    // building must fail loud with exit 1 naming the registry crate.
+    const gpa = std.testing.allocator;
+    // Spawn-capable io: runPipelineBuild probes the real toolchain, and
+    // `global_single_threaded` cannot spawn (failing allocator).
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = "/tmp/rime-cli-needfetch";
+    std.Io.Dir.cwd().createDirPath(io, dir) catch |e| {
+        if (e == error.OutOfMemory) return error.OutOfMemory;
+        return error.Io;
+    };
+    const manifest_path = try std.fmt.allocPrint(gpa, "{s}/Cargo.toml", .{dir});
+    defer gpa.free(manifest_path);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = manifest_path,
+        .data = "[package]\nname = \"cli-needfetch\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nserde = \"1\"\n\n[lib]\nname = \"cli_needfetch\"\npath = \"src/lib.rs\"\n",
+    });
+    const src_dir = try std.fmt.allocPrint(gpa, "{s}/src", .{dir});
+    defer gpa.free(src_dir);
+    std.Io.Dir.cwd().createDirPath(io, src_dir) catch |e| {
+        if (e == error.OutOfMemory) return error.OutOfMemory;
+        return error.Io;
+    };
+    const lib_path = try std.fmt.allocPrint(gpa, "{s}/src/lib.rs", .{dir});
+    defer gpa.free(lib_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = lib_path, .data = "pub fn f() {}\n" });
+    const argv = [_][]const u8{ "rime", "build", "--manifest-path", manifest_path };
+    var opts = try parseArgs(std.testing.allocator, &argv);
+    defer opts.deinit(std.testing.allocator);
+    var err: std.Io.Writer.Allocating = try .initCapacity(std.testing.allocator, 512);
+    defer err.deinit();
+    var out: std.Io.Writer.Allocating = try .initCapacity(std.testing.allocator, 64);
+    defer out.deinit();
+    const code = run(std.testing.allocator, io, opts, &out.writer, &err.writer);
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try std.testing.expectEqual(ExitCode.usage, code);
+    const msg = try err.toOwnedSlice();
+    defer std.testing.allocator.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "need source: serde") != null);
+}
+
+test "run build reports dangling path dependencies" {
+    // minimal/ declares path `../rime-dep`, which does not exist: the M4
+    // driver fails loud (exit 1) naming it instead of attempting a build.
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const argv = [_][]const u8{ "rime", "build", "--manifest-path", "testdata/cargo/minimal/Cargo.toml" };
     var opts = try parseArgs(std.testing.allocator, &argv);
     defer opts.deinit(std.testing.allocator);
@@ -571,7 +693,7 @@ test "run build without dry-run reports need source" {
     try std.testing.expectEqual(ExitCode.usage, code);
     const msg = try err.toOwnedSlice();
     defer std.testing.allocator.free(msg);
-    try std.testing.expect(std.mem.indexOf(u8, msg, "need source: serde") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "rime-dep") != null);
 }
 
 // =====================================================================
@@ -855,6 +977,8 @@ test "lockModeFrom maps flag combinations" {
         .target_triple = null,
         .only_package = null,
         .features = &.{},
+        .all_features = false,
+        .no_default_features = false,
         .message_format = .human,
         .offline = false,
         .frozen = false,

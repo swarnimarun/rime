@@ -79,12 +79,15 @@ fn watchdogMain(w: *Watchdog) void {
     w.child.kill(w.io);
 }
 
-const RunError = error{ SpawnFailed, TimedOut, OutOfMemory };
+pub const RunError = error{ SpawnFailed, TimedOut, OutOfMemory };
 
 /// Spawn `argv` with `cwd`, drain stdout+stderr, enforce the 60s watchdog.
-/// Returns the exit code plus a gpa-owned stdout copy. Stderr is discarded
-/// (callers that need it read files, e.g. Cargo.lock, instead).
-fn runCapture(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, cwd: []const u8) RunError!struct { exited: u8, out: []u8 } {
+/// Returns the exit code plus gpa-owned stdout AND stderr copies (M4 Task 7
+/// made both streams first-class: the rustc driver parses JSON diagnostics
+/// out of the combined bytes — deviation F3. Pre-Task-7 callers keep
+/// reading `.out`/`.exited` only; the added `.err` field is
+/// additive-compatible).
+pub fn runCapture(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, cwd: []const u8) RunError!struct { exited: u8, out: []u8, err: []u8 } {
     const cwd_opt: std.process.Child.Cwd = if (cwd.len == 0) .inherit else .{ .path = cwd };
     var child = std.process.spawn(io, .{
         .argv = argv,
@@ -101,6 +104,7 @@ fn runCapture(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, cwd:
     mr.init(gpa, io, mr_buf.toStreams(), &.{ child.stdout.?, child.stderr.? });
     defer mr.deinit();
     const out_r = mr.reader(0);
+    const err_r = mr.reader(1);
     while (mr.fill(4096, .none)) |_| {} else |e| if (e != error.EndOfStream) {
         w.done.store(true, .release);
         watcher.join();
@@ -116,7 +120,9 @@ fn runCapture(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, cwd:
     if (w.fired.load(.acquire)) return RunError.TimedOut;
     if (term != .exited) return RunError.SpawnFailed;
     const out = gpa.dupe(u8, out_r.buffered()) catch return RunError.OutOfMemory;
-    return .{ .exited = term.exited, .out = out };
+    errdefer gpa.free(out);
+    const err = gpa.dupe(u8, err_r.buffered()) catch return RunError.OutOfMemory;
+    return .{ .exited = term.exited, .out = out, .err = err };
 }
 
 /// Runs `cargo generate-lockfile [--offline]` in `dir`, returns the
@@ -133,6 +139,7 @@ pub fn generateLockfile(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, off
         RunError.SpawnFailed, RunError.TimedOut => return OracleError.CargoFailed,
     };
     defer gpa.free(res.out);
+    defer gpa.free(res.err);
     if (res.exited != 0) return OracleError.CargoFailed;
     const lock_path = std.fmt.allocPrint(gpa, "{s}/Cargo.lock", .{dir}) catch return OracleError.OutOfMemory;
     defer gpa.free(lock_path);
@@ -154,6 +161,7 @@ pub fn metadataPkgs(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) OracleE
         RunError.SpawnFailed, RunError.TimedOut => return OracleError.CargoFailed,
     };
     defer gpa.free(res.out);
+    defer gpa.free(res.err);
     if (res.exited != 0) return OracleError.CargoFailed;
     var parsed = std.json.parseFromSlice(std.json.Value, gpa, res.out, .{}) catch return OracleError.CargoFailed;
     defer parsed.deinit();
@@ -560,10 +568,11 @@ fn fetchIndexLines(gpa: std.mem.Allocator, io: std.Io, name: []const u8) error{ 
         },
     };
     errdefer gpa.free(res.out);
+    errdefer gpa.free(res.err);
     if (res.exited != 0) {
-        gpa.free(res.out);
         return error.FetchFailed;
     }
+    gpa.free(res.err);
     return res.out;
 }
 
@@ -597,7 +606,6 @@ const WsRegistry = struct {
     entries: std.ArrayList(index.IndexEntry), // ALL parsed entries, kept alive (candidates borrow them)
     crates: std.StringHashMap(CrateSummaries),
     previous: []resolve.ResolvedNode, // minimal-update guidance (arena + gpa mix; freed below)
-    wanted: std.StringHashMap([]const []const u8), // registry name -> rendered previous versions
     fetch_failed: bool, // environmental (curl/offline/HTTP): skip, never a false red
     hard_failed: bool, // genuine semantic failure inside query: Mismatch, never skip
     replaces: []manifest.ReplaceEntry,
@@ -612,13 +620,6 @@ const WsRegistry = struct {
             self.gpa.free(kv.value_ptr.nodes);
         }
         self.crates.deinit();
-        var wit = self.wanted.iterator();
-        while (wit.next()) |kv| {
-            self.gpa.free(kv.key_ptr.*);
-            for (kv.value_ptr.*) |s| self.gpa.free(s);
-            self.gpa.free(kv.value_ptr.*);
-        }
-        self.wanted.deinit();
         for (self.path_nodes.items) |*pn| {
             self.gpa.free(pn.summary.deps);
             pn.ext.deinit();
@@ -708,20 +709,21 @@ const WsRegistry = struct {
     /// Parse one crate's index lines into summaries. Lines failing even
     /// minimal parse are SKIPPED (slow-path `continue`, never fatal);
     /// schema-v3+ lines parse but stay unselected (`unsupported`); entries
-    /// with unparseable reqs are DROPPED (`Invalid`, never selected). The
-    /// `wanted` prefilter keeps only previous-lock versions when the crate
-    /// has any (keep-everything Locked resolution can only select those);
-    /// crates with no previous versions parse everything (fresh selection).
+    /// with unparseable reqs are DROPPED (`Invalid`, never selected). Every
+    /// line parses (no previous-version prefilter): pass 1 resolves the
+    /// all-optionals superset, whose fresh edges may select coexisting
+    /// tracks outside the golden (e.g. `syn ^2` for `zeroize_derive`
+    /// alongside locked `syn 3.0.6`) -- filtering to golden versions starves
+    /// those edges to zero candidates and sends the search into backtrack
+    /// thrash. Locked reqs + per-PackageId preferences still pin golden
+    /// versions wherever the golden constrains them.
     fn projectCrate(self: *WsRegistry, name: []const u8, text: []const u8) WsError![]resolve.SummaryNode {
-        const wanted = self.wanted.get(name);
+        _ = name; // summaries are provider-agnostic; the name lives on each entry.
         var nodes: std.ArrayList(resolve.SummaryNode) = .empty;
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
             const t = std.mem.trim(u8, line, " \t\r");
             if (t.len == 0) continue;
-            if (wanted) |ws| {
-                if (!versWanted(t, ws)) continue;
-            }
             var entry = index.parseIndexLine(self.gpa, t) catch continue;
             if (entry.unsupported) {
                 entry.deinit(self.gpa);
@@ -769,7 +771,9 @@ const WsRegistry = struct {
     }
 };
 
-/// `"vers":"<v>"` substring test against the wanted rendered versions.
+/// `"vers":"<v>"` substring test (kept as a tested helper; the former
+/// previous-version prefilter that used it is removed -- pass 1 parses
+/// full candidate sets, see `projectCrate`).
 fn versWanted(line: []const u8, wanted: []const []const u8) bool {
     const key = "\"vers\":\"";
     const i = std.mem.indexOf(u8, line, key) orelse return false;
@@ -834,7 +838,6 @@ fn loadWorkspace(gpa: std.mem.Allocator, io: std.Io, ws_dir: []const u8, previou
         .patch_nodes = .empty,
         .entries = .empty,
         .crates = std.StringHashMap(CrateSummaries).init(gpa),
-        .wanted = std.StringHashMap([]const []const u8).init(gpa),
         .fetch_failed = false,
         .hard_failed = false,
         .previous = &.{},
@@ -1028,43 +1031,6 @@ fn loadWorkspace(gpa: std.mem.Allocator, io: std.Io, ws_dir: []const u8, previou
         }
     }
 
-    // Wanted versions per registry crate (vers prefilter).
-    for (previous) |*pn| {
-        if (pn.source != .registry) continue;
-        const ver = try renderVersion(gpa, pn.version);
-        errdefer gpa.free(ver);
-        const key = gpa.dupe(u8, pn.name) catch {
-            gpa.free(ver);
-            return WsError.OutOfMemory;
-        };
-        errdefer gpa.free(key);
-        if (reg.wanted.getPtr(key)) |slot| {
-            gpa.free(key);
-            const old = slot.*;
-            const grown = gpa.alloc([]const u8, old.len + 1) catch {
-                gpa.free(ver);
-                return WsError.OutOfMemory;
-            };
-            @memcpy(grown[0..old.len], old);
-            grown[old.len] = ver;
-            gpa.free(old);
-            slot.* = grown;
-        } else {
-            const arr = gpa.alloc([]const u8, 1) catch {
-                gpa.free(key);
-                gpa.free(ver);
-                return WsError.OutOfMemory;
-            };
-            arr[0] = ver;
-            reg.wanted.put(key, arr) catch {
-                gpa.free(key);
-                gpa.free(ver);
-                gpa.free(arr);
-                return WsError.OutOfMemory;
-            };
-        }
-    }
-
     // Roots = member summaries (precomputed in path_nodes).
     var roots: std.ArrayList(resolve.SummaryNode) = .empty;
     errdefer roots.deinit(gpa);
@@ -1141,6 +1107,10 @@ fn addPathNode(gpa: std.mem.Allocator, reg: *WsRegistry, dir: []const u8, is_mem
             },
             .deps = deps,
             .links = ext.links,
+            // Provider-tagged path source: the core activates member/path
+            // edges with this source, so they unify with the path roots
+            // instead of splitting into registry-placeholder copies.
+            .source = .{ .path = "" },
         },
         .ext = ext,
     });
@@ -1176,7 +1146,7 @@ fn previousFromLock(reg: *WsRegistry, text: []const u8) WsError![]resolve.Resolv
             const rname = alloc.dupe(u8, r.name) catch return WsError.OutOfMemory;
             // Ref sources are name-based placeholders here (only names and
             // versions feed the keep-closure walk); the resolved graph gets
-            // real sources from the fixup below.
+            // real sources from the provider-tagged summaries in the core.
             try refs.append(reg.gpa, .{ .name = rname, .version = pv, .source = .{ .path = "" } });
         }
         const dep_slice = refs.toOwnedSlice(reg.gpa) catch return WsError.OutOfMemory;
@@ -1272,28 +1242,24 @@ fn runResolve(gpa: std.mem.Allocator, load: *WsLoad) WsError!resolve.ResolveGrap
     return .{ .arena = out_arena, .nodes = nodes };
 }
 
-/// Source fixup (the core's placeholder-registry documented in
-/// `resolve.zig`: every non-root node emerges `.registry`, including path
-/// packages). Re-key by (name, version) against the walked path set; patch
-/// and registry nodes keep the canonical registry source. Both nodes AND
-/// refs are rewritten consistently (the writer renders refs through the
-/// same shortening/sorting).
+/// Edge-dedup rendering pass (cargo's `Graph<PackageId, HashSet<Dependency>>`
+/// unique-neighbor rule: a member's normal+dev edges to the same crate
+/// resolve to ONE node and render ONE lock edge). The core's `buildGraph`
+/// already dedups, so this is an idempotent rendering-rule enforcement.
+///
+/// Sources need no fixup here anymore: summaries are provider-tagged
+/// (`addPathNode` tags path, index entries default to the registry URL),
+/// so the core activates member/path nodes directly with their true
+/// sources -- the old re-key + node-merge workaround for the root/edge
+/// source split is obsolete and removed.
 fn fixupSources(load: *WsLoad, graph: *resolve.ResolveGraph) WsError!void {
+    _ = load;
     // In-place normalization of arena-owned (genuinely mutable) memory:
     // the `[]const` on node/ref slices is a read-default, not an
     // immutability guarantee.
     const nodes: []resolve.ResolvedNode = @constCast(graph.nodes);
     for (nodes) |*n| {
-        if (isPathNode(load, n.name, n.version)) n.source = .{ .path = "" };
         const deps: []resolve.ResolvedRef = @constCast(n.deps);
-        for (deps) |*r| {
-            if (isPathNode(load, r.name, r.version)) r.source = .{ .path = "" };
-        }
-        // Edge dedup (cargo's `Graph<PackageId, HashSet<Dependency>>` +
-        // unique-neighbor rendering: a member's normal+dev edges to the
-        // same crate resolve to ONE node and render ONE lock edge, while
-        // the core records one ref per pending edge). Stable: first
-        // occurrence wins (the writer sorts edges anyway).
         var w: usize = 0;
         for (deps, 0..) |*r, i| {
             var dup = false;
@@ -1310,48 +1276,6 @@ fn fixupSources(load: *WsLoad, graph: *resolve.ResolveGraph) WsError!void {
         }
         n.deps = deps[0..w];
     }
-    // Node merge: the core activates workspace members once as roots
-    // (path source) and again via edges (registry placeholder), yielding
-    // two nodes for one package. Post-fixup both carry the true source, so
-    // same-(name, version, source) nodes merge with unioned dep sets
-    // (cargo has one node per PackageId). Distinct versions and distinct
-    // real sources never share a key and are untouched. Union arrays grow
-    // in the graph arena.
-    const galloc = graph.arena.allocator();
-    var w: usize = 0;
-    for (nodes, 0..) |*n, i| {
-        var target: ?*resolve.ResolvedNode = null;
-        for (nodes[0..w]) |*k| {
-            if (std.mem.eql(u8, k.name, n.name) and k.version.eql(n.version) and sourceEql(k.source, n.source)) {
-                target = k;
-                break;
-            }
-        }
-        if (target) |t| {
-            t.deps = unionDeps(galloc, t.deps, n.deps) catch return WsError.OutOfMemory;
-        } else {
-            nodes[w] = nodes[i];
-            w += 1;
-        }
-    }
-    graph.nodes = nodes[0..w];
-}
-
-fn unionDeps(alloc: std.mem.Allocator, a: []const resolve.ResolvedRef, b: []const resolve.ResolvedRef) WsError![]resolve.ResolvedRef {
-    var out: std.ArrayList(resolve.ResolvedRef) = .empty;
-    errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, a);
-    for (b) |*r| {
-        var found = false;
-        for (out.items) |*k| {
-            if (std.mem.eql(u8, k.name, r.name) and k.version.eql(r.version) and sourceEql(k.source, r.source)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) try out.append(alloc, r.*);
-    }
-    return out.toOwnedSlice(alloc) catch return WsError.OutOfMemory;
 }
 
 fn sourceEql(a: sources.SourceId, b: sources.SourceId) bool {
@@ -1369,13 +1293,6 @@ fn sourceEql(a: sources.SourceId, b: sources.SourceId) bool {
             else => return false,
         },
     }
-}
-
-fn isPathNode(load: *WsLoad, name: []const u8, version: semver.Version) bool {
-    for (load.reg.path_nodes.items) |*pn| {
-        if (std.mem.eql(u8, pn.name, name) and pn.version.eql(version)) return true;
-    }
-    return false;
 }
 
 /// Checksum map for `writeLock` (`checksumKey` convention): registry nodes

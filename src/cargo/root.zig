@@ -14,6 +14,14 @@ pub const resolve = @import("resolve.zig");
 pub const sources = @import("sources.zig");
 pub const features = @import("features.zig");
 pub const oracle = @import("oracle.zig");
+pub const toolchain = @import("toolchain.zig");
+pub const profile = @import("profile.zig");
+pub const driver = @import("driver.zig");
+pub const fingerprint = @import("fingerprint.zig");
+pub const actionkey = @import("actionkey.zig");
+pub const invoke = @import("invoke.zig");
+pub const compile = @import("compile.zig");
+pub const pipeline = @import("pipeline.zig");
 
 // Same pattern as src/store/root.zig: referencing each submodule from a
 // test block pulls its inline `test "…"` blocks into `zig build test`.
@@ -31,4 +39,12 @@ test {
     _ = @import("sources.zig");
     _ = @import("features.zig");
     _ = @import("oracle.zig");
+    _ = @import("toolchain.zig");
+    _ = @import("profile.zig");
+    _ = @import("driver.zig");
+    _ = @import("fingerprint.zig");
+    _ = @import("actionkey.zig");
+    _ = @import("invoke.zig");
+    _ = @import("compile.zig");
+    _ = @import("pipeline.zig");
 }

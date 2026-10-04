@@ -130,10 +130,13 @@ pub fn promote(store: *root.Store, io: Io, digest: digest_mod.Digest) ColdError!
     store.dir.deleteFile(io, cold_full) catch {};
 }
 
-/// Spec §9.4: executable-ish kinds stay hot.
+/// Spec §9.4: executable-ish kinds stay hot. Incremental sessions demote
+/// like any other object (M4 Task 9: `kind=incremental` is a bounded
+/// global class under the soft tag budget, never pinned hot).
 pub fn isDemotable(kind: root.Kind) bool {
     return switch (kind) {
         .bin, .dylib => false,
+        .incremental => true,
         else => true,
     };
 }

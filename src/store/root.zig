@@ -42,7 +42,7 @@ pub const disk_usage = disk_usage_mod;
 pub const disk_usage_pub = disk_usage_mod;
 
 pub const Kind = enum {
-    rlib, rmeta, obj, staticlib, dylib, bin, dep_info, manifest, build_script_out, source, other,
+    rlib, rmeta, obj, staticlib, dylib, bin, dep_info, manifest, build_script_out, source, incremental, other,
 };
 
 /// Storage-v2 §16 tag surface at module level (single spelling; Store
