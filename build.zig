@@ -25,18 +25,38 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    // Cargo-compatible frontend (Plan C milestone 1). The frontend consumes
+    // the Store through a named module import: Zig 0.16 rejects the same
+    // file living in two modules, so view.zig uses @import("store") rather
+    // than a relative path into src/store/.
+    const cargo_mod = b.createModule(.{
+        .root_source_file = b.path("src/cargo/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "store", .module = store_mod }},
+    });
+
     const tests = b.addTest(.{ .root_module = store_mod });
     addSqlite3(store_mod, b);
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
+    // Cargo frontend tests get their own binary (test collection stays
+    // inside one module graph, mirroring the store target above). sqlite3.c
+    // arrives via store_mod (already imported); cargo_mod itself stays
+    // C-free so the exe never sees duplicate sqlite symbols.
+    const cargo_tests = b.addTest(.{ .root_module = cargo_mod });
+    const run_cargo_tests = b.addRunArtifact(cargo_tests);
+    test_step.dependOn(&run_cargo_tests.step);
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{.{ .name = "store", .module = store_mod }},
+        .imports = &.{ .{ .name = "store", .module = store_mod }, .{ .name = "cargo", .module = cargo_mod } },
     });
     const exe = b.addExecutable(.{ .name = "rime", .root_module = exe_mod });
     // NOTE: sqlite3 is wired only into store_mod (index.zig owns every
