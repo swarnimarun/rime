@@ -36,12 +36,16 @@
 //! - `DepEdge.optional` edges are INVISIBLE to resolution (never enqueued,
 //!   never recorded): they enter the graph only via Task 5 `unifyV1` +
 //!   `pruneOptional`. `build_only` is carried on the edge (Task 6 consumes it).
-//! - Sources: the Task-3 `Registry` seam carries no per-summary source, so
-//!   the resolver assigns workspace-member roots `path("")` (per the
-//!   interface note "workspace-member roots record path sources") and every
-//!   other node the default crates.io sparse URL. Task 7/10 wiring replaces
-//!   this placeholder with `DepEdgeFull.source` plumbing; no M3a test
-//!   observes source VALUES (`find` ignores them).
+//! - Sources: each `SummaryNode` carries its provider-tagged `source`
+//!   (path for workspace members / path deps, the default crates.io sparse
+//!   URL for index entries). Roots activate with `path("")` (per the
+//!   interface note "workspace-member roots record path sources");
+//!   non-root activations adopt `cand.node.source`, so a member/path edge
+//!   hits its path root via `findActive` instead of activating a second
+//!   registry-placeholder copy (the old root/edge source split, fixed here
+//!   rather than in the oracle post-fixup). The registry placeholder
+//!   survives only for genuine external registry deps. `find` ignores
+//!   source values.
 //! - `Registry.queryFn` slices must stay valid for the whole call; activated
 //!   summaries are copied by value at activation time.
 //! - `QueryError.FetchFailed` maps to `ResolveError.NoMatchingVersion`
@@ -72,6 +76,12 @@ pub const SummaryNode = struct {
     candidate: index.Candidate, // the selected version + metadata
     deps: []const DepEdge, // edges OUT of this version (version-specific!)
     links: ?[]const u8, // `links = "..."` native-lib key (duplicates conflict)
+    // Provider-tagged source: path for workspace members / path deps,
+    // default registry for index entries. The resolver activates with this
+    // source (cargo's `PackageId` source comes from the resolving `SourceId`),
+    // so member/path edges unify with their path roots. Defaulted so the
+    // registry seam's index entries need no per-node tagging.
+    source: sources.SourceId = .{ .registry = default_registry },
 };
 
 pub const ResolveGraph = struct {
@@ -108,8 +118,8 @@ pub const Registry = struct { // test/M2 seam: all known versions of a crate, wi
     queryFn: *const fn (ctx: *anyopaque, name: []const u8) QueryError![]const SummaryNode,
 };
 
-/// Default registry assumed for non-root nodes until Task 7/10 plumbing
-/// assigns real per-edge sources (see module docs).
+/// Default registry for index-provided summaries (the `SummaryNode.source`
+/// default); path providers tag their own summaries with path sources.
 const default_registry: []const u8 = "sparse+https://github.com/rust-lang/crates.io-index";
 
 // --- semver compatibility classes (types.rs::SemverCompatibility) ---
@@ -466,6 +476,12 @@ fn lessPendingKey(aname: []const u8, aparent: []const u8, aseq: usize, bname: []
     return aseq < bseq;
 }
 
+var dbg_n: usize = 0;
+fn dbgEv(comptime fmt: []const u8, args: anytype) void {
+    if (dbg_n >= 40) return;
+    dbg_n += 1;
+    std.debug.print(fmt, args);
+}
 fn findActive(name: []const u8, version: semver.Version, source: sources.SourceId, state: *const State) ?usize {
     for (state.actives.items, 0..) |*a, i| {
         if (std.mem.eql(u8, a.name, name) and sourceEql(a.source, source) and a.version.eql(version)) return i;
@@ -499,6 +515,7 @@ fn resolveRec(
     if (pick.candidates.len == 0) {
         // Zero viable candidates: nothing to record (no candidate version
         // exists to key a conflict on); fail with the sticky kind.
+        dbgEv("STUCK0 {s}->{s}\n", .{ parent_name, frame.edge.name });
         return if (state.links_conflict_seen) ResolveError.Conflict else ResolveError.NoMatchingVersion;
     }
 
@@ -507,7 +524,13 @@ fn resolveRec(
         if (cstore.blocks(target, keys)) continue;
 
         // eql-active (same name+version+source): edge already satisfied.
-        const src: sources.SourceId = .{ .registry = default_registry };
+        // The source is provider-tagged on the summary (path for workspace
+        // members / path deps, registry default for index entries): a member
+        // edge carries the real path source and hits its path root, so
+        // members activate exactly once (cargo's `ActivationsKey` is
+        // (name, version, source)). The registry placeholder applies only
+        // to genuine external registry deps.
+        const src: sources.SourceId = cand.node.source;
         if (findActive(frame.edge.name, cand.version, src, state)) |idx| {
             var snap = try takeSnapshot(gpa, state);
             _ = state.pending.swapRemove(pick.index);
@@ -584,6 +607,7 @@ fn resolveRec(
 
     // Exhausted: record the conflict set (active keys + failed dep) so future
     // frames skip this known-bad combination (conflict_cache.rs semantic).
+    dbgEv("STUCKN {s}->{s} nc={d}\n", .{ parent_name, frame.edge.name, pick.candidates.len });
     {
         var ids: std.ArrayList(IdKey) = .empty;
         defer ids.deinit(gpa);
@@ -672,10 +696,23 @@ fn buildGraph(gpa: std.mem.Allocator, state: *const State) ResolveError!ResolveG
         for (state.resolutions.items) |r| {
             if (r.parent != i) continue;
             const c = state.actives.items[r.child];
+            // Unique-neighbor rendering (`Graph<PackageId, HashSet<Dependency>>`
+            // + `encodable_package_id`: one pending edge per dep kind can
+            // resolve to the same node -- e.g. a member's normal+dev edges
+            // to one crate -- but the lock renders ONE edge). Stable: first
+            // occurrence wins (the writer sorts edges anyway).
+            var dup = false;
+            for (refs[0..k]) |*prev| {
+                if (std.mem.eql(u8, prev.name, c.name) and prev.version.eql(c.version) and sourceEql(prev.source, c.source)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
             refs[k] = .{ .name = c.name, .version = c.version, .source = c.source };
             k += 1;
         }
-        nodes[i] = .{ .name = a.name, .version = a.version, .source = a.source, .deps = refs };
+        nodes[i] = .{ .name = a.name, .version = a.version, .source = a.source, .deps = refs[0..k] };
     }
     return ResolveGraph{ .arena = arena, .nodes = nodes };
 }
@@ -1111,6 +1148,100 @@ test "resolve rejects duplicate links" {
     };
     const filter = index.QueryFilter{ .allow_yanked = &.{}, .max_pubtime = null, .min_versions_first = false, .rust_versions = &.{}, .preferred = &.{} };
     try std.testing.expectError(ResolveError.Conflict, resolveGraph(gpa, &roots, .{ .ctx = @ptrCast(&stub), .queryFn = &Stub.query }, filter));
+}
+
+test "resolve activates workspace path members exactly once with path sources" {
+    // Root/edge source-split regression (M4 blocker): before the fix, every
+    // non-root activation took the registry placeholder source, so a member
+    // that is BOTH a path root and a path-edge target activated twice (once
+    // per source) and the oracle had to merge the copies post-hoc. Member
+    // summaries carry their real path source (provider-tagged, as
+    // `core/resolver` derives `PackageId` sources from the resolving
+    // `SourceId`), so member edges hit the path root via `findActive`.
+    // Shape mirrors validation/basic-workspace: 3 path members
+    // (cli-bin -> core-lib -> util) plus one external registry crate.
+    const gpa = std.testing.allocator;
+    const path_src: sources.SourceId = .{ .path = "" };
+    const req_any = semver.OptVersionReq{ .any = {} };
+    const bin_edges = [_]DepEdge{
+        .{ .name = "core-lib", .req = req_any, .optional = false, .build_only = false },
+        .{ .name = "ext", .req = req_any, .optional = false, .build_only = false },
+    };
+    const lib_edges = [_]DepEdge{
+        .{ .name = "util", .req = req_any, .optional = false, .build_only = false },
+    };
+    const no_edges = [_]DepEdge{};
+    const bin_nodes = [_]SummaryNode{
+        .{ .name = "cli-bin", .candidate = .{ .name = "cli-bin", .version = try semver.Version.parse("0.1.0"), .yanked = false, .checksum = null, .rust_version = null, .pubtime = null }, .deps = &bin_edges, .links = null, .source = path_src },
+    };
+    const lib_nodes = [_]SummaryNode{
+        .{ .name = "core-lib", .candidate = .{ .name = "core-lib", .version = try semver.Version.parse("0.1.0"), .yanked = false, .checksum = null, .rust_version = null, .pubtime = null }, .deps = &lib_edges, .links = null, .source = path_src },
+    };
+    const util_nodes = [_]SummaryNode{
+        .{ .name = "util", .candidate = .{ .name = "util", .version = try semver.Version.parse("0.1.0"), .yanked = false, .checksum = null, .rust_version = null, .pubtime = null }, .deps = &no_edges, .links = null, .source = path_src },
+    };
+    const ext_nodes = [_]SummaryNode{
+        .{ .name = "ext", .candidate = .{ .name = "ext", .version = try semver.Version.parse("1.0.0"), .yanked = false, .checksum = null, .rust_version = null, .pubtime = null }, .deps = &.{}, .links = null },
+    };
+    const Stub = struct {
+        bin: []const SummaryNode,
+        lib: []const SummaryNode,
+        util: []const SummaryNode,
+        ext: []const SummaryNode,
+        fn query(ctx: *anyopaque, name: []const u8) QueryError![]const SummaryNode {
+            const self: *const @This() = @ptrCast(@alignCast(ctx));
+            if (std.mem.eql(u8, name, "cli-bin")) return self.bin;
+            if (std.mem.eql(u8, name, "core-lib")) return self.lib;
+            if (std.mem.eql(u8, name, "util")) return self.util;
+            if (std.mem.eql(u8, name, "ext")) return self.ext;
+            return &.{};
+        }
+    };
+    var stub = Stub{ .bin = &bin_nodes, .lib = &lib_nodes, .util = &util_nodes, .ext = &ext_nodes };
+    const roots = [_]SummaryNode{ bin_nodes[0], lib_nodes[0], util_nodes[0] };
+    const filter = index.QueryFilter{ .allow_yanked = &.{}, .max_pubtime = null, .min_versions_first = false, .rust_versions = &.{}, .preferred = &.{} };
+    var graph = try resolveGraph(gpa, &roots, .{ .ctx = @ptrCast(&stub), .queryFn = &Stub.query }, filter);
+    defer graph.deinit();
+    // Exactly one node per member plus the external crate: no duplicate
+    // activation via a registry-placeholder edge copy.
+    try std.testing.expectEqual(@as(usize, 4), graph.nodes.len);
+    for ([_]struct { name: []const u8, path: bool }{
+        .{ .name = "cli-bin", .path = true },
+        .{ .name = "core-lib", .path = true },
+        .{ .name = "util", .path = true },
+        .{ .name = "ext", .path = false },
+    }) |want| {
+        var hits: usize = 0;
+        for (graph.nodes) |n| {
+            if (!std.mem.eql(u8, n.name, want.name)) continue;
+            hits += 1;
+            if (want.path) {
+                try std.testing.expect(n.source == .path);
+            } else {
+                try std.testing.expect(n.source == .registry);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), hits);
+    }
+    // Member edges carry the real path source (no registry placeholder).
+    const bin = graph.find("cli-bin", try semver.Version.parse("0.1.0")).?;
+    var saw_lib = false;
+    for (bin.deps) |r| {
+        if (std.mem.eql(u8, r.name, "core-lib")) {
+            saw_lib = true;
+            try std.testing.expect(r.source == .path);
+        }
+    }
+    try std.testing.expect(saw_lib);
+    const lib = graph.find("core-lib", try semver.Version.parse("0.1.0")).?;
+    var saw_util = false;
+    for (lib.deps) |r| {
+        if (std.mem.eql(u8, r.name, "util")) {
+            saw_util = true;
+            try std.testing.expect(r.source == .path);
+        }
+    }
+    try std.testing.expect(saw_util);
 }
 
 test "resolve errors when nothing satisfies" {

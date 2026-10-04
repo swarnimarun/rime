@@ -306,7 +306,7 @@ pub const QueryFilter = struct {
     max_pubtime: ?i64,           // publish_time pre-filter; null = no filter
     min_versions_first: bool,    // -Zminimal-versions ordering (VersionOrdering::MinimumVersionsFirst)
     rust_versions: []const semver.Version, // workspace rust versions for msrv-compat count (empty = skip)
-    preferred: []const semver.Version,     // previous-lock versions tried first (prefer_package_id)
+    preferred: []const PreferredId,     // previous-lock versions tried first (prefer_package_id)
 };
 pub const IndexError = error{ OutOfMemory, UnsupportedIndexField, InvalidIndexLine }; // NOTE: index-side artifact/public data NEVER yields UnsupportedIndexField (carried verbatim per §0.6); the variant is retained for genuinely unsupported index surface only.
 pub fn parseIndexLine(gpa: std.mem.Allocator, line: []const u8) IndexError!IndexEntry; // one JSON object per line, exactly the sparse-index wire shape
