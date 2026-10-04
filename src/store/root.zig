@@ -5,6 +5,7 @@ const disk_usage_mod = @import("disk_usage.zig");
 const layout = @import("layout.zig");
 const test_support = @import("test_support.zig");
 const ingest = @import("ingest.zig");
+const objects = @import("objects.zig");
 
 const Io = std.Io;
 
@@ -94,6 +95,21 @@ pub const Store = struct {
         return ingest.putFile(store, io, src, kind);
     }
 
+    pub const ReadError = objects.ReadError;
+    pub const VerifyError = objects.VerifyError;
+
+    pub fn exists(store: *Store, io: Io, d: Digest) bool {
+        return objects.exists(store, io, d);
+    }
+
+    pub fn readObject(store: *Store, io: Io, d: Digest, gpa: std.mem.Allocator) ReadError![]u8 {
+        return objects.readObject(store, io, d, gpa);
+    }
+
+    pub fn verifyObject(store: *Store, io: Io, d: Digest) VerifyError!void {
+        return objects.verifyObject(store, io, d);
+    }
+
     fn sweepTmp(io: Io, dir: Io.Dir) OpenError!void {
         const tmp = try dir.openDir(io, layout.tmp_dir, .{ .iterate = true });
         defer tmp.close(io);
@@ -135,4 +151,5 @@ test {
     _ = @import("layout.zig");
     _ = @import("test_support.zig");
     _ = @import("ingest.zig");
+    _ = @import("objects.zig");
 }
