@@ -286,18 +286,18 @@ pub const Store = struct {
     /// Size of either tier copy of an object; 0 when absent. Pinned-byte
     /// accounting counts cold copies at their compressed size (spec §9.4).
     fn objectByteSize(store: *Store, io: Io, d: Digest) u64 {
-        var rbuf: [67]u8 = undefined;
+        var rbuf: [65]u8 = undefined;
         const rel = d.relPath(&rbuf);
-        var hot_buf: [75]u8 = undefined;
+        var hot_buf: [73]u8 = undefined;
         @memcpy(hot_buf[0..8], "objects/");
         @memcpy(hot_buf[8..], rel);
-        if (store.dir.statFile(io, hot_buf[0..75], .{})) |st| {
+        if (store.dir.statFile(io, hot_buf[0..73], .{})) |st| {
             return st.size;
         } else |_| {}
-        var cold_buf: [75]u8 = undefined;
+        var cold_buf: [73]u8 = undefined;
         @memcpy(cold_buf[0..5], "cold/");
-        @memcpy(cold_buf[5..72], rel);
-        if (store.dir.statFile(io, cold_buf[0..72], .{})) |st| {
+        @memcpy(cold_buf[5..70], rel);
+        if (store.dir.statFile(io, cold_buf[0..70], .{})) |st| {
             return st.size;
         } else |_| {
             return 0;

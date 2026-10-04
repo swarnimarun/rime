@@ -16,16 +16,16 @@ pub const SweepError = error{Unexpected, OutOfMemory} || Io.Cancelable || Io.Dir
 const EntryJson = struct { manifest_hex: []const u8, created_ms: i64 };
 
 /// Store-relative entry path "actions/ab/<hex>" (spec §6; fanout mirrors objects).
-fn entryFull(key: digest_mod.Digest, buf: *[75]u8) []const u8 {
-    var rbuf: [67]u8 = undefined;
+fn entryFull(key: digest_mod.Digest, buf: *[73]u8) []const u8 {
+    var rbuf: [65]u8 = undefined;
     const rel = layout.actionPath(key, &rbuf);
     @memcpy(buf[0..8], "actions/");
     @memcpy(buf[8..], rel);
-    return buf[0..75];
+    return buf[0..73];
 }
 
 pub fn putAction(io: Io, store_dir: Io.Dir, key: digest_mod.Digest, manifest: digest_mod.Digest, now_ms: i64) PutError!void {
-    var full_buf: [75]u8 = undefined;
+    var full_buf: [73]u8 = undefined;
     const full = entryFull(key, &full_buf);
     const hex = manifest.toHex();
     const bytes = std.json.Stringify.valueAlloc(std.heap.page_allocator, EntryJson{
@@ -37,7 +37,7 @@ pub fn putAction(io: Io, store_dir: Io.Dir, key: digest_mod.Digest, manifest: di
 }
 
 pub fn getAction(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir, key: digest_mod.Digest) GetError!?ActionEntry {
-    var full_buf: [75]u8 = undefined;
+    var full_buf: [73]u8 = undefined;
     const full = entryFull(key, &full_buf);
     const bytes = store_dir.readFileAlloc(io, full, gpa, .unlimited) catch |err| switch (err) {
         error.FileNotFound => return null,
@@ -95,9 +95,13 @@ fn sweepInner(
         defer sub.close(io);
         var it = sub.iterate();
         while (try it.next(io)) |entry| {
-            // Entry files are named by the full 64-char hex key.
-            if (entry.name.len != 64) continue;
-            const key = digest_mod.Digest.fromHex(entry.name) catch continue;
+            // Entry files are named by the 62-char hex remainder (spec
+            // §6 fanout mirrors objects); the fanout dir is the first byte.
+            if (entry.name.len != 62) continue;
+            var hex_buf: [64]u8 = undefined;
+            @memcpy(hex_buf[0..2], fanout.name);
+            @memcpy(hex_buf[2..64], entry.name);
+            const key = digest_mod.Digest.fromHex(hex_buf[0..64]) catch continue;
             // Corrupt entries must not abort the sweep (or gc); skip them
             // like other unreadable state files. Propagate OOM/cancel.
             const got = getAction(io, gpa, store_dir, key) catch |err| switch (err) {
@@ -162,16 +166,16 @@ test "sweepStale skips corrupt entries without aborting" {
     try ts.store.putAction(io, stale_key, stale_man);
 
     // Delete the manifest so the valid entry is stale.
-    var full_buf: [75]u8 = undefined;
-    var rbuf: [67]u8 = undefined;
+    var full_buf: [73]u8 = undefined;
+    var rbuf: [65]u8 = undefined;
     const rel = stale_man.relPath(&rbuf);
     @memcpy(full_buf[0..8], "objects/");
     @memcpy(full_buf[8..], rel);
-    try ts.store.dir.deleteFile(io, full_buf[0..75]);
+    try ts.store.dir.deleteFile(io, full_buf[0..73]);
 
-    // Corrupt entry: valid 64-hex name, invalid JSON body.
+    // Corrupt entry: valid 62-hex name, invalid JSON body.
     const corrupt_key = root.hashBytes("corrupt-sweep-bad");
-    var corrupt_full: [75]u8 = undefined;
+    var corrupt_full: [73]u8 = undefined;
     const corrupt_path = entryFull(corrupt_key, &corrupt_full);
     try ts.store.dir.createDirPath(io, corrupt_path[0..10]);
     try ts.store.dir.writeFile(io, .{ .sub_path = corrupt_path, .data = "{not json" });
@@ -194,12 +198,12 @@ test "sweepStale removes entries whose manifest object is gone" {
     try ts.store.putAction(io, key, man);
 
     // Delete the manifest object behind the entry's back.
-    var full_buf: [75]u8 = undefined;
-    var rbuf: [67]u8 = undefined;
+    var full_buf: [73]u8 = undefined;
+    var rbuf: [65]u8 = undefined;
     const rel = man.relPath(&rbuf);
     @memcpy(full_buf[0..8], "objects/");
     @memcpy(full_buf[8..], rel);
-    try ts.store.dir.deleteFile(io, full_buf[0..75]);
+    try ts.store.dir.deleteFile(io, full_buf[0..73]);
 
     var cb = ExistsCtx{ .store = &ts.store, .io = io };
     const removed = try sweepStale(io, gpa, ts.store.dir, ExistsCtx.call, &cb);

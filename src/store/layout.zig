@@ -13,21 +13,21 @@ pub const format_version: u32 = 1;
 
 pub const FormatJson = struct { format: u32 };
 
-pub fn objectPath(d: Digest, buf: *[67]u8) []const u8 {
+pub fn objectPath(d: Digest, buf: *[65]u8) []const u8 {
     return d.relPath(buf);
 }
 
-pub fn coldPath(d: Digest, buf: *[67]u8) []const u8 {
+pub fn coldPath(d: Digest, buf: *[65]u8) []const u8 {
     return d.relPath(buf);
 }
 
-pub fn actionPath(key: Digest, buf: *[67]u8) []const u8 {
+pub fn actionPath(key: Digest, buf: *[65]u8) []const u8 {
     return key.relPath(buf);
 }
 
 test "object and action paths fan out identically" {
     const d = digest_mod.hashBytes("layout");
-    var b1: [67]u8 = undefined;
-    var b2: [67]u8 = undefined;
+    var b1: [65]u8 = undefined;
+    var b2: [65]u8 = undefined;
     try std.testing.expectEqualStrings(objectPath(d, &b1), actionPath(d, &b2));
 }

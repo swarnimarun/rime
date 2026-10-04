@@ -64,7 +64,7 @@ fn materializeInto(
     var store_abs_buf: [Io.Dir.max_path_bytes]u8 = undefined;
     const store_abs_len = store.dir.realPathFile(io, ".", &store_abs_buf) catch return error.Unexpected;
 
-    var obj_rel_buf: [75]u8 = undefined;
+    var obj_rel_buf: [73]u8 = undefined;
     const obj_rel = objectFull(digest, &obj_rel_buf);
 
     var src_path_buf: [Io.Dir.max_path_bytes]u8 = undefined;
@@ -102,7 +102,7 @@ fn copyToTmp(
     dest_dir: Io.Dir,
     tmp_rel: []const u8,
 ) MaterializeError!MaterializeMethod {
-    var obj_buf: [75]u8 = undefined;
+    var obj_buf: [73]u8 = undefined;
     const src = store.dir.openFile(io, objectFull(digest, &obj_buf), .{}) catch |err| switch (err) {
         // Cold-only objects have no hot-tier file: fall back to a
         // cold-aware read (transparent gunzip) instead of failing.
@@ -157,12 +157,12 @@ fn copyColdAwareToTmp(
 }
 
 /// Store-relative object path: "objects/<hex[0..2]>/<hex[2..]>".
-fn objectFull(d: digest_mod.Digest, buf: *[75]u8) []const u8 {
-    var rbuf: [67]u8 = undefined;
+fn objectFull(d: digest_mod.Digest, buf: *[73]u8) []const u8 {
+    var rbuf: [65]u8 = undefined;
     const rel = d.relPath(&rbuf);
     @memcpy(buf[0..8], "objects/");
     @memcpy(buf[8..], rel);
-    return buf[0..75];
+    return buf[0..73];
 }
 
 test "copy_only strategy writes identical bytes atomically" {

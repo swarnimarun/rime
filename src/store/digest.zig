@@ -14,14 +14,15 @@ pub const Digest = struct {
         return .{ .bytes = out };
     }
 
-    /// Relative object path inside the store, e.g. "ab/cdef…".
-    pub fn relPath(d: Digest, buf: *[67]u8) []const u8 {
+    /// Relative object path inside the store, e.g. "ab/cdef…" (spec §5.1,
+    /// §6: "objects/<hex[0..2]>/<hex[2..]>", 2 + 1 + 62 = 65 chars).
+    pub fn relPath(d: Digest, buf: *[65]u8) []const u8 {
         const hex = d.toHex();
         buf[0] = hex[0];
         buf[1] = hex[1];
         buf[2] = '/';
-        @memcpy(buf[3..], &hex);
-        return buf[0..67];
+        @memcpy(buf[3..65], hex[2..]);
+        return buf[0..65];
     }
 };
 
@@ -42,10 +43,19 @@ test "blake3 known answer for empty input" {
 
 test "rel path fans out on first byte" {
     const d = hashBytes("x");
-    var buf: [67]u8 = undefined;
+    var buf: [65]u8 = undefined;
     const p = d.relPath(&buf);
     try std.testing.expectEqual(@as(u8, '/'), p[2]);
-    try std.testing.expectEqual(@as(usize, 67), p.len);
+    try std.testing.expectEqual(@as(usize, 65), p.len);
+}
+
+test "rel path holds hex without the fanout prefix" {
+    const d = hashBytes("x");
+    const hex = d.toHex();
+    var buf: [65]u8 = undefined;
+    const p = d.relPath(&buf);
+    try std.testing.expectEqualStrings(hex[0..2], p[0..2]);
+    try std.testing.expectEqualStrings(hex[2..], p[3..65]);
 }
 
 pub const HashFileError = std.Io.File.ReadPositionalError;

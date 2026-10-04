@@ -52,10 +52,14 @@ fn scanTier(
         defer sub.close(io);
         var it = sub.iterate();
         while (try it.next(io)) |entry| {
-            // Object files are named by the full 64-char hex digest
-            // (Digest.relPath duplicates the first byte after the slash).
-            if (entry.name.len != 64) continue;
-            const d = digest_mod.Digest.fromHex(entry.name) catch continue;
+            // Object files are named by the 62-char hex remainder
+            // (spec §6: "objects/<hex[0..2]>/<hex[2..]>"); the fanout
+            // dir supplies the first byte.
+            if (entry.name.len != 62) continue;
+            var hex_buf: [64]u8 = undefined;
+            @memcpy(hex_buf[0..2], fanout.name);
+            @memcpy(hex_buf[2..64], entry.name);
+            const d = digest_mod.Digest.fromHex(hex_buf[0..64]) catch continue;
             const st = sub.statFile(io, entry.name, .{}) catch continue;
             try list.append(gpa, .{
                 .digest = d,
@@ -104,7 +108,7 @@ fn parseKindLine(line: []const u8) error{InvalidLine}!KindEntry {
 
 /// Updates mtime on cache hits at most once per touch_interval_ns (spec §9.2).
 pub fn touch(store: *root.Store, io: Io, digest: digest_mod.Digest) void {
-    var path_buf: [75]u8 = undefined;
+    var path_buf: [73]u8 = undefined;
     const f = store.dir.openFile(io, objectFull(digest, &path_buf), .{}) catch return;
     defer f.close(io);
     const st = f.stat(io) catch return;
@@ -115,12 +119,12 @@ pub fn touch(store: *root.Store, io: Io, digest: digest_mod.Digest) void {
 }
 
 /// Store-relative object path: "objects/<hex[0..2]>/<hex[2..]>".
-fn objectFull(d: digest_mod.Digest, buf: *[75]u8) []const u8 {
-    var rbuf: [67]u8 = undefined;
+fn objectFull(d: digest_mod.Digest, buf: *[73]u8) []const u8 {
+    var rbuf: [65]u8 = undefined;
     const rel = d.relPath(&rbuf);
     @memcpy(buf[0..8], "objects/");
     @memcpy(buf[8..], rel);
-    return buf[0..75];
+    return buf[0..73];
 }
 
 test "scan reports tier size mtime and kind" {
@@ -146,15 +150,15 @@ test "touch refreshes mtime only after the throttle interval" {
     defer ts.deinit(io);
 
     const d = try ts.store.putBytes(io, "touched", .other);
-    var pre_buf: [75]u8 = undefined;
+    var pre_buf: [73]u8 = undefined;
     const pre_mtime = (try ts.store.dir.statFile(io, objectFull(d, &pre_buf), .{})).mtime.toMilliseconds();
     ts.store.touch(io, d); // within 1h of ingest: no change
-    var post_buf: [75]u8 = undefined;
+    var post_buf: [73]u8 = undefined;
     const post_mtime = (try ts.store.dir.statFile(io, objectFull(d, &post_buf), .{})).mtime.toMilliseconds();
     try std.testing.expectEqual(pre_mtime, post_mtime);
 
     // Backdate the object beyond the throttle, then touch must refresh it.
-    var buf: [75]u8 = undefined;
+    var buf: [73]u8 = undefined;
     const f = try ts.store.dir.openFile(io, objectFull(d, &buf), .{});
     defer f.close(io);
     const old = std.Io.Timestamp.fromNanoseconds(1_000_000_000);

@@ -18,30 +18,30 @@ pub const VerifyError = error{ ObjectNotFound, DigestMismatch, Unexpected } ||
     Io.Cancelable || Io.Dir.ReadFileAllocError;
 
 /// Store-relative object path "objects/ab/cdef…" (spec §5.1, §6).
-fn objectFull(digest: Digest, buf: *[75]u8) []const u8 {
-    var rbuf: [67]u8 = undefined;
+fn objectFull(digest: Digest, buf: *[73]u8) []const u8 {
+    var rbuf: [65]u8 = undefined;
     const rel = digest.relPath(&rbuf);
     @memcpy(buf[0..8], "objects/");
     @memcpy(buf[8..], rel);
-    return buf[0..75];
+    return buf[0..73];
 }
 
 /// Store-relative cold path "cold/ab/cdef…" (spec §9.4).
-fn coldFull(digest: Digest, buf: *[75]u8) []const u8 {
-    var rbuf: [67]u8 = undefined;
+fn coldFull(digest: Digest, buf: *[70]u8) []const u8 {
+    var rbuf: [65]u8 = undefined;
     const rel = digest.relPath(&rbuf);
     @memcpy(buf[0..5], "cold/");
-    @memcpy(buf[5..72], rel);
-    return buf[0..72];
+    @memcpy(buf[5..70], rel);
+    return buf[0..70];
 }
 
 /// Cold-aware: an object exists when either tier holds it.
 pub fn exists(store: *root.Store, io: Io, digest: Digest) bool {
-    var hot_buf: [75]u8 = undefined;
+    var hot_buf: [73]u8 = undefined;
     if (store.dir.statFile(io, objectFull(digest, &hot_buf), .{})) |_| {
         return true;
     } else |_| {}
-    var cold_buf: [75]u8 = undefined;
+    var cold_buf: [70]u8 = undefined;
     const cold_full = coldFull(digest, &cold_buf);
     _ = store.dir.statFile(io, cold_full, .{}) catch return false;
     return true;
@@ -50,14 +50,14 @@ pub fn exists(store: *root.Store, io: Io, digest: Digest) bool {
 /// Reads a whole object. Hot tier first; cold tier is gunzipped
 /// transparently (spec §9.4). Use verifyObject for hashing.
 pub fn readObject(store: *root.Store, io: Io, digest: Digest, gpa: std.mem.Allocator) ReadError![]u8 {
-    var hot_buf: [75]u8 = undefined;
+    var hot_buf: [73]u8 = undefined;
     if (store.dir.readFileAlloc(io, objectFull(digest, &hot_buf), gpa, .unlimited)) |bytes| {
         return bytes;
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return error.Unexpected,
     }
-    var cold_buf: [75]u8 = undefined;
+    var cold_buf: [70]u8 = undefined;
     const cold_full = coldFull(digest, &cold_buf);
     const z = store.dir.readFileAlloc(io, cold_full, gpa, .unlimited) catch |err| switch (err) {
         error.FileNotFound => return error.ObjectNotFound,
@@ -105,14 +105,14 @@ test "verifyObject detects corruption" {
 
     // Simulate bit rot by writing directly into the object path. Objects
     // are 0444, so relax permissions first (a test-only chmod).
-    var rel_buf: [67]u8 = undefined;
+    var rel_buf: [65]u8 = undefined;
     const rel = d.relPath(&rel_buf);
-    var full_buf: [75]u8 = undefined;
+    var full_buf: [73]u8 = undefined;
     @memcpy(full_buf[0..8], "objects/");
     @memcpy(full_buf[8..], rel);
-    const f = try ts.store.dir.openFile(io, full_buf[0..75], .{});
+    const f = try ts.store.dir.openFile(io, full_buf[0..73], .{});
     try f.setPermissions(io, .fromMode(0o644));
     f.close(io);
-    try ts.store.dir.writeFile(io, .{ .sub_path = full_buf[0..75], .data = "corrupted!" });
+    try ts.store.dir.writeFile(io, .{ .sub_path = full_buf[0..73], .data = "corrupted!" });
     try std.testing.expectError(error.DigestMismatch, ts.store.verifyObject(io, d));
 }

@@ -43,7 +43,7 @@ pub fn demote(store: *root.Store, io: Io, digest: digest_mod.Digest) ColdError!v
     // Cheap gate first: executable-ish kinds never leave hot (spec §9.4).
     if (!isDemotable(kindOf(store, io, digest))) return;
 
-    var hot_buf: [75]u8 = undefined;
+    var hot_buf: [73]u8 = undefined;
     const hot_full = objectFull(digest, &hot_buf);
     const hot_bytes = store.dir.readFileAlloc(io, hot_full, std.heap.page_allocator, .unlimited) catch |err| switch (err) {
         error.FileNotFound => return error.ObjectNotFound,
@@ -59,7 +59,7 @@ pub fn demote(store: *root.Store, io: Io, digest: digest_mod.Digest) ColdError!v
     defer std.heap.page_allocator.free(back);
     if (!std.mem.eql(u8, back, hot_bytes)) return error.DigestMismatch;
 
-    var cold_buf: [75]u8 = undefined;
+    var cold_buf: [70]u8 = undefined;
     const cold_full = coldFull(digest, &cold_buf);
     try store.dir.createDirPath(io, cold_full[0..7]);
     try store.dir.writeFile(io, .{ .sub_path = cold_full, .data = z });
@@ -78,7 +78,7 @@ pub fn demote(store: *root.Store, io: Io, digest: digest_mod.Digest) ColdError!v
 /// The decompressed bytes are digest-checked before the cold copy is
 /// deleted, mirroring demote's verify-before-delete.
 pub fn promote(store: *root.Store, io: Io, digest: digest_mod.Digest) ColdError!void {
-    var cold_buf: [75]u8 = undefined;
+    var cold_buf: [70]u8 = undefined;
     const cold_full = coldFull(digest, &cold_buf);
     const z = store.dir.readFileAlloc(io, cold_full, std.heap.page_allocator, .unlimited) catch |err| switch (err) {
         error.FileNotFound => return error.ObjectNotFound,
@@ -91,7 +91,7 @@ pub fn promote(store: *root.Store, io: Io, digest: digest_mod.Digest) ColdError!
     defer std.heap.page_allocator.free(bytes);
     if (!std.meta.eql(digest_mod.hashBytes(bytes).bytes, digest.bytes)) return error.DigestMismatch;
 
-    var hot_buf: [75]u8 = undefined;
+    var hot_buf: [73]u8 = undefined;
     const hot_full = objectFull(digest, &hot_buf);
     try store.dir.createDirPath(io, hot_full[0..10]);
     try store.dir.writeFile(io, .{ .sub_path = hot_full, .data = bytes });
@@ -143,20 +143,20 @@ fn parseKindLine(line: []const u8) error{InvalidLine}!KindEntry {
 }
 
 /// Store-relative tier paths: "objects/ab/<hex>" / "cold/ab/<hex>" (spec §6).
-fn objectFull(d: digest_mod.Digest, buf: *[75]u8) []const u8 {
-    var rbuf: [67]u8 = undefined;
+fn objectFull(d: digest_mod.Digest, buf: *[73]u8) []const u8 {
+    var rbuf: [65]u8 = undefined;
     const rel = d.relPath(&rbuf);
     @memcpy(buf[0..8], "objects/");
     @memcpy(buf[8..], rel);
-    return buf[0..75];
+    return buf[0..73];
 }
 
-fn coldFull(d: digest_mod.Digest, buf: *[75]u8) []const u8 {
-    var rbuf: [67]u8 = undefined;
+fn coldFull(d: digest_mod.Digest, buf: *[70]u8) []const u8 {
+    var rbuf: [65]u8 = undefined;
     const rel = d.relPath(&rbuf);
     @memcpy(buf[0..5], "cold/");
-    @memcpy(buf[5..72], rel);
-    return buf[0..72];
+    @memcpy(buf[5..70], rel);
+    return buf[0..70];
 }
 
 test "gzip round trip" {
@@ -205,12 +205,12 @@ test "tier copies are read-only" {
 
     const d = try ts.store.putBytes(io, "perm payload", .rlib);
     try ts.store.demote(io, d);
-    var cbuf: [75]u8 = undefined;
+    var cbuf: [70]u8 = undefined;
     const cst = try ts.store.dir.statFile(io, coldFull(d, &cbuf), .{});
     try std.testing.expect(cst.permissions.toMode() & 0o777 == 0o444);
 
     try ts.store.promote(io, d);
-    var hbuf: [75]u8 = undefined;
+    var hbuf: [73]u8 = undefined;
     const hst = try ts.store.dir.statFile(io, objectFull(d, &hbuf), .{});
     try std.testing.expect(hst.permissions.toMode() & 0o777 == 0o444);
 }

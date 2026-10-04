@@ -308,19 +308,19 @@ fn isOlderThan(obj: scan.ObjectInfo, now_ms: i64, max_age_ns: u64) bool {
 }
 
 /// Store-relative tier path: "objects/ab/<hex>" or "cold/ab/<hex>".
-fn tierFullPath(digest: digest_mod.Digest, tier: scan.Tier, buf: *[75]u8) []const u8 {
-    var rbuf: [67]u8 = undefined;
+fn tierFullPath(digest: digest_mod.Digest, tier: scan.Tier, buf: *[73]u8) []const u8 {
+    var rbuf: [65]u8 = undefined;
     const rel = digest.relPath(&rbuf);
     switch (tier) {
         .hot => {
             @memcpy(buf[0..8], "objects/");
-            @memcpy(buf[8..75], rel);
-            return buf[0..75];
+            @memcpy(buf[8..73], rel);
+            return buf[0..73];
         },
         .cold => {
             @memcpy(buf[0..5], "cold/");
-            @memcpy(buf[5..72], rel);
-            return buf[0..72];
+            @memcpy(buf[5..70], rel);
+            return buf[0..70];
         },
     }
 }
@@ -328,12 +328,12 @@ fn tierFullPath(digest: digest_mod.Digest, tier: scan.Tier, buf: *[75]u8) []cons
 /// Compressed size of a cold-tier copy; 0 when the copy is absent.
 /// Used to account demotions against the cold quota (spec §9.4).
 fn coldByteSize(store: *root.Store, io: Io, digest: digest_mod.Digest) u64 {
-    var rbuf: [67]u8 = undefined;
+    var rbuf: [65]u8 = undefined;
     const rel = digest.relPath(&rbuf);
-    var buf: [75]u8 = undefined;
+    var buf: [73]u8 = undefined;
     @memcpy(buf[0..5], "cold/");
-    @memcpy(buf[5..72], rel);
-    if (store.dir.statFile(io, buf[0..72], .{})) |st| {
+    @memcpy(buf[5..70], rel);
+    if (store.dir.statFile(io, buf[0..70], .{})) |st| {
         return st.size;
     } else |_| {
         return 0;
@@ -349,7 +349,7 @@ fn evict(store: *root.Store, io: Io, report: *GcReport, obj: scan.ObjectInfo, dr
         }
         return;
     }
-    var buf: [75]u8 = undefined;
+    var buf: [73]u8 = undefined;
     const full = tierFullPath(obj.digest, obj.tier, &buf);
     store.dir.deleteFile(io, full) catch |err| switch (err) {
         error.FileNotFound => return, // raced with another GC or the owner
@@ -373,16 +373,16 @@ fn fixedConfig(hot: u64) root.config.Config {
 }
 
 /// Store-relative object path "objects/ab/<hex>" (spec §5.1, §6).
-fn objectFull(d: root.Digest, buf: *[75]u8) []const u8 {
-    var rbuf: [67]u8 = undefined;
+fn objectFull(d: root.Digest, buf: *[73]u8) []const u8 {
+    var rbuf: [65]u8 = undefined;
     const rel = d.relPath(&rbuf);
     @memcpy(buf[0..8], "objects/");
     @memcpy(buf[8..], rel);
-    return buf[0..75];
+    return buf[0..73];
 }
 
 fn setMtime(io: std.Io, store: *root.Store, d: root.Digest, ms: i64) !void {
-    var buf: [75]u8 = undefined;
+    var buf: [73]u8 = undefined;
     const f = try store.dir.openFile(io, objectFull(d, &buf), .{});
     defer f.close(io);
     try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(@as(i96, ms) * std.time.ns_per_ms) } });
@@ -533,12 +533,12 @@ test "dry run counts expiry without deleting leases or actions" {
     const man = try ts.store.putManifest(io, .{ .kind = .bin, .outputs = &no_outputs });
     const key = root.hashBytes("dry-run-stale");
     try ts.store.putAction(io, key, man);
-    var mbuf: [75]u8 = undefined;
-    var rbuf: [67]u8 = undefined;
+    var mbuf: [73]u8 = undefined;
+    var rbuf: [65]u8 = undefined;
     const mrel = man.relPath(&rbuf);
     @memcpy(mbuf[0..8], "objects/");
     @memcpy(mbuf[8..], mrel);
-    try ts.store.dir.deleteFile(io, mbuf[0..75]);
+    try ts.store.dir.deleteFile(io, mbuf[0..73]);
 
     const report = try ts.store.gc(io, gpa, .{ .dry_run = true });
     try std.testing.expect(report.dry_run);

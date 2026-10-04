@@ -21,7 +21,7 @@ const store_gpa = std.heap.page_allocator;
 pub fn putBytes(store: *root.Store, io: Io, bytes: []const u8, kind: root.Kind) PutError!Digest {
     const d = digest_mod.hashBytes(bytes);
 
-    var path_buf: [75]u8 = undefined;
+    var path_buf: [73]u8 = undefined;
     const full = objectFull(d, &path_buf);
 
     // Fast path: already present.
@@ -68,7 +68,7 @@ pub fn putFile(store: *root.Store, io: Io, src: Io.File, kind: root.Kind) PutErr
     h.final(&out);
     const d: Digest = .{ .bytes = out };
 
-    var path_buf: [75]u8 = undefined;
+    var path_buf: [73]u8 = undefined;
     const full = objectFull(d, &path_buf);
     try publish(store, io, tmp_name, full);
     try recordKind(store, io, d, kind);
@@ -105,12 +105,12 @@ fn recordKind(store: *root.Store, io: Io, d: Digest, kind: root.Kind) PutError!v
 
 /// Store-relative object path: "objects/<hex[0..2]>/<hex[2..]>"
 /// (spec §5.1, §6). layout.objectPath returns the fanout-relative part.
-fn objectFull(d: digest_mod.Digest, buf: *[75]u8) []const u8 {
-    var rbuf: [67]u8 = undefined;
+fn objectFull(d: digest_mod.Digest, buf: *[73]u8) []const u8 {
+    var rbuf: [65]u8 = undefined;
     const rel = d.relPath(&rbuf);
     @memcpy(buf[0..8], "objects/");
     @memcpy(buf[8..], rel);
-    return buf[0..75];
+    return buf[0..73];
 }
 
 test "putBytes is idempotent and read-only" {
@@ -122,7 +122,7 @@ test "putBytes is idempotent and read-only" {
     const d2 = try ts.store.putBytes(io, "artifact bytes", .other);
     try std.testing.expectEqual(d1.bytes, d2.bytes);
 
-    var buf: [75]u8 = undefined;
+    var buf: [73]u8 = undefined;
     const st = try ts.store.dir.statFile(io, objectFull(d1, &buf), .{});
     try std.testing.expect(st.size == "artifact bytes".len);
     try std.testing.expect(st.permissions.toMode() & 0o777 == 0o444);
@@ -156,6 +156,6 @@ test "crash window: tmp files are never objects" {
     const leftover = try ts.store.dir.readFileAlloc(io, "tmp/leftover", std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(leftover);
     try std.testing.expectEqualStrings("partial", leftover);
-    var buf: [75]u8 = undefined;
+    var buf: [73]u8 = undefined;
     _ = try ts.store.dir.statFile(io, objectFull(d, &buf), .{});
 }
