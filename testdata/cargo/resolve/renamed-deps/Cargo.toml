@@ -10,4 +10,6 @@ members = ["real"]
 old = { package = "real", path = "real", version = "1" }
 
 [features]
-f = ["real/feat"]
+# Feature refs use the MANIFEST key (`old`): cargo rejects `real/feat`
+# ("`real` is not a dependency") since the dependency is named `old`.
+f = ["old/feat"]

@@ -13,6 +13,7 @@ pub const index = @import("index.zig");
 pub const resolve = @import("resolve.zig");
 pub const sources = @import("sources.zig");
 pub const features = @import("features.zig");
+pub const oracle = @import("oracle.zig");
 
 // Same pattern as src/store/root.zig: referencing each submodule from a
 // test block pulls its inline `test "…"` blocks into `zig build test`.
@@ -29,4 +30,5 @@ test {
     _ = @import("resolve.zig");
     _ = @import("sources.zig");
     _ = @import("features.zig");
+    _ = @import("oracle.zig");
 }
