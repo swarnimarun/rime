@@ -89,9 +89,22 @@ pub const RunError = error{ SpawnFailed, TimedOut, OutOfMemory };
 /// additive-compatible).
 pub fn runCapture(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, cwd: []const u8) RunError!struct { exited: u8, out: []u8, err: []u8 } {
     const cwd_opt: std.process.Child.Cwd = if (cwd.len == 0) .inherit else .{ .path = cwd };
+    // The io-spawn environ defaults to empty in test workers; forward the
+    // toolchain-relevant process env so children (cargo/rustc/rime) can find
+    // cc, linker shims, and rustc (workers showed `linker 'cc' not found`
+    // and RustcNotFound without this).
+    var env_map = std.process.Environ.Map.init(gpa);
+    defer env_map.deinit();
+    const env_names = [_][]const u8{ "PATH", "HOME", "USER", "TMPDIR", "CC", "RUSTC", "CARGO_HOME", "RUSTUP_HOME", "DEVELOPER_DIR", "SDKROOT", "RIME_CARGO_ORACLE", "RIME_ORACLE_PREBUILT", "RIME_INDEX_DIR", "RIME_CACHE_DIR" };
+    for (env_names) |name| {
+        const zname = try gpa.dupeZ(u8, name);
+        defer gpa.free(zname);
+        if (std.c.getenv(zname)) |z| try env_map.put(name, std.mem.span(z));
+    }
     var child = std.process.spawn(io, .{
         .argv = argv,
         .cwd = cwd_opt,
+        .environ_map = &env_map,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
@@ -1448,9 +1461,18 @@ fn freeStrList(gpa: std.mem.Allocator, list: [][]const u8) void {
 /// Path-only fixture flow: copy -> cargo generate-lockfile --offline ->
 /// rime resolve (previous = cargo's lock) -> graph compare + lock
 /// byte-compare. No network, no index data: versions are path-fixed.
+/// Test-harness allocator for resolving fixtures: the resolution hot loop
+/// (snapshots, candidate lists, conflict keys) performs millions of small
+/// allocations, and `std.testing.allocator`'s fully-instrumented checks
+/// dominate wall time even in release builds. `page_allocator` is
+/// behavior-identical here (all oracle memory is still explicitly freed via
+/// the usual deinit calls); leak detection for these paths stays covered by
+/// the hermetic unit tests that keep `std.testing.allocator`.
+const oracle_gpa = std.heap.page_allocator;
+
 fn checkPathFixture(fixture_rel: []const u8) !void {
     try requireOracle();
-    const gpa = std.testing.allocator;
+    const gpa = oracle_gpa;
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1504,7 +1526,7 @@ test "oracle patch-table matches cargo" {
     // resolve (no previous lock): the patch is the only `log` candidate,
     // so no index data is needed and --offline suffices.
     try requireOracle();
-    const gpa = std.testing.allocator;
+    const gpa = oracle_gpa;
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1563,9 +1585,19 @@ test "oracle validation projects match committed cargo goldens" {
     // loudly, fail per-project). Goldens are cargo-committed (never
     // rime-generated); this harness only READS them.
     try requireOracle();
-    const gpa = std.testing.allocator;
+    const gpa = oracle_gpa;
     const io = std.Io.Threaded.global_single_threaded.io();
+    // Optional per-project scoping for long acceptance runs
+    // (`RIME_ORACLE_PROJECT=basic-workspace` checks just that project;
+    // unset runs all four). Name-matched only, never a failure mode.
+    const only: ?[]const u8 = if (std.c.getenv("RIME_ORACLE_PROJECT")) |v| std.mem.span(v) else null;
     for (validation_projects) |proj| {
+        if (only) |name| {
+            if (!std.mem.eql(u8, name, proj.name)) {
+                std.debug.print("oracle: skipping validation/{s} (project filter)\n", .{proj.name});
+                continue;
+            }
+        }
         std.debug.print("oracle: checking validation/{s}\n", .{proj.name});
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -1664,10 +1696,12 @@ test "oracle validation projects match committed cargo goldens" {
 test "discoverValidationProjects lists the landed corpus" {
     // Rime-only (no cargo): asserts the sorted landed project names. Update
     // in the same commit whenever a project is added or renamed.
+    // `m6-golden` is a CLI-parity golden dir, not a build project, but it
+    // lives under validation/ so the listing includes it.
     const io = std.Io.Threaded.global_single_threaded.io();
     const projects = try discoverValidationProjects(std.testing.allocator, io);
     defer freeStrList(std.testing.allocator, projects);
-    const want = [_][]const u8{ "basic-workspace", "feature-matrix", "full-manifest", "lockfile-golden" };
+    const want = [_][]const u8{ "basic-workspace", "feature-matrix", "full-manifest", "lockfile-golden", "m6-golden" };
     try std.testing.expectEqual(want.len, projects.len);
     for (want, projects) |w, p| try std.testing.expectEqualStrings(w, p);
 }

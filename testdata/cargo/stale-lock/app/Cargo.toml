@@ -1,0 +1,11 @@
+[package]
+name = "stale-app"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "stale-app"
+path = "src/main.rs"
+
+[dependencies]
+stale-lib = { path = "../lib" }

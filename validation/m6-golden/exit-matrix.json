@@ -1,0 +1,107 @@
+{
+  "rows": [
+    {
+      "argv": [
+        "build",
+        "--warp-drive"
+      ],
+      "fixture": "validation/basic-workspace",
+      "code": 1,
+      "needle": "--warp-drive"
+    },
+    {
+      "argv": [
+        "build",
+        "--message-format",
+        "json,human"
+      ],
+      "fixture": "validation/basic-workspace",
+      "code": 101,
+      "needle": "two kinds"
+    },
+    {
+      "argv": [
+        "build",
+        "--message-format",
+        "yaml"
+      ],
+      "fixture": "validation/basic-workspace",
+      "code": 1,
+      "needle": "invalid message format"
+    },
+    {
+      "argv": [
+        "build",
+        "--manifest-path",
+        "@FIXTURE@/missing/Cargo.toml"
+      ],
+      "fixture": "validation/basic-workspace",
+      "code": 101,
+      "needle": "could not find"
+    },
+    {
+      "argv": [
+        "clean",
+        "extra"
+      ],
+      "fixture": "validation/basic-workspace",
+      "code": 1,
+      "needle": "unexpected argument"
+    },
+    {
+      "argv": [
+        "build",
+        "-p",
+        "no-such-pkg",
+        "--manifest-path",
+        "@FIXTURE@/Cargo.toml"
+      ],
+      "fixture": "validation/basic-workspace",
+      "code": 101,
+      "needle": "package not found"
+    },
+    {
+      "argv": [
+        "build",
+        "--locked",
+        "--offline",
+        "--manifest-path",
+        "@FIXTURE@/Cargo.toml"
+      ],
+      "fixture": "testdata/cargo/stale-lock",
+      "code": 101,
+      "needle": "--locked"
+    },
+    {
+      "argv": [
+        "--help"
+      ],
+      "fixture": "validation/basic-workspace",
+      "code": 0,
+      "needle": "usage:"
+    },
+    {
+      "argv": [
+        "run",
+        "--bin",
+        "no-such-bin",
+        "--manifest-path",
+        "@FIXTURE@/Cargo.toml"
+      ],
+      "fixture": "validation/basic-workspace",
+      "code": 101,
+      "needle": "failed to spawn"
+    },
+    {
+      "argv": [
+        "build",
+        "-j0",
+        "--manifest-path",
+        "@FIXTURE@/Cargo.toml"
+      ],
+      "fixture": "validation/basic-workspace",
+      "code": 101,
+      "needle": "--jobs"
+    }
+  ]
+}

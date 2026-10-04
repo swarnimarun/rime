@@ -121,17 +121,224 @@ fn parseStat(gpa: std.mem.Allocator, rest: []const []const u8) error{ Usage, Out
     return .{ .stat = opts };
 }
 
-/// Plan C cargo subcommands (build/check/test/run/bench/clean).
+/// Plan C cargo subcommands (build/check/test/run/bench/clean/fetch).
 fn isCargoCommand(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "build") or std.mem.eql(u8, arg, "check") or std.mem.eql(u8, arg, "test") or std.mem.eql(u8, arg, "run") or std.mem.eql(u8, arg, "bench") or std.mem.eql(u8, arg, "clean");
+    return std.mem.eql(u8, arg, "build") or std.mem.eql(u8, arg, "check") or std.mem.eql(u8, arg, "test") or std.mem.eql(u8, arg, "run") or std.mem.eql(u8, arg, "bench") or std.mem.eql(u8, arg, "clean") or std.mem.eql(u8, arg, "fetch");
+}
+
+/// Leading-globals prescan (Task 2): `rime -v build`, `rime --quiet check`,
+/// `rime --color=never test` parse identically to trailing position. Moves
+/// recognized leading globals (before the command word) to just after it.
+/// Unknown leading flags are NOT prescanned (fall through to usage errors).
+/// Caller owns the returned slice (each entry borrows `args`).
+pub fn hoistLeadingGlobals(gpa: std.mem.Allocator, args: []const []const u8) ![][]const u8 {
+    var cmd_idx: ?usize = null;
+    for (args, 0..) |a, i| {
+        if (isCargoCommand(a)) {
+            cmd_idx = i;
+            break;
+        }
+        // A positional that is not a command stops the prescan (cargo
+        // would reject it too); leave everything as-is.
+        if (a.len == 0 or a[0] != '-') break;
+    }
+    const ci = cmd_idx orelse return gpa.dupe([]const u8, args);
+    if (ci == 0) return gpa.dupe([]const u8, args);
+    // Verify every leading token is a recognized global (values included).
+    var i: usize = 0;
+    while (i < ci) {
+        const a = args[i];
+        if (isLeadingGlobalFlag(a)) {
+            if (takesLeadingValue(a)) i += 1;
+        } else if (isVerboseLeading(a) or std.mem.eql(u8, a, "-q") or std.mem.eql(u8, a, "--quiet") or
+            std.mem.eql(u8, a, "--offline") or std.mem.eql(u8, a, "--frozen") or std.mem.eql(u8, a, "--locked") or
+            std.mem.eql(u8, a, "-v") or std.mem.eql(u8, a, "--verbose"))
+        {
+            // value-less globals
+        } else return gpa.dupe([]const u8, args);
+        i += 1;
+    }
+    // Splice: [cmd] ++ leading ++ rest.
+    const out = try gpa.alloc([]const u8, args.len);
+    out[0] = args[ci];
+    @memcpy(out[1 .. 1 + ci], args[0..ci]);
+    @memcpy(out[1 + ci ..], args[ci + 1 ..]);
+    return out;
+}
+
+fn isVerboseLeading(a: []const u8) bool {
+    if (a.len < 2 or a[0] != '-' or a[1] == '-') return false;
+    for (a[1..]) |c| if (c != 'v') return false;
+    return true;
+}
+
+/// Leading globals that take a separate value token (`--color never`,
+/// `-j 4`, `--jobs 4`, `--config KEY=VAL`). `--flag=value` forms need no
+/// skipping (single token, handled by the flag check itself).
+fn takesLeadingValue(a: []const u8) bool {
+    if (std.mem.eql(u8, a, "--color") or std.mem.eql(u8, a, "--config") or
+        std.mem.eql(u8, a, "-j") or std.mem.eql(u8, a, "--jobs")) return true;
+    return false;
+}
+
+fn isLeadingGlobalFlag(a: []const u8) bool {
+    if (takesLeadingValue(a)) return true;
+    if (std.mem.startsWith(u8, a, "--color=") or std.mem.startsWith(u8, a, "--jobs=") or
+        std.mem.startsWith(u8, a, "--config=")) return true;
+    if (a.len > 2 and a[0] == '-' and a[1] != '-' and a[1] == 'j') return true; // -j4
+    return false;
+}
+
+pub fn gcHelp() []const u8 {
+    return
+        \\Collect unrooted objects from the global store.
+        \\
+        \\Usage: rime gc [--dry-run] [--to-size BYTES] [--older-than DUR] [--tag K=V ...]
+        \\
+        \\Does not touch project target/ views; use 'rime clean' for those.
+        \\See 'rime cache stat --by-tag' for per-tag usage.
+        \\
+    ;
+}
+
+pub fn cargoCleanHelp() []const u8 {
+    return
+        \\Remove artifacts that rime has generated in the past.
+        \\
+        \\Usage: rime clean [-p PKG ...] [--workspace] [--release|--profile N] [--target TRIPLE] [--target-dir DIR] [--manifest-path P] [--doc] [--dry-run]
+        \\
+        \\Removes only project target/ views, never store state.
+        \\See 'rime gc --help' for global-cache collection.
+        \\
+    ;
+}
+
+pub fn cargoBuildHelp() []const u8 {
+    return
+        \\Compile the current package.
+        \\
+        \\Usage: rime build [--release|--profile N] [--target T] [-p PKG ...] [--features CSV] [--message-format FMT] [--target-dir DIR]
+        \\
+        \\Note: rime implements the build surface; parallelism (-j) is accepted and validated but units run in plan order.
+        \\
+    ;
+}
+
+pub fn cargoCheckHelp() []const u8 {
+    return
+        \\Check the current package (rmeta-only, no codegen).
+        \\
+        \\Usage: rime check [same flags as build]
+        \\
+        \\Note: rime implements the check surface; artifacts are metadata-only.
+        \\
+    ;
+}
+
+pub fn cargoTestHelp() []const u8 {
+    return
+        \\Compile and run tests.
+        \\
+        \\Usage: rime test [--no-run] [--no-fail-fast] [FILTER ...] [-- ARGS ...]
+        \\
+        \\Note: rime forwards trailing args to the libtest harness after `--`.
+        \\
+    ;
+}
+
+pub fn cargoRunHelp() []const u8 {
+    return
+        \\Build and run a binary.
+        \\
+        \\Usage: rime run [--bin NAME|--example NAME] [-- ARGS ...]
+        \\
+        \\Note: rime spawns the view binary built by a prior build.
+        \\
+    ;
+}
+
+pub fn cargoBenchHelp() []const u8 {
+    return
+        \\Compile and run benchmarks.
+        \\
+        \\Usage: rime bench [BENCHNAME] [--no-run] [--no-fail-fast] [-- ARGS ...]
+        \\
+        \\Note: rime invokes the bench harness binary directly.
+        \\
+    ;
+}
+
+pub fn cargoFetchHelp() []const u8 {
+    return
+        \\Fetch dependencies of the current package.
+        \\
+        \\Usage: rime fetch [--target TRIPLE] [--manifest-path P]
+        \\
+        \\Note: rime implements the fetch surface over the existing fetch machinery.
+        \\
+    ;
+}
+
+pub fn cacheStatHelp() []const u8 {
+    return
+        \\Show global store usage.
+        \\
+        \\Usage: rime cache stat [--by-tag [K=V ...]]
+        \\
+        \\Reports budget lines and per-tag usage; project views are out of scope.
+        \\See 'rime gc --help' for reclaiming space.
+        \\
+    ;
 }
 
 /// Cargo usage line (exit 1 per decision D4; the store path keeps exit 2).
+/// Message-format failures are the anyhow class (exit 101).
 fn printCargoUsage() void {
     if (cargo.cli.parseDiagnostic()) |d| {
         std.debug.print("error: {s}\n", .{d});
     }
-    std.debug.print("usage: rime <build|check|test|run|bench|clean> [--manifest-path P] [--release|--profile N] [--target T] [--features CSV] [--message-format=json|human] [--offline|--frozen|--locked] [--dry-run] [-p PKG] [-- ARGS…]\n", .{});
+    std.debug.print("usage: rime <build|check|test|run|bench|clean|fetch> [--manifest-path P] [--release|--profile N] [--target T] [--features CSV] [--message-format=json|human] [--offline|--frozen|--locked] [--dry-run] [-p PKG] [-- ARGS…]\n", .{});
+}
+
+fn cargoExitForUsage() u8 {
+    // Row 5: message-format conflict/invalid specifier is exit 101.
+    if (cargo.cli.isFormatError()) return 101;
+    return 1;
+}
+
+/// Top-level and rime-native `--help`/`--version` handling. Returns the
+/// exit code when handled, null to continue normal dispatch. Help and
+/// version text go to stdout (matrix row 3); only errors use stderr.
+fn tryHandleHelp(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) ?u8 {
+    _ = gpa;
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.File.stdout().writer(io, &buf);
+    const out = &w.interface;
+    if (rest.len == 1 and (std.mem.eql(u8, rest[0], "--help") or std.mem.eql(u8, rest[0], "-h"))) {
+        out.print("usage: rime <build|check|test|run|bench|clean|fetch> …\n       rime <cache stat [--by-tag [k=v …]]|cache verify|cache migrate [--dry-run]|gc [--tag k=v …]|pin|unpin|store> …\n", .{}) catch return 0;
+        w.flush() catch {};
+        return 0;
+    }
+    if (rest.len == 1 and (std.mem.eql(u8, rest[0], "--version") or std.mem.eql(u8, rest[0], "-V"))) {
+        out.print("rime 0.1.0\n", .{}) catch return 0;
+        w.flush() catch {};
+        return 0;
+    }
+    if (rest.len == 2 and std.mem.eql(u8, rest[0], "gc") and (std.mem.eql(u8, rest[1], "--help") or std.mem.eql(u8, rest[1], "-h"))) {
+        out.print("{s}\n", .{gcHelp()}) catch return 0;
+        w.flush() catch {};
+        return 0;
+    }
+    if (rest.len >= 2 and std.mem.eql(u8, rest[0], "cache") and std.mem.eql(u8, rest[1], "stat")) {
+        for (rest[2..]) |a| {
+            if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+                out.print("{s}\n", .{cacheStatHelp()}) catch return 0;
+                w.flush() catch {};
+                return 0;
+            }
+        }
+    }
+    return null;
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -144,12 +351,17 @@ pub fn main(init: std.process.Init) !u8 {
     while (it.next()) |arg| try argv.append(gpa, arg);
 
     const rest: []const []const u8 = if (argv.items.len > 1) argv.items[1..] else &.{};
-    const cmd = parseCommand(gpa, rest) catch {
+    if (tryHandleHelp(gpa, io, rest)) |code| return code;
+    // Leading globals (`rime -v build`) splice after the command word.
+    const routed: []const []const u8 = hoistLeadingGlobals(gpa, rest) catch rest;
+    defer if (routed.ptr != rest.ptr) gpa.free(routed);
+    const cmd = parseCommand(gpa, routed) catch {
         // Cargo usage errors exit 1 with the flag named (decision D4); the
-        // store path keeps its historical exit 2.
-        if (rest.len > 0 and isCargoCommand(rest[0])) {
+        // store path keeps its historical exit 2. Message-format failures
+        // are the anyhow class (exit 101).
+        if (routed.len > 0 and isCargoCommand(routed[0])) {
             printCargoUsage();
-            return 1;
+            return cargoExitForUsage();
         }
         // NOTE (plan adjustment, reported): the plan's replacement usage
         // string dropped `cache migrate`; kept here (still a command).
@@ -523,4 +735,47 @@ test "parseCommand covers the surface" {
     const gt = try parseCommand(gpa, &.{ "gc", "--tag", "project=projA", "--tag", "user.a=b" });
     defer gpa.free(gt.gc.tags);
     try std.testing.expectEqual(@as(usize, 2), gt.gc.tags.len);
+}
+
+test "leading globals hoist after the command" {
+    const gpa = std.testing.allocator;
+    const hoisted = try hoistLeadingGlobals(gpa, &.{ "-v", "build", "--dry-run" });
+    defer gpa.free(hoisted);
+    try std.testing.expectEqualStrings("build", hoisted[0]);
+    try std.testing.expectEqualStrings("-v", hoisted[1]);
+    try std.testing.expectEqualStrings("--dry-run", hoisted[2]);
+    const c = try parseCommand(gpa, hoisted);
+    defer {
+        c.cargo.opts.deinit(gpa);
+        gpa.free(c.cargo.argv);
+    }
+    try std.testing.expectEqual(@as(u32, 1), c.cargo.opts.verbose);
+}
+
+test "leading unknown flags fall through to usage" {
+    const gpa = std.testing.allocator;
+    const hoisted = try hoistLeadingGlobals(gpa, &.{ "--warp-drive", "build" });
+    defer gpa.free(hoisted);
+    try std.testing.expectEqualStrings("--warp-drive", hoisted[0]);
+    try std.testing.expectError(error.Usage, parseCommand(gpa, hoisted));
+}
+
+test "gc help points at clean and stat" {
+    const text = gcHelp();
+    try std.testing.expect(std.mem.indexOf(u8, text, "rime clean") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Does not touch project target/ views") != null);
+}
+
+test "clean help points at gc" {
+    const text = cargoCleanHelp();
+    try std.testing.expect(std.mem.indexOf(u8, text, "rime gc --help") != null);
+}
+
+test "cargo helps carry divergence trailers" {
+    try std.testing.expect(std.mem.indexOf(u8, cargoBuildHelp(), "Note:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cargoTestHelp(), "Note:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cargoRunHelp(), "Note:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cargoBenchHelp(), "Note:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cargoFetchHelp(), "Note:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cargoCheckHelp(), "Note:") != null);
 }

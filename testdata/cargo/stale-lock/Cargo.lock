@@ -1,0 +1,12 @@
+version = 4
+
+[[package]]
+name = "stale-app"
+version = "0.1.0"
+dependencies = [
+ "stale-lib",
+]
+
+[[package]]
+name = "stale-lib"
+version = "0.1.0"

@@ -1,2 +1,3 @@
-{"reason":"unit-plan","package":"b","target":"b","profile":"dev","success":true}
-{"reason":"unit-plan","package":"a","target":"a","profile":"dev","success":true}
+{"reason":"compiler-artifact","package_id":"path+file://@WS@/crates/b#0.1.0","manifest_path":"@WS@/crates/b/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"b","src_path":"@WS@/crates/b/src/b.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":2,"debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["@WS@/target/debug/deps/libb.rlib"],"executable":null,"fresh":true}
+{"reason":"compiler-artifact","package_id":"path+file://@WS@/crates/a#0.1.0","manifest_path":"@WS@/crates/a/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"a","src_path":"@WS@/crates/a/src/a.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":2,"debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["@WS@/target/debug/deps/liba.rlib"],"executable":null,"fresh":true}
+{"reason":"build-finished","success":true}
