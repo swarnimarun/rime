@@ -13,7 +13,7 @@ pub const ColdError = error{
     InvalidGzip,
     Unexpected,
     OutOfMemory,
-} || Io.Cancelable || Io.Dir.ReadFileAllocError || Io.Dir.WriteFileError || Io.Dir.OpenError || Io.Dir.CreateDirPathError || Io.Dir.DeleteFileError;
+} || Io.Cancelable || Io.Dir.ReadFileAllocError || Io.Dir.WriteFileError || Io.Dir.OpenError || Io.Dir.CreateDirPathError || Io.Dir.DeleteFileError || Io.File.SetPermissionsError;
 
 /// gzip-compress in memory (level 6, `flate.Compress.Options.default`).
 pub fn gzipAlloc(gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}![]u8 {
@@ -63,6 +63,13 @@ pub fn demote(store: *root.Store, io: Io, digest: digest_mod.Digest) ColdError!v
     const cold_full = coldFull(digest, &cold_buf);
     try store.dir.createDirPath(io, cold_full[0..7]);
     try store.dir.writeFile(io, .{ .sub_path = cold_full, .data = z });
+    // Tier copies are immutable store objects: publish read-only (0o444),
+    // matching ingest (spec §11).
+    {
+        const cf = try store.dir.openFile(io, cold_full, .{});
+        defer cf.close(io);
+        try cf.setPermissions(io, .fromMode(0o444));
+    }
 
     store.dir.deleteFile(io, hot_full) catch {};
 }
@@ -88,6 +95,13 @@ pub fn promote(store: *root.Store, io: Io, digest: digest_mod.Digest) ColdError!
     const hot_full = objectFull(digest, &hot_buf);
     try store.dir.createDirPath(io, hot_full[0..10]);
     try store.dir.writeFile(io, .{ .sub_path = hot_full, .data = bytes });
+    // Restored hot copies are immutable store objects: read-only (0o444),
+    // matching ingest (spec §11).
+    {
+        const hf = try store.dir.openFile(io, hot_full, .{});
+        defer hf.close(io);
+        try hf.setPermissions(io, .fromMode(0o444));
+    }
     store.dir.deleteFile(io, cold_full) catch {};
 }
 
@@ -182,4 +196,21 @@ test "bins are never demoted" {
     const d = try ts.store.putBytes(io, "executable", .bin);
     try ts.store.demote(io, d);
     try std.testing.expect(ts.store.dirHasHot(io, d));
+}
+
+test "tier copies are read-only" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var ts = test_support.openTestStore(io, .{});
+    defer ts.deinit(io);
+
+    const d = try ts.store.putBytes(io, "perm payload", .rlib);
+    try ts.store.demote(io, d);
+    var cbuf: [75]u8 = undefined;
+    const cst = try ts.store.dir.statFile(io, coldFull(d, &cbuf), .{});
+    try std.testing.expect(cst.permissions.toMode() & 0o777 == 0o444);
+
+    try ts.store.promote(io, d);
+    var hbuf: [75]u8 = undefined;
+    const hst = try ts.store.dir.statFile(io, objectFull(d, &hbuf), .{});
+    try std.testing.expect(hst.permissions.toMode() & 0o777 == 0o444);
 }
