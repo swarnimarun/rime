@@ -104,7 +104,10 @@ fn copyToTmp(
 ) MaterializeError!MaterializeMethod {
     var obj_buf: [75]u8 = undefined;
     const src = store.dir.openFile(io, objectFull(digest, &obj_buf), .{}) catch |err| switch (err) {
-        error.FileNotFound => return error.ObjectNotFound,
+        // Cold-only objects have no hot-tier file: fall back to a
+        // cold-aware read (transparent gunzip) instead of failing.
+        error.FileNotFound => return copyColdAwareToTmp(store, io, digest, dest_dir, tmp_rel),
+        error.Canceled => return error.Canceled,
         else => return error.Unexpected,
     };
     defer src.close(io);
@@ -120,6 +123,36 @@ fn copyToTmp(
         offset += n;
     }
     dst.sync(io) catch return error.Unexpected;
+    return .copied;
+}
+
+/// Cold-aware fallback for cold-only objects: reads transparently through
+/// either tier (gunzipping cold copies) and writes the bytes to the temp
+/// destination. Never promotes: materialization must not mutate tiers.
+fn copyColdAwareToTmp(
+    store: *root.Store,
+    io: Io,
+    digest: root.Digest,
+    dest_dir: Io.Dir,
+    tmp_rel: []const u8,
+) MaterializeError!MaterializeMethod {
+    const bytes = store.readObject(io, digest, std.heap.page_allocator) catch |err| switch (err) {
+        error.ObjectNotFound => return error.ObjectNotFound,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return error.Canceled,
+        else => return error.Unexpected,
+    };
+    defer std.heap.page_allocator.free(bytes);
+    const dst = dest_dir.createFile(io, tmp_rel, .{ .exclusive = true }) catch return error.Unexpected;
+    defer dst.close(io);
+    dst.writeStreamingAll(io, bytes) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => return error.Unexpected,
+    };
+    dst.sync(io) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        else => return error.Unexpected,
+    };
     return .copied;
 }
 
@@ -170,4 +203,21 @@ test "clone_first falls back cleanly" {
     const d = try ts.store.putBytes(io, "clone or copy", .other);
     const got = try materialize(&ts.store, io, d, "out/either", 0o644, .clone_first);
     try std.testing.expect(got == .cloned or got == .copied);
+}
+
+test "copy_only materializes cold-only objects" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var ts = test_support.openTestStore(io, .{});
+    defer ts.deinit(io);
+
+    const d = try ts.store.putBytes(io, "cold bytes", .other);
+    try ts.store.demote(io, d);
+    try std.testing.expect(!ts.store.dirHasHot(io, d));
+
+    const got = try materialize(&ts.store, io, d, "out/coldcpy", 0o644, .copy_only);
+    try std.testing.expectEqual(MaterializeMethod.copied, got);
+
+    const bytes = try ts.store.dir.readFileAlloc(io, "out/coldcpy", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("cold bytes", bytes);
 }
