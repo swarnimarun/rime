@@ -6,6 +6,7 @@ const layout = @import("layout.zig");
 const test_support = @import("test_support.zig");
 const ingest = @import("ingest.zig");
 const objects = @import("objects.zig");
+const manifest_mod = @import("manifest.zig");
 
 const Io = std.Io;
 
@@ -110,6 +111,22 @@ pub const Store = struct {
         return objects.verifyObject(store, io, d);
     }
 
+    pub const Manifest = manifest_mod.Manifest;
+    pub const ManifestOutput = manifest_mod.Output;
+    pub const GetManifestError = ReadError || manifest_mod.DecodeError;
+
+    pub fn putManifest(store: *Store, io: Io, man: manifest_mod.Manifest) PutError!Digest {
+        const bytes = try manifest_mod.encodeAlloc(std.heap.page_allocator, man);
+        defer std.heap.page_allocator.free(bytes);
+        return store.putBytes(io, bytes, .manifest);
+    }
+
+    pub fn getManifest(store: *Store, io: Io, gpa: std.mem.Allocator, d: Digest) GetManifestError!manifest_mod.Manifest {
+        const bytes = try store.readObject(io, d, gpa);
+        defer gpa.free(bytes);
+        return manifest_mod.decode(gpa, bytes);
+    }
+
     fn sweepTmp(io: Io, dir: Io.Dir) OpenError!void {
         const tmp = try dir.openDir(io, layout.tmp_dir, .{ .iterate = true });
         defer tmp.close(io);
@@ -152,4 +169,5 @@ test {
     _ = @import("test_support.zig");
     _ = @import("ingest.zig");
     _ = @import("objects.zig");
+    _ = @import("manifest.zig");
 }
