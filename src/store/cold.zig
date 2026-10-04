@@ -1,6 +1,5 @@
 const std = @import("std");
 const root = @import("root.zig");
-const layout = @import("layout.zig");
 const digest_mod = @import("digest.zig");
 const test_support = @import("test_support.zig");
 const index_mod = @import("index.zig");
@@ -12,9 +11,13 @@ pub const ColdError = error{
     ObjectNotFound,
     DigestMismatch,
     InvalidGzip,
+    StoreFull,
+    UnknownTagKey,
+    TagMismatch,
+    TagLimit,
     Unexpected,
     OutOfMemory,
-} || Io.Cancelable || Io.Dir.ReadFileAllocError || Io.Dir.WriteFileError || Io.Dir.OpenError || Io.Dir.CreateDirPathError || Io.Dir.DeleteFileError || Io.File.SetPermissionsError;
+} || Io.Cancelable || Io.Dir.ReadFileAllocError || Io.Dir.WriteFileError || Io.Dir.OpenError || Io.Dir.CreateDirPathError || Io.Dir.DeleteFileError || Io.File.SetPermissionsError || index_mod.DbError || @import("disk_usage.zig").DiskUsageError || @import("state.zig").StateError;
 
 /// gzip-compress in memory (level 6, `flate.Compress.Options.default`).
 pub fn gzipAlloc(gpa: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}![]u8 {
@@ -60,6 +63,15 @@ pub fn demote(store: *root.Store, io: Io, digest: digest_mod.Digest) ColdError!v
     defer std.heap.page_allocator.free(back);
     if (!std.mem.eql(u8, back, hot_bytes)) return error.DigestMismatch;
 
+    // §10.1 demote staging reserves cold (estimated gzip bytes) before the
+    // copy is published, evicting cold LRU first when full. The reservation
+    // is committed once the hot copy is deleted (ledger → file atom swap)
+    // and aborted on any failure, so I-TOTAL holds through the staging
+    // window where both copies exist. Via Store.reserve so the full
+    // admit pipeline (evict → StoreFull with breakdown in lastFull) runs.
+    const staging = try store.reserve(io, .cold, @as(u64, @intCast(z.len)), null, null);
+    errdefer store.abort(io, staging);
+
     var cold_buf: [70]u8 = undefined;
     const cold_full = coldFull(digest, &cold_buf);
     try store.dir.createDirPath(io, cold_full[0..7]);
@@ -79,6 +91,7 @@ pub fn demote(store: *root.Store, io: Io, digest: digest_mod.Digest) ColdError!v
     }
 
     store.dir.deleteFile(io, hot_full) catch {};
+    store.commit(io, staging, digest);
 }
 
 /// Cold -> hot (used by materialize when a cold object must be executed).
@@ -125,33 +138,17 @@ pub fn isDemotable(kind: root.Kind) bool {
     };
 }
 
-/// Best-effort kind lookup from the ingest journal; unknown digests default
-/// to `.other` (demotable). Never fails: on any I/O or parse problem the
-/// caller gets the permissive default.
+/// Best-effort kind lookup from the index row (Plan B Task 12: the v1
+/// `kinds.jsonl` journal is retired — kind lives only in `objects.kind`).
+/// Unknown digests default to `.other` (demotable). Never fails: on any
+/// index or parse problem the caller gets the permissive default.
 fn kindOf(store: *root.Store, io: Io, digest: digest_mod.Digest) root.Kind {
-    const bytes = store.dir.readFileAlloc(io, layout.state_dir ++ "/kinds.jsonl", std.heap.page_allocator, .unlimited) catch return .other;
-    defer std.heap.page_allocator.free(bytes);
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        const entry = parseKindLine(line) catch continue;
-        if (std.meta.eql(entry.digest, digest.bytes)) return entry.kind;
-    }
-    return .other;
-}
-
-const KindEntry = struct { digest: [32]u8, kind: root.Kind };
-
-fn parseKindLine(line: []const u8) error{InvalidLine}!KindEntry {
-    const d_start = std.mem.indexOf(u8, line, "\"digest\":\"") orelse return error.InvalidLine;
-    const d_val = line[d_start + 10 ..];
-    const d_end = std.mem.indexOfScalar(u8, d_val, '"') orelse return error.InvalidLine;
-    const d = digest_mod.Digest.fromHex(d_val[0..d_end]) catch return error.InvalidLine;
-    const k_start = std.mem.indexOf(u8, line, "\"kind\":\"") orelse return error.InvalidLine;
-    const k_val = line[k_start + 8 ..];
-    const k_end = std.mem.indexOfScalar(u8, k_val, '"') orelse return error.InvalidLine;
-    const kind = std.meta.stringToEnum(root.Kind, k_val[0..k_end]) orelse return error.InvalidLine;
-    return .{ .digest = d.bytes, .kind = kind };
+    _ = io;
+    const hex = digest.toHex();
+    const row = index_mod.getObject(&store.index, std.heap.page_allocator, &hex) catch return .other;
+    const r = row orelse return .other;
+    defer std.heap.page_allocator.free(r.kind);
+    return std.meta.stringToEnum(root.Kind, r.kind) orelse .other;
 }
 
 /// Store-relative tier paths: "objects/ab/<hex>" / "cold/ab/<hex>" (spec §6).
@@ -207,6 +204,21 @@ test "bins are never demoted" {
 
     const d = try ts.store.putBytes(io, "executable", .bin);
     try ts.store.demote(io, d);
+    try std.testing.expect(ts.store.dirHasHot(io, d));
+}
+
+test "demote fails StoreFull when cold has no room" {
+    // §10.1 staging reserves cold: a 1 B cold cap cannot stage any gzip
+    // copy, so demote admits nothing and the hot copy stays put.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var ts = test_support.openTestStore(io, .{
+        .budget = .{ .fixed = 10_000_000 },
+        .cold_cap = .{ .fixed = 1 },
+    });
+    defer ts.deinit(io);
+
+    const d = try ts.store.putBytes(io, "no room to demote", .rlib);
+    try std.testing.expectError(error.StoreFull, ts.store.demote(io, d));
     try std.testing.expect(ts.store.dirHasHot(io, d));
 }
 

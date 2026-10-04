@@ -4,15 +4,21 @@ const layout = @import("layout.zig");
 const digest_mod = @import("digest.zig");
 const test_support = @import("test_support.zig");
 const index_mod = @import("index.zig");
+const admission_mod = @import("admission.zig");
 
 const Io = std.Io;
 const Digest = digest_mod.Digest;
 
+/// StoreFull is new in v2 (additive): admission refuses the put when
+/// eviction + demotion cannot free a full reservation (storage-v2 §10).
+/// The admission error constituents ride along so reserve/checkSpoolFit
+/// failures surface honestly; lastFull()/breakdown carry the detail.
+/// Plan B Task 9. v1 signatures are unchanged (no new parameters).
 pub const PutError = error{
     DigestMismatch,
     Unexpected,
     OutOfMemory,
-} || Io.Dir.StatFileError || Io.File.OpenError || Io.File.Writer.Error || Io.File.SyncError || Io.File.SetPermissionsError || Io.Dir.RenameError || Io.Dir.CreateDirPathError || Io.File.LengthError || Io.File.WritePositionalError || digest_mod.HashFileError;
+} || admission_mod.AdmitError || Io.Dir.StatFileError || Io.File.OpenError || Io.File.Writer.Error || Io.File.SyncError || Io.File.SetPermissionsError || Io.Dir.RenameError || Io.Dir.CreateDirPathError || Io.File.LengthError || Io.File.WritePositionalError || digest_mod.HashFileError;
 
 const object_mode: Io.File.Permissions = .fromMode(0o444);
 const store_gpa = std.heap.page_allocator;
@@ -71,6 +77,16 @@ pub fn putBytes(store: *root.Store, io: Io, bytes: []const u8, kind: root.Kind) 
         else => return error.Unexpected,
     }
 
+    // Admission (§10.1): spool fast-fail, then reserve hot before writing.
+    // The dedup hits above took the reservation-free fast path (§10.5).
+    // Staging double-count note: the hot ledger row plus the tmp file (seen
+    // by the spool walk) count the same bytes twice during the staging
+    // window. That errs toward early StoreFull, never toward breaching
+    // I-TOTAL. Plan B Task 9.
+    try admission_mod.checkSpoolFit(store, io, bytes.len);
+    const r = try admission_mod.reserve(store, io, .hot, bytes.len, null, null);
+    errdefer admission_mod.abort(store, io, r);
+
     const tmp_name = try newTmpName(io);
     const tmp = try store.dir.createFile(io, tmp_name, .{ .exclusive = true });
     defer tmp.close(io);
@@ -78,14 +94,21 @@ pub fn putBytes(store: *root.Store, io: Io, bytes: []const u8, kind: root.Kind) 
     try tmp.sync(io);
     try tmp.setPermissions(io, object_mode);
     try publish(store, io, tmp_name, full);
-    try recordKind(store, io, d, kind);
     indexUpsert(store, io, d, bytes.len, kind);
+    admission_mod.commit(store, io, r, d);
     return d;
 }
 
 /// Streams `src` to a temp file while hashing, then publishes under the hash.
 /// `src` is read positionally, so its seek position is irrelevant.
 pub fn putFile(store: *root.Store, io: Io, src: Io.File, kind: root.Kind) PutError!Digest {
+    // Spool fast-fail before staging anything: a source that alone exceeds
+    // spool_cap can never be admitted (§10.2). Unknown lengths (length
+    // errors) skip the pre-check; the exact post-stream check below still
+    // applies. Plan B Task 9.
+    const staged_hint: ?u64 = src.length(io) catch null;
+    if (staged_hint) |n| try admission_mod.checkSpoolFit(store, io, n);
+
     var h = std.crypto.hash.Blake3.init(.{});
     var buf: [64 * 1024]u8 = undefined;
     var offset: u64 = 0;
@@ -132,9 +155,22 @@ pub fn putFile(store: *root.Store, io: Io, src: Io.File, kind: root.Kind) PutErr
         error.FileNotFound => {},
         else => return error.Unexpected,
     }
+    // Admission on the exact streamed size (known only now). The staged tmp
+    // file is visible to the spool walk during reserve, so the check is
+    // conservative (see the staging note in putBytes). A failed reserve
+    // deletes the staged tmp so the op leaves no residue. Plan B Task 9.
+    admission_mod.checkSpoolFit(store, io, offset) catch |err| {
+        store.dir.deleteFile(io, tmp_name) catch {};
+        return err;
+    };
+    const r = admission_mod.reserve(store, io, .hot, offset, null, null) catch |err| {
+        store.dir.deleteFile(io, tmp_name) catch {};
+        return err;
+    };
+    errdefer admission_mod.abort(store, io, r);
     try publish(store, io, tmp_name, full);
-    try recordKind(store, io, d, kind);
     indexUpsert(store, io, d, offset, kind);
+    admission_mod.commit(store, io, r, d);
     return d;
 }
 
@@ -152,24 +188,6 @@ fn publish(store: *root.Store, io: Io, tmp_name: []const u8, full: []const u8) P
         error.FileNotFound => {}, // lost the race to an identical object; tmp is gone
         else => return error.Unexpected,
     };
-}
-
-fn recordKind(store: *root.Store, io: Io, d: Digest, kind: root.Kind) PutError!void {
-    // Append-only journal; readers skip malformed lines (spec §5.2).
-    const hex = d.toHex();
-    var line_buf: [128]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "{{\"digest\":\"{s}\",\"kind\":\"{s}\"}}\n", .{ hex[0..], @tagName(kind) }) catch return error.Unexpected;
-    const path = layout.state_dir ++ "/kinds.jsonl";
-    const f = try store.dir.createFile(io, path, .{ .read = true, .truncate = false });
-    defer f.close(io);
-    // Serialize length + positional write across processes; concurrent
-    // ingests would otherwise interleave journal lines. Sync so the
-    // kind record is durable with the object it describes.
-    f.lock(io, .exclusive) catch return error.Unexpected;
-    defer f.unlock(io);
-    const len = try f.length(io);
-    try f.writePositionalAll(io, line, len);
-    f.sync(io) catch return error.Unexpected;
 }
 
 /// Store-relative object path: "objects/<hex[0..2]>/<hex[2..]>"
@@ -293,4 +311,13 @@ test "crash window: tmp files are never objects" {
     try std.testing.expectEqualStrings("partial", leftover);
     var buf: [73]u8 = undefined;
     _ = try ts.store.dir.statFile(io, objectFull(d, &buf), .{});
+}
+
+test "ingest writes no journal file" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var ts = test_support.openTestStore(io, .{});
+    defer ts.deinit(io);
+
+    _ = try ts.store.putBytes(io, "no journal", .rlib);
+    try std.testing.expectError(error.FileNotFound, ts.store.dir.statFile(io, "state/kinds.jsonl", .{}));
 }

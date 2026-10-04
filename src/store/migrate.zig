@@ -3,10 +3,23 @@ const index_mod = @import("index.zig");
 const layout = @import("layout.zig");
 const state = @import("state.zig");
 const digest_mod = @import("digest.zig");
+const tags_mod = @import("tags.zig");
+const disk_usage_mod = @import("disk_usage.zig");
 
 const Io = std.Io;
 
-pub const MigrateError = index_mod.DbError || state.StateError || error{ Unexpected, OutOfMemory };
+pub const MigrateError = index_mod.DbError || state.StateError || disk_usage_mod.DiskUsageError || error{ Unexpected, OutOfMemory, LeasesLive, CorruptRoot, NoHeadroom };
+
+/// Filename of the last corrupt root file seen by the strict importer.
+/// Zig errors carry no payload, so the fail-closed path records the name
+/// here (truncated to the buffer) for the CLI to report alongside
+/// `error.CorruptRoot`; tests assert it directly. Reset on every `migrate`.
+var last_bad_root_buf: [512]u8 = undefined;
+var last_bad_root_len: usize = 0;
+
+pub fn lastBadRoot() []const u8 {
+    return last_bad_root_buf[0..last_bad_root_len];
+}
 
 pub const MigrateOpts = struct { dry_run: bool = false };
 
@@ -30,11 +43,16 @@ pub fn migrate(io: Io, store_dir: Io.Dir, idx: *index_mod.Index, opts: MigrateOp
     const parsed = std.json.parseFromSlice(layout.FormatJson, page, fmt_bytes, .{}) catch return error.Unexpected;
     defer parsed.deinit();
     if (parsed.value.format != 1) return .{};
+    last_bad_root_len = 0;
 
-    // §14.1 preconditions: no live leases here in the doc sketch (real code checks
-    // `state.liveLeases` non-empty → return `error.LeasesLive` unless `--wait` drained them;
-    // exclusive `format-lock` is held by the `rime cache migrate` caller, not here).
-    // §14.1 backup: copy `state/` to `state/migrate-backup/` (skipped when `dry_run`).
+    // §14.1 preconditions (fail-closed before touching anything): no live
+    // leases (builds must drain; the caller holds the exclusive
+    // `format-lock` for the whole run), free space ≥ index headroom
+    // `max(256 MiB, 1% of hot bytes)`, and a publishable `state/` backup.
+    // Dry run checks preconditions but writes nothing.
+    try checkNoLiveLeases(io, store_dir);
+    try checkHeadroom(io, store_dir);
+    if (!opts.dry_run) try backupState(io, store_dir);
     var rep = MigrateReport{};
     rep.objects_imported = try importJournal(io, store_dir, idx, opts.dry_run);
     rep.actions_imported = try importActions(io, store_dir, idx, opts.dry_run);
@@ -54,6 +72,103 @@ pub fn migrate(io: Io, store_dir: Io.Dir, idx: *index_mod.Index, opts: MigrateOp
     // the read-only `verify` pass (§11.5) exits 0 — kept as the tag-loss backstop until then.
     // `actions/` + v1 `state/` JSON sources are removed on success (post-verify).
     return rep;
+}
+
+/// §14.1 live-lease gate: any unexpired lease aborts fail-closed with
+/// `error.LeasesLive` (operator drains builds or re-runs with `--wait`).
+/// Peek-only: expired files are left for the migration to import, never
+/// reaped here.
+fn checkNoLiveLeases(io: Io, store_dir: Io.Dir) MigrateError!void {
+    const page = std.heap.page_allocator;
+    const now_ms = Io.Timestamp.now(io, .real).toMilliseconds();
+    // Missing leases dir counts as empty (bare v1 skeleton).
+    var probe = store_dir.openDir(io, layout.state_dir ++ "/leases", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        error.Canceled => return error.Canceled,
+        else => return error.Unexpected,
+    };
+    probe.close(io);
+    const live = try state.peekLiveLeases(io, page, store_dir, now_ms);
+    defer state.freeLeases(page, live);
+    if (live.len > 0) {
+        return error.LeasesLive;
+    }
+}
+
+/// §14.1 headroom: free space must cover `max(256 MiB, 1% of hot bytes)`
+/// for the index build (WAL + rows) before anything is written.
+fn checkHeadroom(io: Io, store_dir: Io.Dir) MigrateError!void {
+    const hot = try hotBytes(store_dir, io);
+    const need = @max(256 * 1024 * 1024, hot / 100);
+    const disk = try disk_usage_mod.readDiskUsage(io, store_dir);
+    if (disk.free_bytes < need) {
+        return error.NoHeadroom;
+    }
+}
+
+fn hotBytes(store_dir: Io.Dir, io: Io) MigrateError!u64 {
+    const page = std.heap.page_allocator;
+    var total: u64 = 0;
+    const top = store_dir.openDir(io, layout.objects_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        error.Canceled => return error.Canceled,
+        else => return error.Unexpected,
+    };
+    defer top.close(io);
+    var fan = top.iterate();
+    while (try fan.next(io)) |fanout| {
+        if (fanout.name.len != 2) continue;
+        const sub = top.openDir(io, fanout.name, .{ .iterate = true }) catch continue;
+        defer sub.close(io);
+        var it = sub.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.name.len != 62) continue;
+            const rel = std.fmt.allocPrint(page, "{s}/{s}/{s}", .{ layout.objects_dir, fanout.name, entry.name }) catch return error.OutOfMemory;
+            defer page.free(rel);
+            if (store_dir.statFile(io, rel, .{})) |st| total +|= st.size else |_| {}
+        }
+    }
+    return total;
+}
+
+/// §14.1 backup: recursive copy of `state/` to `state/migrate-backup/`.
+/// Skipped when dry_run (caller gates). Idempotent: a previous backup is
+/// replaced wholesale via deleteTree + copy.
+fn backupState(io: Io, store_dir: Io.Dir) MigrateError!void {
+    const src = layout.state_dir;
+    const dst = layout.state_dir ++ "/migrate-backup";
+    // A backup inside the source tree must not recurse into itself: clear
+    // any previous backup first, then copy excluding the backup dir.
+    // Missing backup is fine (orelse-return inside deleteTree); any other
+    // failure is best-effort too — the copy below replaces wholesale.
+    store_dir.deleteTree(io, dst) catch {};
+    copyDirRecursive(io, store_dir, src, dst, true) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return error.Canceled,
+        else => return error.Unexpected,
+    };
+}
+
+fn copyDirRecursive(io: Io, store_dir: Io.Dir, src_sub: []const u8, dst_sub: []const u8, comptime is_root: bool) (error{OutOfMemory} || Io.Cancelable || Io.Dir.OpenError || Io.Dir.Iterator.Error || Io.Dir.CreateDirPathError || Io.Dir.CopyFileError)!void {
+    const page = std.heap.page_allocator;
+    const src = try store_dir.openDir(io, src_sub, .{ .iterate = true });
+    defer src.close(io);
+    try store_dir.createDirPath(io, dst_sub);
+    var it = src.iterate();
+    while (try it.next(io)) |entry| {
+        // Never copy the backup into itself.
+        if (is_root and std.mem.eql(u8, entry.name, "migrate-backup")) continue;
+        const s = try std.fmt.allocPrint(page, "{s}/{s}", .{ src_sub, entry.name });
+        defer page.free(s);
+        const d = try std.fmt.allocPrint(page, "{s}/{s}", .{ dst_sub, entry.name });
+        defer page.free(d);
+        if (entry.kind == .directory) {
+            try store_dir.createDirPath(io, d);
+            try copyDirRecursive(io, store_dir, s, d, false);
+        } else {
+            try Io.Dir.copyFile(store_dir, s, store_dir, d, io, .{ .make_path = true });
+        }
+    }
 }
 
 /// Journal lines: {"digest":"<64hex>","kind":"<tag>"}; malformed lines skipped (v1 §5.2 rule).
@@ -176,54 +291,123 @@ fn importActions(io: Io, store_dir: Io.Dir, idx: *index_mod.Index, dry_run: bool
 }
 
 /// Pins/leases/retains JSON -> §11.2 rows (authoritative files stay until post-verify removal).
-/// Corrupt root files abort fail-closed with the filename (v1 skip-and-ignore does NOT carry over, §11.5).
-/// Note: there is no `state.listLeases`; leases are read via `peekLiveLeases`
-/// (no expiry deletion during migration). Missing root dirs count as empty
-/// (a bare v1 skeleton may lack them); any other state error aborts.
+/// Strict fail-closed import (§14.5/§11.5): every root file is read and
+/// validated individually; any corrupt file aborts the migration with
+/// `error.CorruptRoot` and the filename in the log (v1 skip-and-ignore
+/// does NOT carry over to roots). Missing root dirs count as empty (a bare
+/// v1 skeleton may lack them). Expired leases are imported as-is (GC
+/// expires them); corrupt shape in any file — bad JSON, non-64-hex
+/// digests, missing fields — aborts before anything is committed.
 fn importRoots(io: Io, store_dir: Io.Dir, idx: *index_mod.Index, dry_run: bool) MigrateError!u64 {
     const page = std.heap.page_allocator;
     const now_ms = Io.Timestamp.now(io, .real).toMilliseconds();
     var count: u64 = 0;
-    if (dirExists(store_dir, io, layout.state_dir ++ "/pins")) {
-        const pins = state.listPins(io, page, store_dir) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Canceled => return error.Canceled,
-            else => return error.Unexpected,
-        };
-        defer state.freePins(page, pins);
-        for (pins) |p| {
-            count += 1;
-            if (dry_run) continue;
-            index_mod.insertPin(idx, p.name, p.digest_hex, now_ms) catch return error.Unexpected;
-        }
+    count += try importPinsStrict(io, store_dir, idx, page, now_ms, dry_run);
+    count += try importLeasesStrict(io, store_dir, idx, page, now_ms, dry_run);
+    count += try importRetainsStrict(io, store_dir, idx, page, dry_run);
+    return count;
+}
+
+const PinFile = struct { name: []const u8, digest_hex: []const u8, created_ms: i64 };
+const LeaseFile = struct { build_id: []const u8, digest_hexes: []const []const u8, expires_ms: i64 };
+const RetainFile = struct { project_id: []const u8, manifest_hexes: []const []const u8, updated_ms: i64 };
+
+fn failRoot(sub_path: []const u8) MigrateError {
+    // Zig errors carry no payload: record the filename for lastBadRoot()
+    // (CLI reports it; tests assert it) instead of logging — the test
+    // runner fails any test that emits via std.log/std.debug during the run.
+    const n = @min(sub_path.len, last_bad_root_buf.len);
+    @memcpy(last_bad_root_buf[0..n], sub_path[0..n]);
+    last_bad_root_len = n;
+    return error.CorruptRoot;
+}
+
+fn checkHex64(hex: []const u8) bool {
+    if (hex.len != 64) return false;
+    for (hex) |ch| {
+        const ok = (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F');
+        if (!ok) return false;
     }
-    if (dirExists(store_dir, io, layout.state_dir ++ "/leases")) {
-        const leases = state.peekLiveLeases(io, page, store_dir, now_ms) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Canceled => return error.Canceled,
-            else => return error.Unexpected,
-        };
-        defer state.freeLeases(page, leases);
-        for (leases) |l| {
-            count += 1;
-            if (dry_run) continue;
-            index_mod.insertLease(idx, l.build_id, l.expires_ms) catch return error.Unexpected;
-            for (l.digest_hexes) |h| index_mod.insertLeaseObject(idx, l.build_id, h) catch return error.Unexpected;
-        }
+    return true;
+}
+
+fn importPinsStrict(io: Io, store_dir: Io.Dir, idx: *index_mod.Index, gpa: std.mem.Allocator, now_ms: i64, dry_run: bool) MigrateError!u64 {
+    const sub = layout.state_dir ++ "/pins";
+    const dir = store_dir.openDir(io, sub, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        error.Canceled => return error.Canceled,
+        else => return error.Unexpected,
+    };
+    defer dir.close(io);
+    var count: u64 = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        const rel = std.fmt.allocPrint(gpa, "{s}/{s}", .{ sub, entry.name }) catch return error.OutOfMemory;
+        defer gpa.free(rel);
+        const bytes = store_dir.readFileAlloc(io, rel, gpa, .unlimited) catch return failRoot(rel);
+        defer gpa.free(bytes);
+        const parsed = std.json.parseFromSlice(PinFile, gpa, bytes, .{ .allocate = .alloc_always }) catch return failRoot(rel);
+        defer parsed.deinit();
+        if (parsed.value.name.len == 0 or !checkHex64(parsed.value.digest_hex)) return failRoot(rel);
+        count += 1;
+        if (dry_run) continue;
+        index_mod.insertPin(idx, parsed.value.name, parsed.value.digest_hex, now_ms) catch return error.Unexpected;
     }
-    if (dirExists(store_dir, io, layout.state_dir ++ "/projects")) {
-        const retains = state.listRetains(io, page, store_dir) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Canceled => return error.Canceled,
-            else => return error.Unexpected,
-        };
-        defer state.freeRetains(page, retains);
-        for (retains) |r| {
-            count += 1;
-            if (dry_run) continue;
-            index_mod.insertRetain(idx, r.project_id, r.updated_ms) catch return error.Unexpected;
-            for (r.manifest_hexes) |m| index_mod.insertRetainManifest(idx, r.project_id, m) catch return error.Unexpected;
-        }
+    return count;
+}
+
+fn importLeasesStrict(io: Io, store_dir: Io.Dir, idx: *index_mod.Index, gpa: std.mem.Allocator, now_ms: i64, dry_run: bool) MigrateError!u64 {
+    _ = now_ms;
+    const sub = layout.state_dir ++ "/leases";
+    const dir = store_dir.openDir(io, sub, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        error.Canceled => return error.Canceled,
+        else => return error.Unexpected,
+    };
+    defer dir.close(io);
+    var count: u64 = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        const rel = std.fmt.allocPrint(gpa, "{s}/{s}", .{ sub, entry.name }) catch return error.OutOfMemory;
+        defer gpa.free(rel);
+        const bytes = store_dir.readFileAlloc(io, rel, gpa, .unlimited) catch return failRoot(rel);
+        defer gpa.free(bytes);
+        const parsed = std.json.parseFromSlice(LeaseFile, gpa, bytes, .{ .allocate = .alloc_always }) catch return failRoot(rel);
+        defer parsed.deinit();
+        if (parsed.value.build_id.len == 0) return failRoot(rel);
+        for (parsed.value.digest_hexes) |h| if (!checkHex64(h)) return failRoot(rel);
+        count += 1;
+        if (dry_run) continue;
+        index_mod.insertLease(idx, parsed.value.build_id, parsed.value.expires_ms) catch return error.Unexpected;
+        for (parsed.value.digest_hexes) |h| index_mod.insertLeaseObject(idx, parsed.value.build_id, h) catch return error.Unexpected;
+    }
+    return count;
+}
+
+fn importRetainsStrict(io: Io, store_dir: Io.Dir, idx: *index_mod.Index, gpa: std.mem.Allocator, dry_run: bool) MigrateError!u64 {
+    const sub = layout.state_dir ++ "/projects";
+    const dir = store_dir.openDir(io, sub, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        error.Canceled => return error.Canceled,
+        else => return error.Unexpected,
+    };
+    defer dir.close(io);
+    var count: u64 = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const rel = std.fmt.allocPrint(gpa, "{s}/{s}", .{ sub, entry.name }) catch return error.OutOfMemory;
+        defer gpa.free(rel);
+        const bytes = store_dir.readFileAlloc(io, rel, gpa, .unlimited) catch return failRoot(rel);
+        defer gpa.free(bytes);
+        const parsed = std.json.parseFromSlice(RetainFile, gpa, bytes, .{ .allocate = .alloc_always }) catch return failRoot(rel);
+        defer parsed.deinit();
+        if (parsed.value.project_id.len == 0) return failRoot(rel);
+        for (parsed.value.manifest_hexes) |h| if (!checkHex64(h)) return failRoot(rel);
+        count += 1;
+        if (dry_run) continue;
+        index_mod.insertRetain(idx, parsed.value.project_id, parsed.value.updated_ms) catch return error.Unexpected;
+        for (parsed.value.manifest_hexes) |m| index_mod.insertRetainManifest(idx, parsed.value.project_id, m) catch return error.Unexpected;
     }
     return count;
 }
@@ -238,14 +422,112 @@ fn dirExists(store_dir: Io.Dir, io: Io, sub: []const u8) bool {
 /// `kind=incremental` objects with at least `action=rustc` + `project=<dir id>` tags
 /// (dedup may collapse identical sessions); delete source trees unless `dry_run`.
 /// Returns re-homed bytes. Installs the `kind:incremental = 4GiB` soft tag budget.
-/// Walk ingestion lands in a later pass; this step installs the soft budget row
-/// so migrated stores are bounded from the first boot.
+/// Dry run walks and counts without ingesting, tagging, deleting, or
+/// installing the budget row.
 fn rehomeIncremental(io: Io, store_dir: Io.Dir, idx: *index_mod.Index, dry_run: bool) MigrateError!u64 {
-    _ = io;
-    _ = store_dir;
-    if (dry_run) return 0;
+    const page = std.heap.page_allocator;
+    const now_ms = Io.Timestamp.now(io, .real).toMilliseconds();
+    var total: u64 = 0;
+    const projs_sub = layout.state_dir ++ "/projects";
+    const projs = store_dir.openDir(io, projs_sub, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (dry_run) return 0;
+            idx.execAll("INSERT OR IGNORE INTO tag_budgets(key,value,soft_cap) VALUES('kind','incremental',4294967296);") catch return error.Unexpected;
+            return 0;
+        },
+        error.Canceled => return error.Canceled,
+        else => return error.Unexpected,
+    };
+    defer projs.close(io);
+    var it = projs.iterate();
+    while (try it.next(io)) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".json")) continue;
+        if (std.mem.eql(u8, entry.name, "migrate-backup")) continue;
+        const incr_sub = std.fmt.allocPrint(page, "{s}/{s}/incremental", .{ projs_sub, entry.name }) catch return error.OutOfMemory;
+        defer page.free(incr_sub);
+        // Missing incremental tree counts as empty (project without sessions).
+        var probe = store_dir.openDir(io, incr_sub, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            error.Canceled => return error.Canceled,
+            else => continue,
+        };
+        probe.close(io);
+        total += try rehomeOneProject(io, store_dir, idx, page, incr_sub, entry.name, now_ms, dry_run);
+        if (!dry_run) store_dir.deleteTree(io, incr_sub) catch {};
+    }
+    if (dry_run) return total;
     idx.execAll("INSERT OR IGNORE INTO tag_budgets(key,value,soft_cap) VALUES('kind','incremental',4294967296);") catch return error.Unexpected;
-    return 0;
+    return total;
+}
+
+/// Ingests every regular file under one `incremental/` tree as a hot
+/// `kind=incremental` object (content-hash dedup: identical sessions
+/// collapse to one object), tagged `action=rustc` + `project=<dir id>`.
+/// Returns the source bytes walked. Files are published 0o444 like any
+/// ingested object; the index row seeds `last_access_ms` from the source
+/// mtime so ages survive migration.
+fn rehomeOneProject(io: Io, store_dir: Io.Dir, idx: *index_mod.Index, gpa: std.mem.Allocator, incr_sub: []const u8, project_id: []const u8, now_ms: i64, dry_run: bool) MigrateError!u64 {
+    var total: u64 = 0;
+    const incr = store_dir.openDir(io, incr_sub, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        error.Canceled => return error.Canceled,
+        else => return error.Unexpected,
+    };
+    defer incr.close(io);
+    var it = incr.iterate();
+    while (try it.next(io)) |entry| {
+        const rel = std.fmt.allocPrint(gpa, "{s}/{s}", .{ incr_sub, entry.name }) catch return error.OutOfMemory;
+        defer gpa.free(rel);
+        if (entry.kind == .directory) {
+            total += try rehomeOneProject(io, store_dir, idx, gpa, rel, project_id, now_ms, dry_run);
+            continue;
+        }
+        const st = store_dir.statFile(io, rel, .{}) catch continue;
+        total += st.size;
+        if (dry_run) continue;
+        const bytes = store_dir.readFileAlloc(io, rel, gpa, .unlimited) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            else => continue,
+        };
+        defer gpa.free(bytes);
+        const d = digest_mod.hashBytes(bytes);
+        const hex = d.toHex();
+        // Publish under objects/ (hot, immutable 0o444); dedup race is
+        // won by whoever renames first — rename misses are ignored.
+        var rbuf: [65]u8 = undefined;
+        const rrel = d.relPath(&rbuf);
+        var full: [73]u8 = undefined;
+        @memcpy(full[0..8], "objects/");
+        @memcpy(full[8..73], rrel);
+        store_dir.createDirPath(io, full[0..10]) catch continue;
+        const already = if (store_dir.statFile(io, full[0..73], .{})) |_| true else |_| false;
+        if (!already) {
+            store_dir.writeFile(io, .{ .sub_path = full[0..73], .data = bytes }) catch continue;
+            if (store_dir.openFile(io, full[0..73], .{})) |f| {
+                defer f.close(io);
+                f.setPermissions(io, .fromMode(0o444)) catch {};
+            } else |_| {}
+        }
+        index_mod.upsertObject(idx, .{
+            .digest = hex,
+            .size = st.size,
+            .compressed_size = null,
+            .tier = .hot,
+            .kind = "incremental",
+            .created_ms = now_ms,
+            .last_access_ms = st.mtime.toMilliseconds(),
+        }) catch return error.Unexpected;
+        tags_mod.tagObject(idx, &hex, &.{ .{ .key = "action", .value = "rustc" }, .{ .key = "project", .value = project_id } }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            // Tag gate (e.g. TagLimit) must not fail migration: the bytes
+            // are already published; untagged sessions are
+            // evictable-first per §12.2 (accepted transient, §14.3).
+            else => {},
+        };
+    }
+    return total;
 }
 
 test "migrate imports journal kinds and bumps format to 2" {
@@ -330,4 +612,114 @@ fn test_openRefusesV1(io: std.Io, dir: std.Io.Dir) !void {
     const root = @import("root.zig");
     var s = try root.Store.open(io, dir, .{});
     s.close(io);
+}
+
+test "migrate refuses live leases" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "state/leases");
+    try tmp.dir.writeFile(io, .{ .sub_path = "format.json", .data = "{\"format\":1}\n" });
+    const now_ms = Io.Timestamp.now(io, .real).toMilliseconds();
+    const lease_json = try std.fmt.allocPrint(std.testing.allocator, "{{\"build_id\":\"b1\",\"digest_hexes\":[],\"expires_ms\":{d}}}", .{now_ms + 2 * 60 * 60 * 1000});
+    defer std.testing.allocator.free(lease_json);
+    try tmp.dir.writeFile(io, .{ .sub_path = "state/leases/b1", .data = lease_json });
+    var idx = try index_mod.Index.open(io, tmp.dir);
+    defer idx.close();
+    try std.testing.expectError(error.LeasesLive, migrate(io, tmp.dir, &idx, .{}));
+    // Fail-closed: format untouched.
+    const fmt = try tmp.dir.readFileAlloc(io, "format.json", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(fmt);
+    try std.testing.expect(std.mem.indexOf(u8, fmt, "\"format\":1") != null);
+}
+
+test "migrate backs up state before importing" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "state/pins");
+    try tmp.dir.writeFile(io, .{ .sub_path = "format.json", .data = "{\"format\":1}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "state/pins/keep", .data = "{\"name\":\"keep\",\"digest_hex\":\"" ++ "a" ** 64 ++ "\",\"created_ms\":1}" });
+    var idx = try index_mod.Index.open(io, tmp.dir);
+    defer idx.close();
+    _ = try migrate(io, tmp.dir, &idx, .{});
+    // Backup holds the pre-migration pin file.
+    const backed = try tmp.dir.readFileAlloc(io, "state/migrate-backup/pins/keep", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(backed);
+    try std.testing.expect(std.mem.indexOf(u8, backed, "keep") != null);
+}
+
+test "migrate aborts on corrupt root" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "state/pins");
+    try tmp.dir.writeFile(io, .{ .sub_path = "format.json", .data = "{\"format\":1}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "state/pins/bad", .data = "{not json" });
+    var idx = try index_mod.Index.open(io, tmp.dir);
+    defer idx.close();
+    try std.testing.expectError(error.CorruptRoot, migrate(io, tmp.dir, &idx, .{}));
+    // The filename travels via lastBadRoot (errors carry no payload).
+    try std.testing.expect(std.mem.indexOf(u8, lastBadRoot(), "state/pins/bad") != null);
+}
+
+test "migrate rehomes incremental trees as tagged objects" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "state/projects/proj1/incremental");
+    try tmp.dir.writeFile(io, .{ .sub_path = "format.json", .data = "{\"format\":1}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "state/projects/proj1/incremental/sess.bin", .data = "session-bytes" });
+    var idx = try index_mod.Index.open(io, tmp.dir);
+    defer idx.close();
+    const rep = try migrate(io, tmp.dir, &idx, .{});
+    try std.testing.expectEqual(@as(u64, 13), rep.incremental_rehomed_bytes);
+    // Object row exists with kind=incremental.
+    const d = digest_mod.hashBytes("session-bytes");
+    const hex = d.toHex();
+    const row = try index_mod.getObject(&idx, std.testing.allocator, &hex);
+    try std.testing.expect(row != null);
+    try std.testing.expectEqualStrings("incremental", row.?.kind);
+    std.testing.allocator.free(row.?.kind);
+    // Tags carry action=rustc + project=proj1.
+    const tags = try tags_mod.tagsFor(std.testing.allocator, &idx, &hex);
+    defer tags_mod.freeTags(std.testing.allocator, tags);
+    var has_action = false;
+    var has_project = false;
+    for (tags) |t| {
+        if (std.mem.eql(u8, t.key, "action") and std.mem.eql(u8, t.value, "rustc")) has_action = true;
+        if (std.mem.eql(u8, t.key, "project") and std.mem.eql(u8, t.value, "proj1")) has_project = true;
+    }
+    try std.testing.expect(has_action and has_project);
+    // Source tree deleted; soft budget installed.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "state/projects/proj1/incremental/sess.bin", .{}));
+    const budgets = try index_mod.listTagBudgets(&idx, std.testing.allocator);
+    defer index_mod.freeTagBudgets(std.testing.allocator, budgets);
+    var found = false;
+    for (budgets) |b| {
+        if (std.mem.eql(u8, b.key, "kind") and std.mem.eql(u8, b.value, "incremental")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "migrate dry run counts incremental without ingesting" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "state/projects/proj1/incremental");
+    try tmp.dir.writeFile(io, .{ .sub_path = "format.json", .data = "{\"format\":1}\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "state/projects/proj1/incremental/sess.bin", .data = "12345" });
+    var idx = try index_mod.Index.open(io, tmp.dir);
+    defer idx.close();
+    const rep = try migrate(io, tmp.dir, &idx, .{ .dry_run = true });
+    try std.testing.expectEqual(@as(u64, 5), rep.incremental_rehomed_bytes);
+    // Dry run: source stays, no object row, no budget row, format stays 1.
+    _ = try tmp.dir.statFile(io, "state/projects/proj1/incremental/sess.bin", .{});
+    try std.testing.expectEqual(@as(u64, 0), try index_mod.objectCount(&idx));
+    const budgets = try index_mod.listTagBudgets(&idx, std.testing.allocator);
+    defer index_mod.freeTagBudgets(std.testing.allocator, budgets);
+    try std.testing.expectEqual(@as(usize, 0), budgets.len);
+    const fmt = try tmp.dir.readFileAlloc(io, "format.json", std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(fmt);
+    try std.testing.expect(std.mem.indexOf(u8, fmt, "\"format\":1") != null);
 }

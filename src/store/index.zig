@@ -360,6 +360,47 @@ pub fn getAction(idx: *Index, gpa: std.mem.Allocator, action_key: *const [64]u8)
     };
 }
 
+/// One actions-table row for the stale sweep (Plan B Task 12): the sweep
+/// iterates the index, never the retired `actions/` flat files. Owned
+/// manifest_digest strings; caller frees via freeActionRows.
+/// Manifest digests may be short/invalid (pre-migration residue); the
+/// caller skips unparseable rows, same leniency as the old file walk.
+/// Only index.zig calls sqlite3_* directly.
+pub const ActionKeyRow = struct { action_key: [64]u8, manifest_digest: []u8, created_ms: i64 };
+
+pub fn listActions(idx: *Index, gpa: std.mem.Allocator) DbError![]ActionKeyRow {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db,
+        "SELECT action_key,manifest_digest,created_ms FROM actions;",
+        -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    var list: std.ArrayList(ActionKeyRow) = .empty;
+    errdefer {
+        for (list.items) |r| gpa.free(r.manifest_digest);
+        list.deinit(gpa);
+    }
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        var key: [64]u8 = undefined;
+        @memcpy(&key, std.mem.span(c.sqlite3_column_text(stmt, 0))[0..64]);
+        const m = try gpa.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 1)));
+        list.append(gpa, .{
+            .action_key = key,
+            .manifest_digest = m,
+            .created_ms = c.sqlite3_column_int64(stmt, 2),
+        }) catch |append_err| {
+            gpa.free(m);
+            return append_err;
+        };
+    }
+    return try list.toOwnedSlice(gpa);
+}
+
+pub fn freeActionRows(gpa: std.mem.Allocator, rows: []ActionKeyRow) void {
+    for (rows) |r| gpa.free(r.manifest_digest);
+    gpa.free(rows);
+}
+
 /// Pins mirror: JSON stays authoritative (decision D4); the row is rewritten
 /// in the same call. No children, so REPLACE is cascade-safe.
 pub fn insertPin(idx: *Index, name: []const u8, digest_hex: []const u8, created_ms: i64) DbError!void {
@@ -508,6 +549,250 @@ pub fn reservationSum(idx: *Index, class: Class) DbError!u64 {
     bindText(stmt, 1, className(class));
     if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DbStep;
     return @intCast(c.sqlite3_column_int64(stmt, 0));
+}
+
+/// Admission ledger (storage-v2 §10.2). Reservation ids are 128-bit random,
+/// stored as 32 lowercase hex chars. Plain INSERT: a collision fails the
+/// put with DbStep (128-bit random makes this a never-happens path, and
+/// silently replacing another live reservation would corrupt accounting).
+/// Timestamps are passed in (Unix millis); the owner lease extension to the
+/// lease TTL is computed by the admission caller via leaseExpiry below.
+/// Plan B Task 9.
+pub fn insertReservation(idx: *Index, id: [16]u8, class: Class, bytes: u64, created_ms: i64, expires_ms: i64, owner: ?[]const u8) DbError!void {
+    const hex = std.fmt.bytesToHex(id, .lower);
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db,
+        "INSERT INTO reservations(reservation_id,class,bytes,created_ms,expires_ms,owner_build_id)" ++
+        " VALUES(?1,?2,?3,?4,?5,?6);", -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, &hex);
+    bindText(stmt, 2, className(class));
+    _ = c.sqlite3_bind_int64(stmt, 3, @intCast(bytes));
+    _ = c.sqlite3_bind_int64(stmt, 4, created_ms);
+    _ = c.sqlite3_bind_int64(stmt, 5, expires_ms);
+    if (owner) |o| {
+        bindText(stmt, 6, o);
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 6);
+    }
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
+/// Ledger -> file atom swap completion (success and failure alike: both
+/// just delete the row; the bytes are authoritative either way).
+/// Plan B Task 9.
+pub fn deleteReservation(idx: *Index, id: [16]u8) DbError!void {
+    const hex = std.fmt.bytesToHex(id, .lower);
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db, "DELETE FROM reservations WHERE reservation_id=?1;", -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, &hex);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
+/// Reaps expired reservation rows (§10.2 TTL). Run on open and on every
+/// admission so the ledger never counts garbage (§8.1 sweep discipline).
+/// Plan B Task 9.
+pub fn sweepExpiredReservations(idx: *Index, now_ms: i64) DbError!void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db, "DELETE FROM reservations WHERE expires_ms<?1;", -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_int64(stmt, 1, now_ms);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
+/// Lease expiry for an owner build id, if a row exists. Lets admission
+/// extend a matching reservation to the lease TTL (§10.2). Plan B Task 9.
+pub fn leaseExpiry(idx: *Index, build_id: []const u8) DbError!?i64 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db, "SELECT expires_ms FROM leases WHERE build_id=?1;", -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, build_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+    return c.sqlite3_column_int64(stmt, 0);
+}
+
+/// §12.3 per-tag-value byte measure (hot sizes, cold compressed, both = sum
+/// of both copies). Joins object_tags to objects; misses (no such pair)
+/// read as 0. Plan B Task 10.
+pub fn tagUsage(idx: *Index, key: []const u8, value: []const u8) DbError!u64 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db,
+        "SELECT COALESCE(SUM(CASE WHEN o.tier='hot' THEN o.size WHEN o.tier='both' THEN o.size + COALESCE(o.compressed_size, 0) ELSE COALESCE(o.compressed_size,o.size) END),0)" ++
+        " FROM object_tags t JOIN objects o ON o.digest=t.digest WHERE t.key=?1 AND t.value=?2;",
+        -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, key);
+    bindText(stmt, 2, value);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DbStep;
+    return @intCast(c.sqlite3_column_int64(stmt, 0));
+}
+
+/// §12.3 `kind:` budget sibling: the same CASE summed over
+/// `objects WHERE kind=?1` with no tag join (`kind` is an objects column,
+/// never an object tag, §11.3). Plan B Task 10.
+pub fn kindUsage(idx: *Index, kind: []const u8) DbError!u64 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db,
+        "SELECT COALESCE(SUM(CASE WHEN tier='hot' THEN size WHEN tier='both' THEN size + COALESCE(compressed_size, 0) ELSE COALESCE(compressed_size,size) END),0)" ++
+        " FROM objects WHERE kind=?1;",
+        -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, kind);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DbStep;
+    return @intCast(c.sqlite3_column_int64(stmt, 0));
+}
+
+/// One soft-cap row (§12.3, decision D6). Owned strings: free the slice
+/// with freeTagBudgets. Plan B Task 10.
+pub const TagBudgetRow = struct { key: []u8, value: []u8, soft_cap: u64 };
+
+pub fn listTagBudgets(idx: *Index, gpa: std.mem.Allocator) DbError![]TagBudgetRow {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db, "SELECT key,value,soft_cap FROM tag_budgets;", -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    var list: std.ArrayList(TagBudgetRow) = .empty;
+    errdefer {
+        for (list.items) |b| {
+            gpa.free(b.key);
+            gpa.free(b.value);
+        }
+        list.deinit(gpa);
+    }
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        const k = try gpa.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 0)));
+        errdefer gpa.free(k);
+        const v = try gpa.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 1)));
+        list.append(gpa, .{ .key = k, .value = v, .soft_cap = @intCast(c.sqlite3_column_int64(stmt, 2)) }) catch |append_err| {
+            gpa.free(k);
+            gpa.free(v);
+            return append_err;
+        };
+    }
+    return try list.toOwnedSlice(gpa);
+}
+
+pub fn freeTagBudgets(gpa: std.mem.Allocator, rows: []TagBudgetRow) void {
+    for (rows) |b| {
+        gpa.free(b.key);
+        gpa.free(b.value);
+    }
+    gpa.free(rows);
+}
+
+/// One per-pair aggregate for `stat --by-tag` (§12.2). Defined here (not in
+/// stats.zig) so the index owns the row shape while stats.zig re-exports it
+/// — no import cycle, no sqlite3 outside the index. Owned key/value
+/// strings. Plan B Task 11.
+pub const TagStat = struct { key: []u8, value: []u8, bytes: u64, objects: u64 };
+
+/// One row per distinct tag pair, bytes DESC, using the §12.3 CASE measure
+/// (hot sizes, cold compressed, both = both copies) with COUNT(*) objects
+/// per pair (PRIMARY KEY digest,key,value: one row per object per pair).
+/// Caller frees keys/values + slice (see stats.freeTagStats). Plan B Task 11.
+pub fn tagStats(idx: *Index, gpa: std.mem.Allocator) DbError![]TagStat {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db,
+        "SELECT key,value," ++
+        "COALESCE(SUM(CASE WHEN o.tier='hot' THEN o.size WHEN o.tier='both' THEN o.size + COALESCE(o.compressed_size,0) ELSE COALESCE(o.compressed_size,o.size) END),0)," ++
+        "COUNT(*) FROM object_tags t JOIN objects o ON o.digest=t.digest GROUP BY key,value ORDER BY 3 DESC;",
+        -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    var list: std.ArrayList(TagStat) = .empty;
+    errdefer {
+        for (list.items) |r| {
+            gpa.free(r.key);
+            gpa.free(r.value);
+        }
+        list.deinit(gpa);
+    }
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        const k = try gpa.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 0)));
+        errdefer gpa.free(k);
+        const v = try gpa.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 1)));
+        list.append(gpa, .{
+            .key = k,
+            .value = v,
+            .bytes = @intCast(c.sqlite3_column_int64(stmt, 2)),
+            .objects = @intCast(c.sqlite3_column_int64(stmt, 3)),
+        }) catch |append_err| {
+            gpa.free(k);
+            gpa.free(v);
+            return append_err;
+        };
+    }
+    return try list.toOwnedSlice(gpa);
+}
+
+/// Bounded oldest-first eviction candidates for one object class (§10.2
+/// bounded effort): at most max_objects rows AND at most max_bytes of class
+/// measure (hot: size; cold: compressed size), whichever bound hits first —
+/// never a full-table fetch. Rows carry duped kind strings: free with
+/// freeRows. index_state/spool hold no object bytes, so they yield zero
+/// candidates (their admit paths fail fast with StoreFull). Plan B Task 9.
+pub fn evictionCandidates(idx: *Index, gpa: std.mem.Allocator, class: Class, max_objects: u32, max_bytes: u64) DbError![]ObjectRow {
+    var list: std.ArrayList(ObjectRow) = .empty;
+    errdefer {
+        for (list.items) |r| gpa.free(r.kind);
+        list.deinit(gpa);
+    }
+    switch (class) {
+        .hot, .cold => {
+            const tier_text: []const u8 = if (class == .hot) "hot" else "cold";
+            var stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(idx.db,
+                "SELECT digest,size,compressed_size,tier,kind,created_ms,last_access_ms FROM objects" ++
+                " WHERE tier=?1 ORDER BY last_access_ms ASC LIMIT ?2;", -1, &stmt, null) != c.SQLITE_OK)
+                return error.DbPrepare;
+            defer _ = c.sqlite3_finalize(stmt);
+            bindText(stmt, 1, tier_text);
+            _ = c.sqlite3_bind_int64(stmt, 2, @intCast(max_objects));
+            while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+                var row = ObjectRow{
+                    .digest = undefined,
+                    .size = @intCast(c.sqlite3_column_int64(stmt, 1)),
+                    .compressed_size = if (c.sqlite3_column_type(stmt, 2) == c.SQLITE_NULL)
+                        null
+                    else
+                        @intCast(c.sqlite3_column_int64(stmt, 2)),
+                    .tier = if (std.mem.eql(u8, std.mem.span(c.sqlite3_column_text(stmt, 3)), "hot")) .hot else if (std.mem.eql(u8, std.mem.span(c.sqlite3_column_text(stmt, 3)), "cold")) .cold else .both,
+                    .kind = "",
+                    .created_ms = c.sqlite3_column_int64(stmt, 5),
+                    .last_access_ms = c.sqlite3_column_int64(stmt, 6),
+                };
+                @memcpy(&row.digest, std.mem.span(c.sqlite3_column_text(stmt, 0))[0..64]);
+                row.kind = try gpa.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 4)));
+                list.append(gpa, row) catch |append_err| {
+                    gpa.free(row.kind);
+                    return append_err;
+                };
+            }
+        },
+        .index_state, .spool => {},
+    }
+    // Byte bound: keep the oldest prefix whose cumulative class measure
+    // stays within max_bytes. Stop at the first row that would exceed —
+    // later rows are newer by LRU order, so skipping ahead would break LRU.
+    // Zero-byte objects always fit (eviction must make progress on them).
+    var kept: usize = 0;
+    var accum: u64 = 0;
+    for (list.items) |r| {
+        const m = if (class == .cold) (r.compressed_size orelse r.size) else r.size;
+        if (accum +| m > max_bytes) break;
+        accum += m;
+        kept += 1;
+    }
+    for (list.items[kept..]) |r| gpa.free(r.kind);
+    list.items = list.items[0..kept];
+    return try list.toOwnedSlice(gpa);
 }
 
 test "index opens inside a store dir and creates the schema" {

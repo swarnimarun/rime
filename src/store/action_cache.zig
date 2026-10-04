@@ -14,8 +14,6 @@ pub const PutError = error{Unexpected, OutOfMemory} || Io.Cancelable;
 pub const GetError = error{Unexpected, OutOfMemory} || Io.Cancelable;
 pub const SweepError = error{Unexpected, OutOfMemory} || Io.Cancelable || Io.Dir.Iterator.Error;
 
-const EntryJson = struct { manifest_hex: []const u8, created_ms: i64 };
-
 /// Store-relative entry path "actions/ab/<hex>" (spec §6; fanout mirrors objects).
 fn entryFull(key: digest_mod.Digest, buf: *[73]u8) []const u8 {
     var rbuf: [65]u8 = undefined;
@@ -25,65 +23,51 @@ fn entryFull(key: digest_mod.Digest, buf: *[73]u8) []const u8 {
     return buf[0..73];
 }
 
-/// Write-through (Plan B Task 6): the flat file stays until Task 12, and
-/// the `actions` table row is written in the same call (best-effort).
+/// Index-only write (Plan B Task 12): the v1 flat file write-through is
+/// retired. The `actions` table row is the entry; stale flat files left on
+/// migrated stores are ignored (imported already; a future `gc --compact`
+/// may reclaim them). Failures propagate: unlike object bytes, a dropped
+/// action row is silent performance loss with no self-heal path.
 pub fn putAction(io: Io, store_dir: Io.Dir, key: digest_mod.Digest, manifest: digest_mod.Digest, now_ms: i64, idx: *index_mod.Index) PutError!void {
-    var full_buf: [73]u8 = undefined;
-    const full = entryFull(key, &full_buf);
+    _ = io;
+    _ = store_dir;
+    const ahex = key.toHex();
     const hex = manifest.toHex();
-    const bytes = std.json.Stringify.valueAlloc(std.heap.page_allocator, EntryJson{
-        .manifest_hex = hex[0..],
-        .created_ms = now_ms,
-    }, .{}) catch return error.OutOfMemory;
-    defer std.heap.page_allocator.free(bytes);
-    try writeEntryAtomic(io, store_dir, full, bytes);
-    const ahex = key.toHex();
-    index_mod.insertAction(idx, &ahex, hex[0..], now_ms) catch {};
-}
-
-/// Index-first read; filesystem fallback with re-index on file hit
-/// (self-heal for pre-mirror entries). Stale rows (manifest gone) are left
-/// for the gc sweep — same contract as the v1 file path.
-pub fn getAction(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir, key: digest_mod.Digest, idx: *index_mod.Index) GetError!?ActionEntry {
-    const ahex = key.toHex();
-    if (index_mod.getAction(idx, gpa, &ahex)) |row| {
-        if (row) |r| {
-            defer gpa.free(r.manifest_digest);
-            return .{
-                .manifest = digest_mod.Digest.fromHex(r.manifest_digest) catch return error.Unexpected,
-                .created_ms = r.created_ms,
-            };
-        }
-    } else |err| switch (err) {
+    index_mod.insertAction(idx, &ahex, hex[0..], now_ms) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Canceled => return error.Canceled,
-        else => {},
-    }
-    const entry = try readFileEntry(io, gpa, store_dir, key);
-    if (entry) |e| {
-        const hex = e.manifest.toHex();
-        index_mod.insertAction(idx, &ahex, hex[0..], e.created_ms) catch {};
-    }
-    return entry;
-}
-
-/// File-only read for the stale sweep (sweep keeps filesystem behavior).
-fn readFileEntry(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir, key: digest_mod.Digest) GetError!?ActionEntry {
-    var full_buf: [73]u8 = undefined;
-    const full = entryFull(key, &full_buf);
-    const bytes = store_dir.readFileAlloc(io, full, gpa, .unlimited) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        error.OutOfMemory => return error.OutOfMemory,
         else => return error.Unexpected,
     };
-    defer gpa.free(bytes);
-    const parsed = std.json.parseFromSlice(EntryJson, gpa, bytes, .{ .allocate = .alloc_always }) catch return error.Unexpected;
-    defer parsed.deinit();
+}
+
+/// Table-only read (Plan B Task 12): no filesystem fallback. The index is
+/// the entry; a missing row is a miss (stale rows whose manifest is gone
+/// are removed by the sweep, same contract as the v1 file path). A DbError
+/// that is not OOM/cancel reads as a miss — entries are hints (§5.3), so a
+/// transient index fault degrades to a rebuild, never a build failure.
+pub fn getAction(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir, key: digest_mod.Digest, idx: *index_mod.Index) GetError!?ActionEntry {
+    _ = io;
+    _ = store_dir;
+    const ahex = key.toHex();
+    const row = index_mod.getAction(idx, gpa, &ahex) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return error.Canceled,
+        else => return null,
+    };
+    const r = row orelse return null;
+    defer gpa.free(r.manifest_digest);
     return .{
-        .manifest = digest_mod.Digest.fromHex(parsed.value.manifest_hex) catch return error.Unexpected,
-        .created_ms = parsed.value.created_ms,
+        .manifest = digest_mod.Digest.fromHex(r.manifest_digest) catch return error.Unexpected,
+        .created_ms = r.created_ms,
     };
 }
+
+/// Index-driven stale sweep (Plan B Task 12): iterates the `actions` table
+/// via `index.listActions`, never the retired `actions/` flat files.
+/// Manifest presence comes from the caller's `is_present` probe (gc wires
+/// the index-backed PresentCtx; tests wire their own ExistsCtx). Deletes
+/// the index row for stale entries so table-only reads stay consistent
+/// with the sweep.
 
 /// Deletes entries whose manifest object no longer exists. Returns count.
 /// Removes the flat file and the index row together so table-first reads
@@ -122,58 +106,33 @@ fn sweepInner(
     delete_stale: bool,
     idx: *index_mod.Index,
 ) SweepError!u64 {
+    _ = io;
+    _ = store_dir;
     var removed: u64 = 0;
-    const top = store_dir.openDir(io, layout.actions_dir, .{ .iterate = true }) catch return error.Unexpected;
-    defer top.close(io);
-    var fan = top.iterate();
-    while (try fan.next(io)) |fanout| {
-        if (fanout.name.len != 2) continue;
-        const sub = top.openDir(io, fanout.name, .{ .iterate = true }) catch continue;
-        defer sub.close(io);
-        var it = sub.iterate();
-        while (try it.next(io)) |entry| {
-            // Entry files are named by the 62-char hex remainder (spec
-            // §6 fanout mirrors objects); the fanout dir is the first byte.
-            if (entry.name.len != 62) continue;
-            var hex_buf: [64]u8 = undefined;
-            @memcpy(hex_buf[0..2], fanout.name);
-            @memcpy(hex_buf[2..64], entry.name);
-            const key = digest_mod.Digest.fromHex(hex_buf[0..64]) catch continue;
-            // Corrupt entries must not abort the sweep (or gc); skip them
-            // like other unreadable state files. Propagate OOM/cancel.
-            const got = readFileEntry(io, gpa, store_dir, key) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.Canceled => return error.Canceled,
-                error.Unexpected => continue,
-            };
-            const e = got orelse continue;
-            if (is_present(ctx, e.manifest)) continue;
-            if (delete_stale) {
-                sub.deleteFile(io, entry.name) catch {};
-                const ahex = key.toHex();
-                index_mod.deleteAction(idx, &ahex) catch {};
-            }
+    const rows = index_mod.listActions(idx, gpa) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return error.Canceled,
+        else => return error.Unexpected,
+    };
+    defer index_mod.freeActionRows(gpa, rows);
+    for (rows) |r| {
+        // Unparseable rows (pre-migration residue) can never resolve to a
+        // manifest: count them stale and drop them like corrupt files.
+        const man = digest_mod.Digest.fromHex(r.manifest_digest) catch {
+            if (delete_stale) index_mod.deleteAction(idx, &r.action_key) catch {};
             removed += 1;
-        }
+            continue;
+        };
+        if (is_present(ctx, man)) continue;
+        if (delete_stale) index_mod.deleteAction(idx, &r.action_key) catch {};
+        removed += 1;
     }
     return removed;
 }
 
-fn writeEntryAtomic(io: Io, store_dir: Io.Dir, full: []const u8, bytes: []const u8) PutError!void {
-    // Ensure the fanout dir exists (same layout rule as object publish).
-    store_dir.createDirPath(io, full[0..10]) catch return error.Unexpected;
-    var rnd: [8]u8 = undefined;
-    io.random(&rnd);
-    const rand_hex = std.fmt.bytesToHex(rnd, .lower);
-    var tmp_buf: [80]u8 = undefined;
-    const tmp = std.fmt.bufPrint(&tmp_buf, "{s}/a-{s}", .{ layout.tmp_dir, rand_hex[0..] }) catch return error.Unexpected;
-    store_dir.writeFile(io, .{ .sub_path = tmp, .data = bytes }) catch return error.Unexpected;
-    // Sync before rename so a crash cannot publish a torn entry (spec §8.3).
-    const f = store_dir.openFile(io, tmp, .{}) catch return error.Unexpected;
-    defer f.close(io);
-    f.sync(io) catch return error.Unexpected;
-    store_dir.rename(tmp, store_dir, full, io) catch return error.Unexpected;
-}
+/// Retired-flat-file path helper kept for tests that plant legacy files
+/// directly (corrupt-entry skip, index-mirror survival). Production code
+/// never constructs `actions/` paths outside `migrate.zig` (Plan B Task 12).
 
 const ExistsCtx = struct {
     store: *root.Store,
@@ -275,9 +234,12 @@ test "action entries survive through the index mirror" {
         try std.testing.expectEqualStrings(want[0..], r.manifest_digest);
     }
     // Delete the flat file: the index must still serve the entry.
+    // (Task 12: putAction no longer writes flat files, so the delete is a
+    // no-op tolerated for the retired path — the getAction below proves
+    // table-only reads serve the entry.)
     var flat_buf: [73]u8 = undefined;
     const flat = entryFull(key, &flat_buf);
-    try ts.store.dir.deleteFile(io, flat);
+    ts.store.dir.deleteFile(io, flat) catch {}; // retired path; absent on Task 12 stores
     const got = try ts.store.getAction(io, gpa, key);
     try std.testing.expect(got != null);
     try std.testing.expectEqual(man.bytes, got.?.manifest.bytes);

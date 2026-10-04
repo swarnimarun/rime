@@ -4,9 +4,9 @@ const digest_mod = @import("digest.zig");
 
 pub const Tag = struct { key: []const u8, value: []const u8 };
 
-pub const Predicate = struct { tags: []Tag, limit: u32 = 10 };
+pub const Predicate = struct { tags: []const Tag, limit: u32 = 10 };
 
-pub const TagError = index_mod.DbError || error{ UnknownTagKey, TagMismatch, TagLimit };
+pub const TagError = index_mod.DbError || error{ UnknownTagKey, TagMismatch, TagLimit, StoreFull };
 
 const c = index_mod.c;
 
@@ -20,26 +20,98 @@ fn isKnownKey(key: []const u8) bool {
     return std.mem.startsWith(u8, key, "user.");
 }
 
+fn isUserKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "user.");
+}
+
+/// Storage-v2 §11.3 `features` value shape: `fh-<16 lowercase hex>` =
+/// BLAKE3(sorted features)[0..8] hex. Empty set = hash of empty string,
+/// still `fh-` + 16 hex (never bare or upper-case).
+fn isValidFeaturesValue(value: []const u8) bool {
+    if (value.len != 19) return false;
+    if (!std.mem.startsWith(u8, value, "fh-")) return false;
+    for (value[3..]) |ch| {
+        const hex = (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f');
+        if (!hex) return false;
+    }
+    return true;
+}
+
 fn validateTags(tags: []const Tag) TagError!void {
     if (tags.len > 32) return error.TagLimit;
     var total: usize = 0;
-    var has_crate = false;
-    var has_crate_version = false;
     for (tags) |t| {
         if (t.key.len == 0 or t.key.len > 32 or t.value.len > 256) return error.TagLimit;
         if (std.mem.eql(u8, t.key, "kind")) return error.UnknownTagKey;
         if (!isKnownKey(t.key)) return error.UnknownTagKey;
-        if (std.mem.eql(u8, t.key, "crate")) has_crate = true;
-        if (std.mem.eql(u8, t.key, "crate_version")) has_crate_version = true;
+        // §11.3 fixed vocabulary: `features` must be `fh-[0-9a-f]{16}`.
+        if (std.mem.eql(u8, t.key, "features") and !isValidFeaturesValue(t.value)) return error.TagMismatch;
         total += t.key.len + t.value.len;
     }
     if (total > 8 * 1024) return error.TagLimit;
-    if (has_crate != has_crate_version) return error.TagMismatch;
+    // §11.3 cardinality within the batch: one value per key per object
+    // except `user.*` (many). Identical (key,value) dupes are idempotent
+    // and allowed; different values for one non-user key are rejected.
+    for (tags, 0..) |a, i| {
+        if (isUserKey(a.key)) continue;
+        for (tags[0..i]) |b| {
+            if (std.mem.eql(u8, a.key, b.key) and !std.mem.eql(u8, a.value, b.value)) return error.TagLimit;
+        }
+    }
 }
 
 /// §16 `tagObject`: validates per §11.3, then writes one `object_tags` row per pair.
+/// Per-object rules are enforced against the stored tag set, not just the
+/// batch: `crate`/`crate_version` must co-occur in the combined set
+/// (`error.TagMismatch`), and a non-`user.*` key keeps a single value per
+/// object (`error.TagLimit` on a conflicting value). Combined count (>32)
+/// and combined bytes (>8 KiB) also bind the object, not the call.
+/// Callers needing index_state admission (Store.tagObject) check the
+/// budget before calling; this layer stays a pure tag gate.
 pub fn tagObject(idx: *index_mod.Index, digest: *const [64]u8, tags: []const Tag) TagError!void {
     try validateTags(tags);
+    const gpa = std.heap.page_allocator;
+    const existing = try tagsFor(gpa, idx, digest);
+    defer freeTags(gpa, existing);
+    // Cardinality vs stored rows: same non-user key with a different value.
+    for (tags) |t| {
+        if (isUserKey(t.key)) continue;
+        for (existing) |e| {
+            if (std.mem.eql(u8, e.key, t.key) and !std.mem.eql(u8, e.value, t.value)) return error.TagLimit;
+        }
+    }
+    // `crate` without `crate_version` (and vice versa) on the combined set.
+    var has_crate = false;
+    var has_crate_version = false;
+    for (existing) |e| {
+        if (std.mem.eql(u8, e.key, "crate")) has_crate = true;
+        if (std.mem.eql(u8, e.key, "crate_version")) has_crate_version = true;
+    }
+    for (tags) |t| {
+        if (std.mem.eql(u8, t.key, "crate")) has_crate = true;
+        if (std.mem.eql(u8, t.key, "crate_version")) has_crate_version = true;
+    }
+    if (has_crate != has_crate_version) return error.TagMismatch;
+    // Combined size guards: new pairs only (stored pairs already counted).
+    var new_pairs: usize = 0;
+    var new_bytes: usize = 0;
+    var stored_bytes: usize = 0;
+    for (existing) |e| stored_bytes += e.key.len + e.value.len;
+    for (tags) |t| {
+        var already = false;
+        for (existing) |e| {
+            if (std.mem.eql(u8, e.key, t.key) and std.mem.eql(u8, e.value, t.value)) {
+                already = true;
+                break;
+            }
+        }
+        if (!already) {
+            new_pairs += 1;
+            new_bytes += t.key.len + t.value.len;
+        }
+    }
+    if (existing.len + new_pairs > 32) return error.TagLimit;
+    if (stored_bytes + new_bytes > 8 * 1024) return error.TagLimit;
     for (tags) |t| {
         var stmt: ?*c.sqlite3_stmt = null;
         if (c.sqlite3_prepare_v2(idx.db, "INSERT OR IGNORE INTO object_tags(digest,key,value) VALUES(?1,?2,?3);", -1, &stmt, null) != c.SQLITE_OK)
@@ -239,4 +311,46 @@ test "tag validation rejects unknown keys, half crates, and over-limit sets" {
     var too_many: [33]Tag = undefined;
     for (&too_many) |*t| t.* = .{ .key = "user.k", .value = "v" };
     try std.testing.expectError(error.TagLimit, tagObject(&idx, &a, &too_many));
+}
+
+test "features value must be fh- plus 16 lowercase hex" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var idx = try index_mod.Index.open(io, tmp.dir);
+    defer idx.close();
+
+    const a: [64]u8 = [_]u8{'a'} ** 64;
+    try index_mod.upsertObject(&idx, .{ .digest = a, .size = 1, .compressed_size = null, .tier = .hot, .kind = "other", .created_ms = 1, .last_access_ms = 1 });
+    // Valid: fh- + 16 lowercase hex.
+    try tagObject(&idx, &a, &.{.{ .key = "features", .value = "fh-9c41aa02d1e57f03" }});
+    // Invalid shapes: bare, upper-case, short, non-hex.
+    try std.testing.expectError(error.TagMismatch, tagObject(&idx, &a, &.{.{ .key = "features", .value = "serde" }}));
+    try std.testing.expectError(error.TagMismatch, tagObject(&idx, &a, &.{.{ .key = "features", .value = "fh-9C41AA02D1E57F03" }}));
+    try std.testing.expectError(error.TagMismatch, tagObject(&idx, &a, &.{.{ .key = "features", .value = "fh-abc" }}));
+    try std.testing.expectError(error.TagMismatch, tagObject(&idx, &a, &.{.{ .key = "features", .value = "fh-zzzzzzzzzzzzzzzz" }}));
+}
+
+test "non-user keys keep a single value per object" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var idx = try index_mod.Index.open(io, tmp.dir);
+    defer idx.close();
+
+    const a: [64]u8 = [_]u8{'a'} ** 64;
+    try index_mod.upsertObject(&idx, .{ .digest = a, .size = 1, .compressed_size = null, .tier = .hot, .kind = "other", .created_ms = 1, .last_access_ms = 1 });
+    // Batch dup with different values.
+    try std.testing.expectError(error.TagLimit, tagObject(&idx, &a, &.{
+        .{ .key = "profile", .value = "release" },
+        .{ .key = "profile", .value = "debug" },
+    }));
+    // Stored-vs-new conflict.
+    try tagObject(&idx, &a, &.{.{ .key = "profile", .value = "release" }});
+    try std.testing.expectError(error.TagLimit, tagObject(&idx, &a, &.{.{ .key = "profile", .value = "debug" }}));
+    // Idempotent re-tag of the same pair still succeeds.
+    try tagObject(&idx, &a, &.{.{ .key = "profile", .value = "release" }});
+    // user.* keeps many values across batches.
+    try tagObject(&idx, &a, &.{.{ .key = "user.k", .value = "1" }});
+    try tagObject(&idx, &a, &.{.{ .key = "user.k", .value = "2" }});
 }

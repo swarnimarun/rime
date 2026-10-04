@@ -13,7 +13,7 @@ pub const Pin = struct { name: []const u8, digest_hex: []const u8, created_ms: i
 pub const Lease = struct { build_id: []const u8, digest_hexes: []const []const u8, expires_ms: i64 };
 pub const ProjectRetain = struct { project_id: []const u8, manifest_hexes: []const []const u8, updated_ms: i64 };
 
-pub const StateError = error{ Unexpected, OutOfMemory, NoSuchPin } || Io.Cancelable ||
+pub const StateError = error{ Unexpected, OutOfMemory, NoSuchPin, StoreFull } || Io.Cancelable ||
     Io.Dir.OpenError || Io.Dir.Iterator.Error || Io.Dir.ReadFileAllocError ||
     Io.Dir.WriteFileError || Io.Dir.RenameError || Io.Dir.DeleteFileError;
 

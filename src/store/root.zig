@@ -20,10 +20,17 @@ const action_cache = @import("action_cache.zig");
 const cold_mod = @import("cold.zig");
 const index_mod = @import("index.zig");
 const tags_mod = @import("tags.zig");
-const budget_mod = @import("budget.zig");
+/// Budget resolution + class usage (classUsage feeds the `stat` budget
+/// line). Public so the CLI reads usage without a Store wrapper.
+/// Plan B Task 11.
+pub const budget_mod = @import("budget.zig");
+const admission_mod = @import("admission.zig");
 /// Explicit v1→v2 migration (storage-v2 §14); invoked only by
 /// `rime cache migrate`, never by `Store.open`.
 pub const migrate_mod = @import("migrate.zig");
+/// Per-tag aggregates for `cache stat --by-tag` (storage-v2 §12.2).
+/// Plan B Task 11.
+pub const stats_mod = @import("stats.zig");
 
 const Io = std.Io;
 
@@ -38,6 +45,55 @@ pub const Kind = enum {
     rlib, rmeta, obj, staticlib, dylib, bin, dep_info, manifest, build_script_out, source, other,
 };
 
+/// Storage-v2 §16 tag surface at module level (single spelling; Store
+/// methods resolve these names directly). Plan B Task 10 needs root.Tag
+/// for GcPolicy.tag_filter.
+pub const Tag = tags_mod.Tag;
+pub const Predicate = tags_mod.Predicate;
+pub const TagError = tags_mod.TagError;
+
+/// Write-admission class (storage-v2 §16). disk_reserve is report-only:
+/// reserve() is never *called* with it, but a breached disk_reserve floor
+/// reports StoreFull{ class = "disk_reserve" } per §10.3 (the plan sketch
+/// reused .spool there; the spec's explicit class value wins). The four
+/// ledger classes match index.Class / the reservations CHECK exactly.
+/// Plan B Task 9.
+pub const Class = enum { hot, cold, index_state, spool, disk_reserve };
+
+/// Opaque build identifier (lease owner) for reservations (§16).
+/// Plan B Task 9.
+pub const BuildId = []const u8;
+
+/// Admission token: 128-bit random id, issuing class, counted bytes (§16).
+/// Plan B Task 9.
+pub const Reservation = struct { id: [16]u8, class: Class, bytes: u64 };
+
+/// What would free space, per §10.4. Plan B Task 9.
+pub const Hint = enum { run_gc, unpin_named, raise_budget, free_disk };
+
+/// Per-call StoreFull detail (§10.4 fields verbatim). All fields defaulted
+/// so Store.open can init with .{}. Plan B Task 9.
+pub const BudgetBreakdown = struct {
+    requested_bytes: u64 = 0,
+    class: Class = .hot,
+    budget: u64 = 0,
+    used_total: u64 = 0,
+    used_class: u64 = 0,
+    cap_class: u64 = 0,
+    reserved_class: u64 = 0,
+    reclaimable_class: u64 = 0,
+    hint: Hint = .run_gc,
+};
+
+/// Admission failures (§16): StoreFull plus the §11.3 tag errors (reserve
+/// paths that tag), layered over index/disk/state I/O. Plan B Task 9.
+pub const AdmitError = error{ StoreFull, UnknownTagKey, TagMismatch, TagLimit } || index_mod.DbError || disk_usage_mod.DiskUsageError || state.StateError;
+
+/// The StoreFull error value, re-exported for CLI/tests (§10.4).
+/// (Zig error sets are global; this is spelling convenience only.)
+/// Plan B Task 9.
+pub const StoreFull = error.StoreFull;
+
 pub const Store = struct {
     dir: Io.Dir,
     config: config_mod.Config,
@@ -49,6 +105,10 @@ pub const Store = struct {
     budget: budget_mod.ResolvedBudget,
     lock_file: Io.File,
     index: index_mod.Index,
+    /// Last admission diagnostic, overwritten by the next admission (racy
+    /// under concurrent puts — concurrent callers must use the per-call
+    /// `breakdown` out-param). Read via lastFull(). Plan B Task 9.
+    last_breakdown: BudgetBreakdown,
 
     pub const OpenError = error{
         UnknownFormat,
@@ -103,6 +163,13 @@ pub const Store = struct {
         errdefer index.close();
 
         const usage = try disk_usage_mod.readDiskUsage(io, dir);
+        // Reap expired reservation rows on open (§10.2 TTL, §8.1 sweep
+        // discipline). Best-effort: the ledger is derived state.
+        // Plan B Task 9.
+        {
+            const now_ms = Io.Timestamp.now(io, .real).toMilliseconds();
+            index_mod.sweepExpiredReservations(&index, now_ms) catch {};
+        }
         return .{
             .dir = dir,
             .config = cfg,
@@ -110,6 +177,7 @@ pub const Store = struct {
             .budget = budget_mod.resolveBudget(cfg, usage),
             .lock_file = lock,
             .index = index,
+            .last_breakdown = .{},
         };
     }
 
@@ -171,6 +239,10 @@ pub const Store = struct {
     pub const lease_ttl_ms = state.lease_ttl_ms;
 
     pub fn pin(store: *Store, io: Io, name: []const u8, d: Digest) StateError!void {
+        // §9.2 roots count: a pin that would breach index_state or I-TOTAL
+        // fails with StoreFull (never pushes the store over limit). JSON +
+        // index row estimate covers the file plus the pins row.
+        try checkRootBudget(store, io, @as(u64, @intCast(name.len)) + 256);
         return state.putPin(io, store.dir, name, d, Io.Timestamp.now(io, .real).toMilliseconds(), &store.index);
     }
 
@@ -179,10 +251,17 @@ pub const Store = struct {
     }
 
     pub fn leasePut(store: *Store, io: Io, build_id: []const u8, digests: []const Digest) StateError!void {
+        // Same §9.2 gate as pin: lease JSON (one row per member) counts in
+        // index_state. Estimate covers the file plus member rows.
+        try checkRootBudget(store, io, @as(u64, @intCast(build_id.len)) + @as(u64, @intCast(digests.len)) * 96 + 256);
         return state.putLease(io, store.dir, build_id, digests, Io.Timestamp.now(io, .real).toMilliseconds(), &store.index);
     }
 
     pub fn leaseRenew(store: *Store, io: Io, build_id: []const u8) StateError!void {
+        // Renew rewrites the lease file in place (same members, fresh
+        // expiry): still a root write, still gated so a breached store
+        // cannot grow roots. Estimate is the rewritten file alone.
+        try checkRootBudget(store, io, @as(u64, @intCast(build_id.len)) + 256);
         return state.renewLease(io, store.dir, build_id, Io.Timestamp.now(io, .real).toMilliseconds(), &store.index);
     }
 
@@ -191,6 +270,7 @@ pub const Store = struct {
     }
 
     pub fn retainProject(store: *Store, io: Io, project_id: []const u8, manifests: []const Digest) StateError!void {
+        try checkRootBudget(store, io, @as(u64, @intCast(project_id.len)) + @as(u64, @intCast(manifests.len)) * 96 + 256);
         return state.putRetain(io, std.heap.page_allocator, store.dir, project_id, manifests, Io.Timestamp.now(io, .real).toMilliseconds(), &store.index);
     }
 
@@ -314,12 +394,18 @@ pub const Store = struct {
         return store.lookupAction(io, gpa, key);
     }
 
-    pub const Tag = tags_mod.Tag;
-    pub const Predicate = tags_mod.Predicate;
-    pub const TagError = tags_mod.TagError;
-
+    // Tag surface aliases live at module level (root.Tag/Predicate/
+    // TagError); Store methods resolve those names directly.
+    /// Storage-v2 §11.4 index admission: tag rows grow `index.sqlite`, so
+    /// the index_state class (plus I-TOTAL) is checked before writing.
+    /// Over cap, a best-effort `incremental_vacuum` runs first, then a
+    /// spool-reserved `VACUUM` (scratch counted in spool so I-TOTAL holds
+    /// through compaction); still over afterwards returns
+    /// `StoreFull{ class = index_state }` with `lastFull` populated.
     pub fn tagObject(store: *Store, io: Io, d: Digest, tags: []const Tag) TagError!void {
-        _ = io;
+        var estimate: u64 = 128;
+        for (tags) |t| estimate += @as(u64, @intCast(t.key.len + t.value.len + 64));
+        try ensureIndexStateBudget(store, io, estimate);
         const hex = d.toHex();
         return tags_mod.tagObject(&store.index, &hex, tags);
     }
@@ -336,6 +422,41 @@ pub const Store = struct {
         return tags_mod.tagsFor(gpa, &store.index, &hex);
     }
 
+    /// Write-time admission (§16): reserve -> evict -> demote -> StoreFull.
+    /// Thin delegates to admission.zig; breakdown carries the per-call
+    /// StoreFull detail (lastFull() is the racy convenience). Plan B Task 9.
+    pub fn reserve(store: *Store, io: Io, class: Class, bytes: u64, owner: ?BuildId, breakdown: ?*BudgetBreakdown) AdmitError!Reservation {
+        return admission_mod.reserve(store, io, class, bytes, owner, breakdown);
+    }
+
+    /// Ledger -> file atom swap completion (never fails). Plan B Task 9.
+    /// (Param is named `d`: `digest` is taken by the digest module import.)
+    pub fn commit(store: *Store, io: Io, r: Reservation, d: Digest) void {
+        admission_mod.commit(store, io, r, d);
+    }
+
+    /// Release a reservation without publishing (never fails). Plan B Task 9.
+    pub fn abort(store: *Store, io: Io, r: Reservation) void {
+        admission_mod.abort(store, io, r);
+    }
+
+    /// Last admission diagnostic on this handle (see last_breakdown).
+    /// Plan B Task 9.
+    pub fn lastFull(store: *Store) BudgetBreakdown {
+        return store.last_breakdown;
+    }
+
+    /// Total in-flight reservation bytes across all classes (§9.3 ledger).
+    /// Feeds the `stat` budget line (keeps the index module encapsulated:
+    /// main.zig cannot name index free functions). Plan B Task 11.
+    pub fn reservedBytes(store: *Store) index_mod.DbError!u64 {
+        var total: u64 = 0;
+        for ([_]index_mod.Class{ .hot, .cold, .index_state, .spool }) |c| {
+            total += try index_mod.reservationSum(&store.index, c);
+        }
+        return total;
+    }
+
     /// Storage-v2 §16 canonical lookup: conjunctive tag predicate, newest-first, bounded LIMIT.
     pub fn lookupObjects(store: *Store, io: Io, gpa: std.mem.Allocator, pred: Predicate) TagError![]Digest {
         _ = io;
@@ -345,6 +466,117 @@ pub const Store = struct {
         errdefer gpa.free(out);
         for (hexes, out) |h, slot| slot.* = Digest.fromHex(&h) catch return error.Unexpected;
         return out;
+    }
+
+    /// §11.4 index_state admission for index-growing writes (tags here;
+    /// roots share it via checkRootBudget below). Checks class usage plus
+    /// live reservations against the index_state cap and I-TOTAL before
+    /// growth. Over cap: `incremental_vacuum` first (frees freelist pages
+    /// when GC churn left >1,024), then a spool-reserved `VACUUM` whose
+    /// scratch copy is spool-counted (StoreFull spool if the scratch alone
+    /// does not fit). Still over afterwards → StoreFull index_state with
+    /// `last_breakdown` populated. Steady-state puts (one row + ≤10 tag
+    /// rows) cannot hit this on any budget ≥ 5 GiB floor; the path exists
+    /// so the invariant has no hole.
+    fn ensureIndexStateBudget(store: *Store, io: Io, estimate: u64) TagError!void {
+        const page = std.heap.page_allocator;
+        const usage = budget_mod.classUsage(store, io, page) catch return error.Unexpected;
+        const r_hot = index_mod.reservationSum(&store.index, .hot) catch return error.Unexpected;
+        const r_cold = index_mod.reservationSum(&store.index, .cold) catch return error.Unexpected;
+        const r_is = index_mod.reservationSum(&store.index, .index_state) catch return error.Unexpected;
+        _ = index_mod.reservationSum(&store.index, .spool) catch return error.Unexpected;
+        const used_class = usage.index_state +| r_is;
+        const used_total = usage.hot +| usage.cold +| usage.index_state +| usage.spool +| r_hot +| r_cold +| r_is;
+        if (used_class +| estimate <= store.budget.index_state and used_total +| estimate <= store.budget.total) return;
+        // Best-effort freelist return before the heavy path.
+        store.index.execAll("PRAGMA incremental_vacuum;") catch {};
+        const usage2 = budget_mod.classUsage(store, io, page) catch return error.Unexpected;
+        const r2 = index_mod.reservationSum(&store.index, .index_state) catch return error.Unexpected;
+        const t_hot = index_mod.reservationSum(&store.index, .hot) catch return error.Unexpected;
+        const t_cold = index_mod.reservationSum(&store.index, .cold) catch return error.Unexpected;
+        const t_spool = index_mod.reservationSum(&store.index, .spool) catch return error.Unexpected;
+        const used_c2 = usage2.index_state +| r2;
+        const used_t2 = usage2.hot +| usage2.cold +| usage2.index_state +| usage2.spool +| t_hot +| t_cold +| r2;
+        if (used_c2 +| estimate <= store.budget.index_state and used_t2 +| estimate <= store.budget.total) return;
+        // Spool-reserved VACUUM: scratch ≈ current db file size.
+        const db_size: u64 = if (store.dir.statFile(io, "index.sqlite", .{})) |st| st.size else |_| estimate;
+        // Spool fast-fail mirrors admission.checkSpoolFit: a scratch copy
+        // that alone exceeds the spool cap can never be staged.
+        if (db_size > store.budget.spool) {
+            const bd = BudgetBreakdown{
+                .requested_bytes = estimate,
+                .class = .spool,
+                .budget = store.budget.total,
+                .used_total = used_t2,
+                .used_class = usage2.spool,
+                .cap_class = store.budget.spool,
+                .reserved_class = t_spool,
+                .reclaimable_class = 0,
+                .hint = .raise_budget,
+            };
+            store.last_breakdown = bd;
+            return error.StoreFull;
+        }
+        const vr = store.reserve(io, .spool, db_size, null, null) catch |e| {
+            if (e == error.StoreFull) return error.StoreFull;
+            return error.Unexpected;
+        };
+        defer store.abort(io, vr);
+        store.index.execAll("VACUUM;") catch {};
+        store.abort(io, vr);
+        const usage3 = budget_mod.classUsage(store, io, page) catch return error.Unexpected;
+        const r3 = index_mod.reservationSum(&store.index, .index_state) catch return error.Unexpected;
+        const hot3 = index_mod.reservationSum(&store.index, .hot) catch return error.Unexpected;
+        const cold3 = index_mod.reservationSum(&store.index, .cold) catch return error.Unexpected;
+        const used_c3 = usage3.index_state +| r3;
+        const used_t3 = usage3.hot +| usage3.cold +| usage3.index_state +| usage3.spool +| hot3 +| cold3 +| r3;
+        if (used_c3 +| estimate <= store.budget.index_state and used_t3 +| estimate <= store.budget.total) return;
+        const bd = BudgetBreakdown{
+            .requested_bytes = estimate,
+            .class = .index_state,
+            .budget = store.budget.total,
+            .used_total = used_t3,
+            .used_class = used_c3,
+            .cap_class = store.budget.index_state,
+            .reserved_class = r3,
+            .reclaimable_class = 0,
+            .hint = .raise_budget,
+        };
+        store.last_breakdown = bd;
+        return error.StoreFull;
+    }
+
+    /// §9.2 root admission: pins/leases/retains count in index_state and
+    /// I-TOTAL. Checks class usage plus live reservations against the
+    /// budget before the JSON write; breach returns StoreFull with a
+    /// populated breakdown (also in `lastFull`). No eviction is attempted
+    /// (roots are never auto-evicted; index_state holds no LRU), so the
+    /// hint is `raise_budget` on a class breach and `run_gc` only when
+    /// total breached while the class still fits (unrooted bytes elsewhere
+    /// could be reclaimed). State helpers stay low-level writers; the gate
+    /// lives here where the resolved budget lives.
+    fn checkRootBudget(store: *Store, io: Io, estimate: u64) StateError!void {
+        const page = std.heap.page_allocator;
+        const usage = budget_mod.classUsage(store, io, page) catch return error.Unexpected;
+        const r_hot = index_mod.reservationSum(&store.index, .hot) catch return error.Unexpected;
+        const r_cold = index_mod.reservationSum(&store.index, .cold) catch return error.Unexpected;
+        const r_is = index_mod.reservationSum(&store.index, .index_state) catch return error.Unexpected;
+        const used_class = usage.index_state +| r_is;
+        const used_total = usage.hot +| usage.cold +| usage.index_state +| usage.spool +| r_hot +| r_cold +| r_is;
+        if (used_class +| estimate <= store.budget.index_state and used_total +| estimate <= store.budget.total) return;
+        const bd = BudgetBreakdown{
+            .requested_bytes = estimate,
+            .class = .index_state,
+            .budget = store.budget.total,
+            .used_total = used_total,
+            .used_class = used_class,
+            .cap_class = store.budget.index_state,
+            .reserved_class = r_is,
+            .reclaimable_class = 0,
+            .hint = .raise_budget,
+        };
+        store.last_breakdown = bd;
+        return error.StoreFull;
     }
 
     /// Size of either tier copy of an object; 0 when absent. Pinned-byte
@@ -409,6 +641,36 @@ test "v2 store open wires the index" {
     try std.testing.expect(try ts.store.index.tableExists("objects"));
 }
 
+test "pin fails StoreFull when index_state is full" {
+    // §9.2 roots count: a 1 B index_state cap is already breached by the
+    // real index file, so even the first pin is refused with a populated
+    // breakdown instead of pushing the store over limit.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var ts = test_support.openTestStore(io, .{
+        .budget = .{ .fixed = 10_000_000 },
+        .index_state_cap = .{ .fixed = 1 },
+    });
+    defer ts.deinit(io);
+
+    const d = try ts.store.putBytes(io, "rooted", .other);
+    try std.testing.expectError(error.StoreFull, ts.store.pin(io, "r", d));
+    try std.testing.expectEqual(Class.index_state, ts.store.lastFull().class);
+}
+
+test "tagObject fails StoreFull when index_state is full" {
+    // §11.4 index admission: tag rows grow the index, so the same 1 B
+    // index_state cap refuses tag growth with class index_state.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var ts = test_support.openTestStore(io, .{
+        .budget = .{ .fixed = 10_000_000 },
+        .index_state_cap = .{ .fixed = 1 },
+    });
+    defer ts.deinit(io);
+
+    const d = try ts.store.putBytes(io, "tagged", .other);
+    try std.testing.expectError(error.StoreFull, ts.store.tagObject(io, d, &.{.{ .key = "profile", .value = "release" }}));
+}
+
 test {
     _ = @import("digest.zig");
     _ = @import("config.zig");
@@ -429,4 +691,6 @@ test {
     _ = @import("tags.zig");
     _ = @import("migrate.zig");
     _ = @import("budget.zig");
+    _ = @import("admission.zig");
+    _ = @import("stats.zig");
 }

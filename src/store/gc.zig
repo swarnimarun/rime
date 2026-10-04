@@ -10,6 +10,7 @@ const manifest_mod = @import("manifest.zig");
 const disk_usage = @import("disk_usage.zig");
 const digest_mod = @import("digest.zig");
 const index_mod = @import("index.zig");
+const tags_mod = @import("tags.zig");
 
 const Io = std.Io;
 
@@ -17,6 +18,17 @@ pub const GcPolicy = struct {
     dry_run: bool = false,
     target_bytes: ?u64 = null,
     older_than_ns: ?u64 = null,
+    /// Scopes every reclaim phase to objects carrying ALL pairs (bound to
+    /// Predicate.tags; `--tag k=v` is repeatable/conjunctive). Null or
+    /// empty = unscoped. Non-matching candidates are skipped and counted
+    /// in tag_skipped_objects. Roots stay protected either way.
+    /// Plan B Task 10.
+    tag_filter: ?[]const root.Tag = null,
+    /// Steer eviction order by per-tag soft budgets (§12.3): over-cap tags
+    /// sort before other unrooted candidates, LRU within each group.
+    /// Steering only; age-trim and emergency ignore budgets (safety first)
+    /// but still respect tag_filter. Plan B Task 10.
+    honor_tag_budgets: bool = true,
 };
 
 pub const GcReport = struct {
@@ -29,29 +41,34 @@ pub const GcReport = struct {
     expired_leases: u64 = 0,
     stale_action_entries: u64 = 0,
     dry_run: bool = false,
+    tag_skipped_objects: u64 = 0,
 };
 
 pub const GcError = error{Unexpected, OutOfMemory} || Io.Cancelable ||
     Io.Dir.Iterator.Error || scan.ScanError || state.StateError ||
-    action_cache.SweepError || disk_usage.DiskUsageError;
+    action_cache.SweepError || disk_usage.DiskUsageError || index_mod.DbError;
 
-const LiveSet = std.AutoHashMap([32]u8, void);
+pub const LiveSet = std.AutoHashMap([32]u8, void);
 
-/// Spec §9.7 reclaim order. Never deletes rooted objects. Never deletes
-/// anything when policy.dry_run is set.
-pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) GcError!GcReport {
-    var report = GcReport{ .dry_run = policy.dry_run };
+pub const LiveSetError = error{Unexpected, OutOfMemory} || Io.Cancelable || state.StateError;
+
+/// Phase-0 root collection extracted for admission control (Plan B Task 9):
+/// pins + live leases + retain manifests (+ manifest outputs). dry_run=true
+/// peeks (never reaps expired lease files); false reaps them exactly as gc
+/// always did. The caller owns the returned set. No behavior change to gc:
+/// gc passes policy.dry_run through, preserving the dry-run-deletes-nothing
+/// invariant.
+///
+/// NOTE: takes an explicit dry_run flag rather than the plan sketch's
+/// 3-arg shape — the sketch would reap expired leases during dry runs and
+/// during reserve(), breaking the dry-run guarantee and adding write side
+/// effects to the admission path. Read-only callers pass true.
+pub fn liveSet(store: *root.Store, io: Io, gpa: std.mem.Allocator, dry_run: bool) LiveSetError!LiveSet {
     const now_ms = Io.Timestamp.now(io, .real).toMilliseconds();
-
-    // -- Phase 0: roots (pins, live leases, project retains + manifests). --
-    // liveLeases deletes expired lease files as a side effect (expiry), so
-    // dry runs peek without deleting. Count first: after liveLeases the
-    // expired files are gone.
-    report.expired_leases = try state.countExpiredLeases(io, gpa, store.dir, now_ms);
     var live = LiveSet.init(gpa);
-    defer live.deinit();
+    errdefer live.deinit();
 
-    const leases = if (policy.dry_run)
+    const leases = if (dry_run)
         try state.peekLiveLeases(io, gpa, store.dir, now_ms)
     else
         try state.liveLeases(io, gpa, store.dir, now_ms);
@@ -85,10 +102,26 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
             } else |_| {}
         }
     }
+    return live;
+}
+
+/// Spec §9.7 reclaim order. Never deletes rooted objects. Never deletes
+/// anything when policy.dry_run is set.
+pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) GcError!GcReport {
+    var report = GcReport{ .dry_run = policy.dry_run };
+    const now_ms = Io.Timestamp.now(io, .real).toMilliseconds();
+
+    // -- Phase 0: roots (pins, live leases, project retains + manifests). --
+    // liveLeases deletes expired lease files as a side effect (expiry), so
+    // dry runs peek without deleting. Count first: after liveLeases the
+    // expired files are gone.
+    report.expired_leases = try state.countExpiredLeases(io, gpa, store.dir, now_ms);
+    var live = try liveSet(store, io, gpa, policy.dry_run);
+    defer live.deinit();
 
     // -- Phase 1: inventory + stale action sweep. --
     // Dry runs count stale entries without deleting them.
-    var present_cb = PresentCtx{ .store = store, .io = io };
+    var present_cb = PresentCtx{ .store = store, .io = io, .gpa = gpa };
     report.stale_action_entries = if (policy.dry_run)
         try action_cache.countStale(io, gpa, store.dir, PresentCtx.call, &present_cb, &store.index)
     else
@@ -107,11 +140,42 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
         }
     }.lt);
 
+    // -- Tag filter (Plan B Task 10): resolve the allowed digest set once.
+    // Bounded to the tag-query max (1,000 newest matches): larger scopes
+    // under-evict rather than over-evict. Null/empty = unscoped.
+    // NOTE (plan fix, reported): the sketch's default-limit query caps
+    // recall at 10 rows; the 1,000 max is passed explicitly.
+    const filt = if (policy.tag_filter) |f| (if (f.len == 0) null else f) else null;
+    var allowed_map: LiveSet = undefined;
+    var allowed: ?*LiveSet = null;
+    if (filt) |f| {
+        allowed_map = LiveSet.init(gpa);
+        const hexes = try tags_mod.query(gpa, &store.index, .{ .tags = f, .limit = 1000 });
+        defer gpa.free(hexes);
+        for (hexes) |h| {
+            const dd = digest_mod.Digest.fromHex(&h) catch continue;
+            try allowed_map.put(dd.bytes, {});
+        }
+        allowed = &allowed_map;
+    }
+    defer if (allowed != null) allowed_map.deinit();
+
+    // -- Tag-budget steering (Plan B Task 10): over-cap-first order for the
+    // demotion + quota sweeps below (LRU stable within groups). Null when
+    // disabled or unconfigured: plain LRU, zero behavior change.
+    var order_owned: ?[]scan.ObjectInfo = null;
+    if (policy.honor_tag_budgets) order_owned = try steeredOrder(store, gpa, sorted);
+    defer if (order_owned) |o| gpa.free(o);
+    const order = order_owned orelse sorted;
+
     // -- Phase 2: age trim (policy.older_than_ns overrides max_age_ns). --
+    // Age-trim ignores tag budgets (safety first) but still respects the
+    // filter. Plan B Task 10.
     const max_age_ns = policy.older_than_ns orelse store.config.max_age_ns;
     for (sorted) |obj| {
         if (live.contains(obj.digest.bytes)) continue;
         if (!isOlderThan(obj, now_ms, max_age_ns)) continue;
+        if (!allowedCheck(allowed, &report, obj.digest.bytes)) continue;
         try evict(store, io, &report, obj, policy.dry_run);
     }
 
@@ -150,13 +214,19 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
     // the same set so each object is counted exactly once.
     var demoted = LiveSet.init(gpa);
     defer demoted.deinit();
-    for (sorted) |obj| {
+    for (order) |obj| {
+        // Cold-full break first (hoisted, behavior-preserving: the condition
+        // is object-independent and cold_used only grows, so reaching it
+        // earlier changes nothing but lets quota-satisfied runs — and the
+        // tag-filter skip counter — see that this phase has no candidates).
+        // Plan B Task 10.
+        if (cold_used >= cold_target) break; // cold full; the 3b sweep trims it
         if (obj.tier != .hot) continue;
+        if (!allowedCheck(allowed, &report, obj.digest.bytes)) continue;
         if (live.contains(obj.digest.bytes)) continue;
         if (!policy.dry_run and isOlderThan(obj, now_ms, max_age_ns)) continue; // gone in phase 2
         if (!isOlderThan(obj, now_ms, store.config.cold_after_ns)) continue;
         if (!cold.isDemotable(obj.kind)) continue;
-        if (cold_used >= cold_target) break; // cold full; the 3b sweep trims it
         if (!policy.dry_run) {
             cold.demote(store, io, obj.digest) catch |err| switch (err) {
                 error.ObjectNotFound => continue, // raced; treat as gone
@@ -171,9 +241,10 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
         report.demoted_objects += 1;
     }
 
-    for (sorted) |obj| {
+    for (order) |obj| {
         if (hot_used <= hot_target) break;
         if (obj.tier != .hot) continue;
+        if (!allowedCheck(allowed, &report, obj.digest.bytes)) continue;
         if (live.contains(obj.digest.bytes)) continue;
         if (demoted.contains(obj.digest.bytes)) continue; // handled in phase 2c
         if (!policy.dry_run and isOlderThan(obj, now_ms, max_age_ns)) continue; // evicted in phase 2
@@ -201,9 +272,10 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
     // invariant §11.4). Oldest unrooted cold objects first; the demote
     // gate above keeps post-demotion cold usage near target, and this
     // pass trims whatever remains over it.
-    for (sorted) |obj| {
+    for (order) |obj| {
         if (cold_used <= cold_target) break;
         if (obj.tier != .cold) continue;
+        if (!allowedCheck(allowed, &report, obj.digest.bytes)) continue;
         if (live.contains(obj.digest.bytes)) continue;
         if (!policy.dry_run and isOlderThan(obj, now_ms, max_age_ns)) continue; // evicted in phase 2
         try evict(store, io, &report, obj, policy.dry_run);
@@ -213,7 +285,10 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
     // -- Phase 4: emergency trim to restore disk_reserve. --
     const usage = try disk_usage.readDiskUsage(io, store.dir);
     if (usage.free_bytes < store.limits.reserve) {
+        // Emergency ignores tag budgets (safety first) but still respects
+        // the filter. Plan B Task 10.
         for (sorted) |obj| {
+            if (!allowedCheck(allowed, &report, obj.digest.bytes)) continue;
             if (live.contains(obj.digest.bytes)) continue;
             if (!policy.dry_run and isOlderThan(obj, now_ms, max_age_ns)) continue; // already gone
             // Objects evicted by an earlier phase report FileNotFound here;
@@ -336,13 +411,27 @@ pub fn incrementalBytes(store: *root.Store, io: Io, gpa: std.mem.Allocator) GcEr
 }
 
 /// Callback adapter: action entries are stale when their manifest object
-/// no longer exists in either tier.
+/// is no longer present. Presence is determined via the index row
+/// (`index.getObject`, either tier — Plan B Task 12), not the filesystem
+/// walk: the manifest kind/tier lives in the row. A row whose bytes are
+/// gone (file deleted behind the index, e.g. gc tests planting staleness
+/// by direct delete) counts as absent — the spec §8.2 reconciler direction
+/// (row-without-file deletes the row); the sweep then drops the action
+/// row. On index faults, fall back to the filesystem (bytes authoritative,
+/// decision D4) so a transient DB fault never mass-invalidates actions.
 const PresentCtx = struct {
     store: *root.Store,
     io: Io,
+    gpa: std.mem.Allocator,
 
     fn call(ctx: *anyopaque, d: digest_mod.Digest) bool {
         const self: *@This() = @ptrCast(@alignCast(ctx));
+        const hex = d.toHex();
+        const row = index_mod.getObject(&self.store.index, self.gpa, &hex) catch
+            return objects.exists(self.store, self.io, d);
+        const r = row orelse return false;
+        defer self.gpa.free(r.kind);
+        // Row present: verify the bytes still exist in either tier.
         return objects.exists(self.store, self.io, d);
     }
 };
@@ -413,6 +502,106 @@ fn evict(store: *root.Store, io: Io, report: *GcReport, obj: scan.ObjectInfo, dr
     }
 }
 
+/// Tag-filter gate for one reclaim candidate (Plan B Task 10). Null set =
+/// unscoped (always true). A miss counts tag_skipped_objects and excludes
+/// the object from this phase; roots stay protected by the live check that
+/// follows at each call site either way.
+fn allowedCheck(allowed: ?*LiveSet, report: *GcReport, digest: [32]u8) bool {
+    const al = allowed orelse return true;
+    if (al.contains(digest)) return true;
+    report.tag_skipped_objects += 1;
+    return false;
+}
+
+/// Builds the over-cap-first candidate order (§12.3 steering). Returns null
+/// when steering is disabled by the caller or no tag budgets are configured
+/// (caller keeps plain LRU). Otherwise returns an owned over++rest
+/// permutation of sorted (LRU stable within each group); the caller frees
+/// it. An object counts as over-cap when ANY of its tags (or its kind, for
+/// `kind:` budgets) exceeds its soft cap. Plan B Task 10.
+fn steeredOrder(store: *root.Store, gpa: std.mem.Allocator, sorted: []scan.ObjectInfo) (error{OutOfMemory} || index_mod.DbError)!?[]scan.ObjectInfo {
+    const budgets = try index_mod.listTagBudgets(&store.index, gpa);
+    defer index_mod.freeTagBudgets(gpa, budgets);
+    if (budgets.len == 0) return null;
+    var over_cache: std.StringHashMap(bool) = .init(gpa);
+    defer {
+        var kit = over_cache.keyIterator();
+        while (kit.next()) |k| gpa.free(k.*);
+        over_cache.deinit();
+    }
+    const flags = try gpa.alloc(bool, sorted.len);
+    defer gpa.free(flags);
+    for (sorted, 0..) |obj, i| {
+        flags[i] = try objectOverCap(store, gpa, obj, budgets, &over_cache);
+    }
+    var any = false;
+    for (flags) |f| {
+        if (f) {
+            any = true;
+            break;
+        }
+    }
+    if (!any) return null;
+    const out = try gpa.alloc(scan.ObjectInfo, sorted.len);
+    var w: usize = 0;
+    for (sorted, 0..) |obj, i| {
+        if (flags[i]) {
+            out[w] = obj;
+            w += 1;
+        }
+    }
+    for (sorted, 0..) |obj, i| {
+        if (!flags[i]) {
+            out[w] = obj;
+            w += 1;
+        }
+    }
+    return out;
+}
+
+fn objectOverCap(store: *root.Store, gpa: std.mem.Allocator, obj: scan.ObjectInfo, budgets: []index_mod.TagBudgetRow, cache: *std.StringHashMap(bool)) (error{OutOfMemory} || index_mod.DbError)!bool {
+    const hex = obj.digest.toHex();
+    const tags = try tags_mod.tagsFor(gpa, &store.index, &hex);
+    defer tags_mod.freeTags(gpa, tags);
+    for (budgets) |b| {
+        if (std.mem.eql(u8, b.key, "kind")) {
+            // `kind:` budgets measure the objects.kind column (no tag
+            // join, §11.3): only objects of exactly this kind qualify.
+            if (!std.mem.eql(u8, b.value, @tagName(obj.kind))) continue;
+            if (try overCached(store, gpa, cache, b.key, b.value, true, b.soft_cap)) return true;
+        } else {
+            var carries = false;
+            for (tags) |t| {
+                if (std.mem.eql(u8, t.key, b.key) and std.mem.eql(u8, t.value, b.value)) {
+                    carries = true;
+                    break;
+                }
+            }
+            if (!carries) continue;
+            if (try overCached(store, gpa, cache, b.key, b.value, false, b.soft_cap)) return true;
+        }
+    }
+    return false;
+}
+
+/// Usage-vs-soft-cap check with a per-run cache keyed by "key\x00value".
+/// The key is map-owned on miss (freed with the map); freed inline on hit.
+fn overCached(store: *root.Store, gpa: std.mem.Allocator, cache: *std.StringHashMap(bool), key: []const u8, value: []const u8, is_kind: bool, soft_cap: u64) (error{OutOfMemory} || index_mod.DbError)!bool {
+    const ck = try std.fmt.allocPrint(gpa, "{s}\x00{s}", .{ key, value });
+    if (cache.get(ck)) |v| {
+        gpa.free(ck);
+        return v;
+    }
+    errdefer gpa.free(ck);
+    const usage = if (is_kind)
+        try index_mod.kindUsage(&store.index, value)
+    else
+        try index_mod.tagUsage(&store.index, key, value);
+    const over = usage > soft_cap;
+    try cache.put(ck, over);
+    return over;
+}
+
 const test_support = @import("test_support.zig");
 
 fn fixedConfig(hot: u64) root.config.Config {
@@ -455,6 +644,11 @@ test "quota sweep evicts oldest unrooted first and stops at 90 percent" {
     const gpa = std.testing.allocator;
     var ts = test_support.openTestStore(io, fixedConfig(10));
     defer ts.deinit(io);
+    // Admission (v2, Plan B Task 9): fixedConfig's hot_limit pins the hot
+    // budget class to 10 B, which the 12 B fixture cannot admit. The quota
+    // assertions below target store.limits (what gc reads), so widen only
+    // the budget for fixture setup.
+    ts.store.budget.hot = ts.store.budget.total;
     // limits.resolveLimits is not re-run by open with .fixed values:
     // Cold is full here so the sweep evicts instead of demoting (spec §9.7
     // demote-before-evict is covered by the demotion test below).
@@ -485,6 +679,9 @@ test "quota pressure demotes demotable objects before evicting" {
     const gpa = std.testing.allocator;
     var ts = test_support.openTestStore(io, fixedConfig(10));
     defer ts.deinit(io);
+    // Admission (v2, Plan B Task 9): widen the budget for the 12 B fixture
+    // (fixedConfig pins hot to 10 B); quota assertions target store.limits.
+    ts.store.budget.hot = ts.store.budget.total;
     ts.store.limits = .{ .hot = 10, .cold = 100 * root.config.GiB, .reserve = 0 };
     ts.store.config.max_age_ns = std.math.maxInt(u64);
 
@@ -510,6 +707,9 @@ test "cold quota sweep evicts oldest unrooted first" {
     const gpa = std.testing.allocator;
     var ts = test_support.openTestStore(io, fixedConfig(10));
     defer ts.deinit(io);
+    // Admission (v2, Plan B Task 9): widen the budget for the 12 B fixture
+    // (fixedConfig pins hot to 10 B); quota assertions target store.limits.
+    ts.store.budget.hot = ts.store.budget.total;
     ts.store.limits = .{ .hot = 100 * root.config.GiB, .cold = 100 * root.config.GiB, .reserve = 0 };
     ts.store.config.max_age_ns = std.math.maxInt(u64);
 
@@ -549,6 +749,9 @@ test "idle hot objects demote past cold_after" {
     defer ts.deinit(io);
     ts.store.limits = .{ .hot = 100 * root.config.GiB, .cold = 100 * root.config.GiB, .reserve = 0 };
     ts.store.config.max_age_ns = std.math.maxInt(u64);
+    // Admission (v2, Plan B Task 9): widen the budget for the 22 B fixture
+    // (fixedConfig pins hot to 10 B); quota assertions target store.limits.
+    ts.store.budget.hot = ts.store.budget.total;
     ts.store.config.cold_after_ns = std.time.ns_per_hour; // 1 h idle -> demote
 
     const a = try ts.store.putBytes(io, "idle payload", .other);
@@ -673,4 +876,63 @@ test "dry run counts expiry without deleting leases or actions" {
     try std.testing.expect(ts.store.exists(io, a));
     try std.testing.expectEqual(@as(u64, 1), try state.countExpiredLeases(io, gpa, ts.store.dir, std.Io.Timestamp.now(io, .real).toMilliseconds()));
     try std.testing.expect((try ts.store.getAction(io, gpa, key)) != null);
+}
+
+test "gc with tag filter leaves untagged objects alone" {
+    // NOTE (plan deviation, reported): fixture puts must admit BEFORE the
+    // limits/budget shrink (admission runs at put time), so setup order is
+    // put -> tag -> backdate -> shrink -> gc. limits.hot is 8 (not the
+    // plan's 10) so the quota pass actually has work to do: with hot_used=8
+    // over target=7 only the in-scope object may go, proving the filter
+    // (not just a no-op gc) left the out-of-scope object alone.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = std.testing.allocator;
+    var ts = test_support.openTestStore(io, fixedConfig(10));
+    defer ts.deinit(io);
+    ts.store.config.max_age_ns = std.math.maxInt(u64);
+
+    const a = try ts.store.putBytes(io, "aaaa", .other);
+    const b = try ts.store.putBytes(io, "bbbb", .other);
+    try ts.store.tagObject(io, a, &.{.{ .key = "project", .value = "projA" }});
+    try ts.store.tagObject(io, b, &.{.{ .key = "project", .value = "projB" }});
+    try setMtime(io, &ts.store, a, 1_000);
+    try setMtime(io, &ts.store, b, 2_000);
+
+    ts.store.limits = .{ .hot = 8, .cold = 1, .reserve = 0 };
+    ts.store.budget = .{ .total = 1_000_000, .hot = 1_000_000, .cold = 1, .index_state = 100_000, .spool = 100_000, .reserve = 0 };
+
+    const filt = [_]root.Tag{.{ .key = "project", .value = "projB" }};
+    const report = try ts.store.gc(io, gpa, .{ .tag_filter = &filt });
+    try std.testing.expect(ts.store.exists(io, a)); // filtered out: untouched
+    try std.testing.expect(!ts.store.exists(io, b)); // in scope: evicted
+    try std.testing.expectEqual(@as(u64, 1), report.tag_skipped_objects);
+}
+
+test "over-soft-cap tags evict first" {
+    // NOTE (plan deviation, reported): puts admit before the shrink (see
+    // above); limits.cold is 1 (not the plan's 100) so demote-before-evict
+    // cannot divert the fixtures to cold and the test actually observes
+    // eviction; target is 3 (not 1) so exactly the over-cap object goes
+    // while the 3-byte survivor proves the soft budget overrode pure LRU.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = std.testing.allocator;
+    var ts = test_support.openTestStore(io, fixedConfig(100));
+    defer ts.deinit(io);
+    ts.store.config.max_age_ns = std.math.maxInt(u64);
+
+    const old_heavy = try ts.store.putBytes(io, "old-heavy-payload", .other);
+    const new_light = try ts.store.putBytes(io, "new", .other);
+    try ts.store.tagObject(io, old_heavy, &.{.{ .key = "project", .value = "hungry" }});
+    try ts.store.tagObject(io, new_light, &.{.{ .key = "project", .value = "lean" }});
+    try ts.store.index.execAll("INSERT OR REPLACE INTO tag_budgets(key,value,soft_cap) VALUES('project','hungry',1);");
+    try setMtime(io, &ts.store, old_heavy, 5_000); // newer, but over soft cap
+    try setMtime(io, &ts.store, new_light, 1_000); // older, but under cap
+
+    ts.store.limits = .{ .hot = 100, .cold = 1, .reserve = 0 };
+    ts.store.budget = .{ .total = 1_000_000, .hot = 1_000_000, .cold = 1, .index_state = 100_000, .spool = 100_000, .reserve = 0 };
+
+    const report = try ts.store.gc(io, gpa, .{ .target_bytes = 3 });
+    try std.testing.expect(report.evicted_objects >= 1);
+    try std.testing.expect(!ts.store.exists(io, old_heavy));
+    try std.testing.expect(ts.store.exists(io, new_light));
 }

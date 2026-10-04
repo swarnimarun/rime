@@ -2,7 +2,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 const store = @import("store");
 
-pub const GcOpts = struct { dry_run: bool = false, target_bytes: ?u64 = null, older_than_ns: ?u64 = null };
+/// `cache stat` options: `--by-tag` prints the per-pair table, optionally
+/// narrowed to exact `k=v` pairs. Plan B Task 11.
+pub const StatOpts = struct { by_tag: bool = false, filters: []const []const u8 = &.{} };
+/// One `--tag k=v` scope (repeatable, conjunctive). Plan B Task 11.
+pub const TagFilter = struct { key: []const u8, value: []const u8 };
+pub const GcOpts = struct { dry_run: bool = false, target_bytes: ?u64 = null, older_than_ns: ?u64 = null, tags: []const TagFilter = &.{} };
 pub const MigrateOpts = struct { dry_run: bool = false };
 pub const PinArgs = struct { name: []const u8, digest: []const u8 };
 pub const UnpinArgs = struct { name: []const u8 };
@@ -10,7 +15,7 @@ pub const StorePutArgs = struct { name: []const u8, file: []const u8 };
 pub const StoreGetArgs = struct { name: []const u8, out_file: []const u8 };
 
 pub const Command = union(enum) {
-    stat,
+    stat: StatOpts,
     migrate: MigrateOpts,
     gc: GcOpts,
     pin: PinArgs,
@@ -20,11 +25,10 @@ pub const Command = union(enum) {
     verify,
 };
 
-pub fn parseCommand(gpa: std.mem.Allocator, args: []const []const u8) error{Usage}!Command {
-    _ = gpa;
+pub fn parseCommand(gpa: std.mem.Allocator, args: []const []const u8) error{ Usage, OutOfMemory }!Command {
     if (args.len == 0) return error.Usage;
     if (std.mem.eql(u8, args[0], "cache")) {
-        if (args.len == 2 and std.mem.eql(u8, args[1], "stat")) return .stat;
+        if (args.len >= 2 and std.mem.eql(u8, args[1], "stat")) return try parseStat(gpa, args[2..]);
         if (args.len == 2 and std.mem.eql(u8, args[1], "verify")) return .verify;
         // Explicit v1→v2 migration (storage-v2 §14); never auto-runs on open.
         if (args.len >= 2 and std.mem.eql(u8, args[1], "migrate")) {
@@ -40,6 +44,9 @@ pub fn parseCommand(gpa: std.mem.Allocator, args: []const []const u8) error{Usag
     }
     if (std.mem.eql(u8, args[0], "gc")) {
         var cmd: Command = .{ .gc = .{} };
+        // Owned only when non-empty, so tagless call sites allocate nothing.
+        var tag_list: std.ArrayList(TagFilter) = .empty;
+        defer tag_list.deinit(gpa);
         var i: usize = 1;
         while (i < args.len) : (i += 1) {
             if (std.mem.eql(u8, args[i], "--dry-run")) {
@@ -50,8 +57,15 @@ pub fn parseCommand(gpa: std.mem.Allocator, args: []const []const u8) error{Usag
             } else if (std.mem.eql(u8, args[i], "--older-than") and i + 1 < args.len) {
                 i += 1;
                 cmd.gc.older_than_ns = store.config.parseDuration(args[i]) catch return error.Usage;
+            } else if (std.mem.eql(u8, args[i], "--tag") and i + 1 < args.len) {
+                i += 1;
+                const a = args[i];
+                const eq = std.mem.indexOfScalar(u8, a, '=') orelse return error.Usage;
+                if (eq == 0 or eq == a.len - 1) return error.Usage;
+                try tag_list.append(gpa, .{ .key = a[0..eq], .value = a[eq + 1 ..] });
             } else return error.Usage;
         }
+        if (tag_list.items.len > 0) cmd.gc.tags = try tag_list.toOwnedSlice(gpa);
         return cmd;
     }
     if (std.mem.eql(u8, args[0], "pin") and args.len == 3)
@@ -67,6 +81,27 @@ pub fn parseCommand(gpa: std.mem.Allocator, args: []const []const u8) error{Usag
     return error.Usage;
 }
 
+/// `cache stat [--by-tag [k=v ...]]`. Bare `cache stat` keeps StatOpts{}
+/// defaults; filters borrow the argv slices (the array is caller-owned via
+/// gpa — allocated only when filters are present, so existing no-filter
+/// call sites allocate nothing). Plan B Task 11.
+fn parseStat(gpa: std.mem.Allocator, rest: []const []const u8) error{ Usage, OutOfMemory }!Command {
+    var opts = StatOpts{};
+    if (rest.len == 0) return .{ .stat = opts };
+    if (!std.mem.eql(u8, rest[0], "--by-tag")) return error.Usage;
+    opts.by_tag = true;
+    if (rest.len == 1) return .{ .stat = opts };
+    const fs = try gpa.alloc([]const u8, rest.len - 1);
+    errdefer gpa.free(fs);
+    for (rest[1..], 0..) |a, i| {
+        const eq = std.mem.indexOfScalar(u8, a, '=') orelse return error.Usage;
+        if (eq == 0 or eq == a.len - 1) return error.Usage;
+        fs[i] = a;
+    }
+    opts.filters = fs;
+    return .{ .stat = opts };
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
@@ -78,9 +113,20 @@ pub fn main(init: std.process.Init) !u8 {
 
     const rest: []const []const u8 = if (argv.items.len > 1) argv.items[1..] else &.{};
     const cmd = parseCommand(gpa, rest) catch {
-        std.debug.print("usage: rime <cache stat|cache verify|cache migrate [--dry-run]|gc|pin|unpin|store> …\n", .{});
+        // NOTE (plan adjustment, reported): the plan's replacement usage
+        // string dropped `cache migrate`; kept here (still a command).
+        std.debug.print("usage: rime <cache stat [--by-tag [k=v …]]|cache verify|cache migrate [--dry-run]|gc [--tag k=v …]|pin|unpin|store> …\n", .{});
         return 2;
     };
+    // parseCommand-owned arrays (stat filters / gc tags; allocated only
+    // when non-empty). Freed here so Debug-allocator runs stay clean.
+    defer {
+        switch (cmd) {
+            .stat => |o| if (o.filters.len > 0) gpa.free(o.filters),
+            .gc => |o| if (o.tags.len > 0) gpa.free(o.tags),
+            else => {},
+        }
+    }
 
     var store_dir = try openStoreDir(init, io, gpa);
     defer store_dir.close(io);
@@ -94,7 +140,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer s.close(io);
 
     switch (cmd) {
-        .stat => return cmdStat(io, gpa, &s),
+        .stat => |o| return cmdStat(io, gpa, &s, o),
         .migrate => unreachable, // handled before Store.open above
         .gc => |p| return cmdGc(io, gpa, &s, p),
         .pin => |p| return cmdPin(io, &s, p),
@@ -146,7 +192,12 @@ fn cmdMigrate(io: std.Io, store_dir: std.Io.Dir, opts: MigrateOpts) u8 {
     };
     defer idx.close();
     const rep = store.migrate_mod.migrate(io, store_dir, &idx, .{ .dry_run = opts.dry_run }) catch |e| {
-        std.debug.print("rime: migrate failed: {t}\n", .{e});
+        // Fail-closed roots carry the filename via lastBadRoot (errors have
+        // no payload); surface it so the operator knows which file to fix.
+        if (e == error.CorruptRoot) {
+            const bad = store.migrate_mod.lastBadRoot();
+            if (bad.len > 0) std.debug.print("rime: migrate failed: {t}: corrupt root file {s}\n", .{ e, bad });
+        } else std.debug.print("rime: migrate failed: {t}\n", .{e});
         return 1;
     };
     std.debug.print(
@@ -156,7 +207,7 @@ fn cmdMigrate(io: std.Io, store_dir: std.Io.Dir, opts: MigrateOpts) u8 {
     return 0;
 }
 
-fn cmdStat(io: std.Io, gpa: std.mem.Allocator, s: *store.Store) u8 {
+fn cmdStat(io: std.Io, gpa: std.mem.Allocator, s: *store.Store, opts: StatOpts) u8 {
     const st = s.stats(io, gpa) catch |e| {
         std.debug.print("rime: stat failed: {t}\n", .{e});
         return 1;
@@ -167,7 +218,56 @@ fn cmdStat(io: std.Io, gpa: std.mem.Allocator, s: *store.Store) u8 {
     std.debug.print("roots: {d} pinned bytes, {d} live leases\n", .{ st.pinned_bytes, st.lease_count });
     std.debug.print("free: {d} bytes (reserve {d})\n", .{ st.free_bytes, st.limits.reserve });
     std.debug.print("binding: {s}\n", .{bindingConstraint(&st)});
+    // Budget line (§9.1/§12.2): total cap, per-class usage, in-flight
+    // reservations. Plan B Task 11.
+    const u = store.budget_mod.classUsage(s, io, gpa) catch |e| {
+        std.debug.print("rime: stat failed: {t}\n", .{e});
+        return 1;
+    };
+    const reserved = s.reservedBytes() catch |e| {
+        std.debug.print("rime: stat failed: {t}\n", .{e});
+        return 1;
+    };
+    std.debug.print("budget: total {d} (hot {d} cold {d} index+state {d} spool {d}) reservations {d}\n", .{ s.budget.total, u.hot, u.cold, u.index_state, u.spool, reserved });
+    if (opts.by_tag) {
+        const rows = store.stats_mod.byTag(s, io, gpa) catch |e| {
+            std.debug.print("rime: stat failed: {t}\n", .{e});
+            return 1;
+        };
+        defer store.stats_mod.freeTagStats(gpa, rows);
+        for (rows) |r| {
+            if (opts.filters.len > 0 and !statFilterMatch(opts.filters, r.key, r.value)) continue;
+            std.debug.print("tag {s}={s}: {d} bytes in {d} objects\n", .{ r.key, r.value, r.bytes, r.objects });
+        }
+    }
     return 0;
+}
+
+/// Renders the last admission diagnostic with the §10.4 exact fields
+/// verbatim (`admitting N to <class> (budget B, <class> used/cap,
+/// reserved R, reclaimable Q): <hint>`). Plan B Task 9.
+fn renderStoreFull(s: *store.Store) void {
+    const bd = s.lastFull();
+    std.debug.print("rime: store full admitting {d} to {s} (budget {d}, {s} {d}/{d}, reserved {d}, reclaimable {d}): {s}\n", .{
+        bd.requested_bytes,
+        @tagName(bd.class),
+        bd.budget,
+        @tagName(bd.class),
+        bd.used_class,
+        bd.cap_class,
+        bd.reserved_class,
+        bd.reclaimable_class,
+        @tagName(bd.hint),
+    });
+}
+
+/// True when (key, value) exactly equals any `k=v` filter (§12.1).
+fn statFilterMatch(filters: []const []const u8, key: []const u8, value: []const u8) bool {
+    for (filters) |f| {
+        const eq = std.mem.indexOfScalar(u8, f, '=') orelse continue;
+        if (std.mem.eql(u8, f[0..eq], key) and std.mem.eql(u8, f[eq + 1 ..], value)) return true;
+    }
+    return false;
 }
 
 /// What would block the next build: free space below reserve, roots alone
@@ -189,10 +289,19 @@ fn cmdGc(
         return 0;
     }
     defer s.unlock(io);
+    // `--tag k=v` scopes map to store.Tag; empty stays unscoped (null) so
+    // plain `gc` never hits the tag-query newest-1,000 bound. Plan B Task 11.
+    const tf = gpa.alloc(store.Tag, p.tags.len) catch |e| {
+        std.debug.print("rime: gc failed: {t}\n", .{e});
+        return 1;
+    };
+    defer gpa.free(tf);
+    for (p.tags, 0..) |t, i| tf[i] = .{ .key = t.key, .value = t.value };
     const report = s.gc(io, gpa, .{
         .dry_run = p.dry_run,
         .target_bytes = p.target_bytes,
         .older_than_ns = p.older_than_ns,
+        .tag_filter = if (tf.len == 0) null else tf,
     }) catch |e| {
         std.debug.print("rime: gc failed: {t}\n", .{e});
         return 1;
@@ -250,6 +359,11 @@ fn cmdStorePut(io: std.Io, s: *store.Store, p: StorePutArgs) u8 {
     };
     defer f.close(io);
     const d = s.putFile(io, f, .other) catch |e| {
+        // Admission detail (§10.4 exact fields verbatim). A cache-write
+        // StoreFull never fails a build (callers fall back to spool), but
+        // the CLI surfaces what is full and what would free space.
+        // Plan B Task 9.
+        if (e == error.StoreFull) renderStoreFull(s);
         std.debug.print("rime: ingest failed: {t}\n", .{e});
         return 1;
     };
@@ -330,4 +444,14 @@ test "parseCommand covers the surface" {
     try std.testing.expect(c.gc.dry_run);
     try std.testing.expectEqual(@as(?u64, 5 * store.config.GiB), c.gc.target_bytes);
     try std.testing.expectError(error.Usage, parseCommand(gpa, &.{"nonsense"}));
+    // Plan B Task 11: `cache stat --by-tag [k=v]` and repeatable `gc --tag`.
+    // (Owned filter/tag arrays are freed; tagless commands allocate nothing.)
+    const st = try parseCommand(gpa, &.{ "cache", "stat", "--by-tag", "profile=release" });
+    defer gpa.free(st.stat.filters);
+    try std.testing.expect(st == .stat);
+    try std.testing.expect(st.stat.by_tag);
+    try std.testing.expectEqual(@as(usize, 1), st.stat.filters.len);
+    const gt = try parseCommand(gpa, &.{ "gc", "--tag", "project=projA", "--tag", "user.a=b" });
+    defer gpa.free(gt.gc.tags);
+    try std.testing.expectEqual(@as(usize, 2), gt.gc.tags.len);
 }
