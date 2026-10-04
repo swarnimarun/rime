@@ -573,3 +573,402 @@ test "run build without dry-run reports need source" {
     defer std.testing.allocator.free(msg);
     try std.testing.expect(std.mem.indexOf(u8, msg, "need source: serde") != null);
 }
+
+// =====================================================================
+// Task 9 (CLI half): --locked/--frozen/--offline enforcement + lock check.
+//
+// Reference pins:
+// - `ops/lockfile.rs::write_pkg_lockfile` (order: equality check FIRST --
+//   up-to-date + `--locked` = success, not error -- then the locked bail;
+//   copy of the `cannot {update,create} the lock file {path} because
+//   {flag} was passed to prevent this` wording, which the M4 driver
+//   renders; this module owns the MODE taxonomy + the semantic compare).
+// - `are_equal_lockfiles` (semantic compare: decoded-graph equality, NOT
+//   bytes -- comment/whitespace/edge-shortening diffs stay up_to_date).
+// - `ops/resolve.rs::lock_update_allowed` + `generate_lockfile.rs`
+//   testsuite (`--locked` failure exit + message; `--offline` success with
+//   a complete lock).
+// - `dep_cache.rs::describe_path_in_context` + `resolver/errors.rs`
+//   (resolve-side `Diag` text lives in `resolve.zig::formatDiag`, settled;
+//   the offline-missing DIAGNOSIS is produced by the M4 resolve driver
+//   when the registry seam serves zero candidates under offline/frozen).
+
+const resolve_mod = @import("resolve.zig");
+const lock_mod = @import("lock.zig");
+const semver_mod = @import("semver.zig");
+const sources_mod = @import("sources.zig");
+
+/// `--locked` reproduces the existing lock exactly (mismatch = bail, no
+/// write); `--frozen` = `--locked` + `--offline`; `--offline` resolves
+/// freely but never hits the network seam.
+pub const LockMode = enum { normal, locked, frozen, offline };
+
+/// Frozen is its own flag but semantically locked+offline: an explicit
+/// `--locked --offline` pair maps to `.frozen` too (equivalent behavior,
+/// one taxonomy).
+pub fn lockModeFrom(opts: Options) LockMode {
+    if (opts.frozen or (opts.locked and opts.offline)) return .frozen;
+    if (opts.locked) return .locked;
+    if (opts.offline) return .offline;
+    return .normal;
+}
+
+/// Only normal|locked may touch the network seam (frozen/offline never do).
+pub fn needsNetwork(mode: LockMode) bool {
+    return mode == .normal or mode == .locked;
+}
+
+pub const LockCheck = enum { up_to_date, would_change, offline_missing };
+
+/// Semantic lock comparison (`are_equal_lockfiles`): null or malformed
+/// previous text is `would_change` (cargo picks the "create" wording when
+/// the file is missing); otherwise both sides decode to (name, version,
+/// source) node sets with per-node (dep-name, dep-version) edge sets and
+/// compare -- so comment/whitespace/edge-shortening-only diffs stay
+/// `up_to_date`. Ambiguous short edges on the previous side are DROPPED
+/// (cargo's `into_resolve` bad-merge tolerance); a graph edge the previous
+/// side dropped therefore reads as `would_change`, matching cargo (it would
+/// rewrite the file). Allocation failure also reads as `would_change`
+/// (equality unprovable -- fail toward rewriting, never toward a false
+/// `--locked` success). `offline_missing` is never returned here: it is
+/// produced by the M4 resolve driver when the seam serves zero candidates
+/// under offline/frozen (see `resolve.formatDiag`).
+pub fn checkLock(gpa: std.mem.Allocator, previous: ?[]const u8, new_graph: *const resolve_mod.ResolveGraph) LockCheck {
+    const text = previous orelse return .would_change;
+    var lf = lock_mod.parseLock(gpa, text) catch return .would_change;
+    defer lf.deinit();
+    const prev_sig = lockSignature(gpa, lf.packages) catch return .would_change;
+    defer {
+        for (prev_sig) |*s| {
+            gpa.free(s.node);
+            for (s.deps) |d| gpa.free(d);
+            gpa.free(s.deps);
+        }
+        gpa.free(prev_sig);
+    }
+    const graph_sig = graphSignature(gpa, new_graph) catch return .would_change;
+    defer {
+        for (graph_sig) |*s| {
+            gpa.free(s.node);
+            for (s.deps) |d| gpa.free(d);
+            gpa.free(s.deps);
+        }
+        gpa.free(graph_sig);
+    }
+    if (prev_sig.len != graph_sig.len) return .would_change;
+    for (prev_sig) |ps| {
+        var found = false;
+        for (graph_sig) |gs| {
+            if (std.mem.eql(u8, ps.node, gs.node)) {
+                found = true;
+                if (ps.deps.len != gs.deps.len) return .would_change;
+                for (ps.deps) |pd| {
+                    var dfound = false;
+                    for (gs.deps) |gd| {
+                        if (std.mem.eql(u8, pd, gd)) {
+                            dfound = true;
+                            break;
+                        }
+                    }
+                    if (!dfound) return .would_change;
+                }
+                break;
+            }
+        }
+        if (!found) return .would_change;
+    }
+    return .up_to_date;
+}
+
+const NodeSig = struct { node: []u8, deps: [][]u8 };
+
+/// Canonical `Version` rendering `M.m.p[-pre][+build]` (cargo's `Version`
+/// Display -- the form lockfiles carry, including build metadata such as
+/// `0.11.1+wasi-snapshot-preview1`).
+fn renderVersionText(gpa: std.mem.Allocator, v: semver_mod.Version) std.mem.Allocator.Error![]u8 {
+    if (v.pre.len == 0 and v.build.len == 0)
+        return std.fmt.allocPrint(gpa, "{d}.{d}.{d}", .{ v.major, v.minor, v.patch });
+    if (v.pre.len == 0)
+        return std.fmt.allocPrint(gpa, "{d}.{d}.{d}+{s}", .{ v.major, v.minor, v.patch, v.build });
+    if (v.build.len == 0)
+        return std.fmt.allocPrint(gpa, "{d}.{d}.{d}-{s}", .{ v.major, v.minor, v.patch, v.pre });
+    return std.fmt.allocPrint(gpa, "{d}.{d}.{d}-{s}+{s}", .{ v.major, v.minor, v.patch, v.pre, v.build });
+}
+
+/// Graph-side source rendering for the signature key (v4 form; only the
+/// registry/git identity feeds the key, and path never reaches here).
+fn renderSourceText(gpa: std.mem.Allocator, src: sources_mod.SourceId) std.mem.Allocator.Error![]u8 {
+    switch (src) {
+        .path => |p| return std.fmt.allocPrint(gpa, "path:{s}", .{p}),
+        .registry => |u| return std.fmt.allocPrint(gpa, "registry+{s}", .{srcNormRegistry(u)}),
+        .git => {
+            // Only OOM is reachable here (git lines are never null);
+            // LockLineError coerces into the caller's Allocator.Error.
+            const line = try sources_mod.SourceId.lockSourceLine(gpa, src, .v4);
+            return line.?;
+        },
+    }
+}
+
+fn srcNormRegistry(url: []const u8) []const u8 {
+    // cargo's lock writes `registry+<url>` while the resolver keys
+    // `sparse+<url>`: compare the URL past any `<scheme>+` prefix.
+    if (std.mem.indexOfScalar(u8, url, '+')) |i| return url[i + 1 ..];
+    return url;
+}
+
+/// Canonical node key `name\0version\0source-class\0source-rest`. Path (lock
+/// `source` absent, graph `.path`) keys identically; registry compares past
+/// the `sparse+`/`registry+` scheme split; git compares the full line.
+fn nodeKey(gpa: std.mem.Allocator, name: []const u8, version: []const u8, source: ?[]const u8, is_path: bool) std.mem.Allocator.Error![]u8 {
+    if (is_path) return std.fmt.allocPrint(gpa, "{s}\x00{s}\x00path:", .{ name, version });
+    const s = source orelse return std.fmt.allocPrint(gpa, "{s}\x00{s}\x00path:", .{ name, version });
+    if (std.mem.startsWith(u8, s, "git+")) return std.fmt.allocPrint(gpa, "{s}\x00{s}\x00git:{s}", .{ name, version, s });
+    return std.fmt.allocPrint(gpa, "{s}\x00{s}\x00reg:{s}", .{ name, version, srcNormRegistry(s) });
+}
+
+/// Graph side: versions render canonically `M.m.p[-pre][+build]` (cargo's
+/// `Version` Display -- the form lockfiles carry), sources key by variant.
+fn graphSignature(gpa: std.mem.Allocator, graph: *const resolve_mod.ResolveGraph) std.mem.Allocator.Error![]NodeSig {
+    var out: std.ArrayList(NodeSig) = .empty;
+    errdefer {
+        for (out.items) |*s| {
+            gpa.free(s.node);
+            for (s.deps) |d| gpa.free(d);
+            gpa.free(s.deps);
+        }
+        out.deinit(gpa);
+    }
+    for (graph.nodes) |n| {
+        const ver = try renderVersionText(gpa, n.version);
+        defer gpa.free(ver);
+        const is_path = n.source == .path;
+        var src_buf: ?[]u8 = null;
+        defer if (src_buf) |b| gpa.free(b);
+        if (!is_path) {
+            src_buf = try renderSourceText(gpa, n.source);
+        }
+        const node = try nodeKey(gpa, n.name, ver, src_buf, is_path);
+        errdefer gpa.free(node);
+        var deps: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (deps.items) |d| gpa.free(d);
+            deps.deinit(gpa);
+        }
+        for (n.deps) |r| {
+            const rv = try renderVersionText(gpa, r.version);
+            defer gpa.free(rv);
+            const rk = try std.fmt.allocPrint(gpa, "{s}\x00{s}", .{ r.name, rv });
+            errdefer gpa.free(rk);
+            try deps.append(gpa, rk);
+        }
+        std.mem.sort([]u8, deps.items, {}, struct {
+            fn lt(_: void, a: []u8, b: []u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lt);
+        try out.append(gpa, .{ .node = node, .deps = try deps.toOwnedSlice(gpa) });
+    }
+    std.mem.sort(NodeSig, out.items, {}, struct {
+        fn lt(_: void, a: NodeSig, b: NodeSig) bool {
+            return std.mem.order(u8, a.node, b.node) == .lt;
+        }
+    }.lt);
+    return out.toOwnedSlice(gpa);
+}
+
+/// Previous-lock side: edge strings (`name [version] [(source)]`) resolve
+/// against the package list with `into_resolve` tolerance (ambiguous or
+/// dangling edges are DROPPED, never errors).
+fn lockSignature(gpa: std.mem.Allocator, packages: []lock_mod.LockPackage) std.mem.Allocator.Error![]NodeSig {
+    var out: std.ArrayList(NodeSig) = .empty;
+    errdefer {
+        for (out.items) |*s| {
+            gpa.free(s.node);
+            for (s.deps) |d| gpa.free(d);
+            gpa.free(s.deps);
+        }
+        out.deinit(gpa);
+    }
+    for (packages) |*p| {
+        const node = try nodeKey(gpa, p.name, p.version, p.source, p.source == null);
+        errdefer gpa.free(node);
+        var deps: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (deps.items) |d| gpa.free(d);
+            deps.deinit(gpa);
+        }
+        for (p.dependencies) |e| {
+            const resolved = resolveLockEdgeForSig(packages, e) orelse continue;
+            const rk = try std.fmt.allocPrint(gpa, "{s}\x00{s}", .{ resolved.name, resolved.version });
+            errdefer gpa.free(rk);
+            try deps.append(gpa, rk);
+        }
+        std.mem.sort([]u8, deps.items, {}, struct {
+            fn lt(_: void, a: []u8, b: []u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lt);
+        try out.append(gpa, .{ .node = node, .deps = try deps.toOwnedSlice(gpa) });
+    }
+    std.mem.sort(NodeSig, out.items, {}, struct {
+        fn lt(_: void, a: NodeSig, b: NodeSig) bool {
+            return std.mem.order(u8, a.node, b.node) == .lt;
+        }
+    }.lt);
+    return out.toOwnedSlice(gpa);
+}
+
+const SigEdge = struct { name: []const u8, version: []const u8 };
+
+/// `into_resolve` edge tolerance for the compare: bare `name` needs a
+/// single distinct version for the name; `name version` needs that package
+/// to exist (a trailing `(source)` is accepted and ignored for the version
+/// key -- source drift already shows in the node keys).
+fn resolveLockEdgeForSig(packages: []lock_mod.LockPackage, edge: []const u8) ?SigEdge {
+    const sp = std.mem.indexOfScalar(u8, edge, ' ') orelse {
+        var first: ?[]const u8 = null;
+        for (packages) |*p| {
+            if (!std.mem.eql(u8, p.name, edge)) continue;
+            if (first) |f| {
+                if (!std.mem.eql(u8, f, p.version)) return null;
+            } else first = p.version;
+        }
+        const v = first orelse return null;
+        return .{ .name = edge, .version = v };
+    };
+    const name = edge[0..sp];
+    const rest = edge[sp + 1 ..];
+    const ver = if (std.mem.indexOfScalar(u8, rest, ' ')) |sp2| rest[0..sp2] else rest;
+    for (packages) |*p| {
+        if (std.mem.eql(u8, p.name, name) and std.mem.eql(u8, p.version, ver)) return .{ .name = name, .version = ver };
+    }
+    return null;
+}
+
+test "lockModeFrom maps flag combinations" {
+    const base = Options{
+        .cmd = .build,
+        .manifest_path = null,
+        .profile = "dev",
+        .explicit_profile = false,
+        .target_triple = null,
+        .only_package = null,
+        .features = &.{},
+        .message_format = .human,
+        .offline = false,
+        .frozen = false,
+        .locked = false,
+        .dry_run = false,
+        .extra_args = &.{},
+    };
+    try std.testing.expectEqual(LockMode.normal, lockModeFrom(base));
+    var locked = base;
+    locked.locked = true;
+    try std.testing.expectEqual(LockMode.locked, lockModeFrom(locked));
+    var offline = base;
+    offline.offline = true;
+    try std.testing.expectEqual(LockMode.offline, lockModeFrom(offline));
+    var frozen = base;
+    frozen.frozen = true;
+    try std.testing.expectEqual(LockMode.frozen, lockModeFrom(frozen));
+    // frozen wins over everything; locked+offline without --frozen is frozen.
+    var both = base;
+    both.locked = true;
+    both.offline = true;
+    try std.testing.expectEqual(LockMode.frozen, lockModeFrom(both));
+    var all = base;
+    all.locked = true;
+    all.offline = true;
+    all.frozen = true;
+    try std.testing.expectEqual(LockMode.frozen, lockModeFrom(all));
+}
+
+test "needsNetwork is false only for offline modes" {
+    try std.testing.expect(needsNetwork(.normal));
+    try std.testing.expect(needsNetwork(.locked));
+    try std.testing.expect(!needsNetwork(.offline));
+    try std.testing.expect(!needsNetwork(.frozen));
+}
+
+test "locked mode bails only when the graph would change" {
+    // Plan Task-9 shape (adapted: the settled `formatDiag` renders the
+    // cargo-verbatim `name = \"req\"` leading line, so the bail-text
+    // assertion lives with the M4 driver; here the checkLock halves).
+    const gpa = std.testing.allocator;
+    const path: sources_mod.SourceId = .{ .path = "/repo/app" };
+    const v010 = try semver_mod.Version.parse("0.1.0");
+    const nodes = [_]resolve_mod.ResolvedNode{
+        .{ .name = "app", .version = v010, .source = path, .deps = &.{} },
+    };
+    var graph = resolve_mod.ResolveGraph{ .arena = std.heap.ArenaAllocator.init(gpa), .nodes = &nodes };
+    defer graph.deinit();
+    var cksums = std.StringHashMap(?[]const u8).init(gpa);
+    defer cksums.deinit();
+    const bytes = try lock_mod.writeLock(gpa, &graph, &cksums, .v4);
+    defer gpa.free(bytes);
+    try std.testing.expectEqual(LockCheck.up_to_date, checkLock(gpa, bytes, &graph));
+    try std.testing.expectEqual(LockCheck.would_change, checkLock(gpa, null, &graph));
+    const v020 = try semver_mod.Version.parse("0.2.0");
+    const moved = [_]resolve_mod.ResolvedNode{
+        .{ .name = "app", .version = v020, .source = path, .deps = &.{} },
+    };
+    var graph2 = resolve_mod.ResolveGraph{ .arena = std.heap.ArenaAllocator.init(gpa), .nodes = &moved };
+    defer graph2.deinit();
+    try std.testing.expectEqual(LockCheck.would_change, checkLock(gpa, bytes, &graph2));
+}
+
+test "checkLock ignores comments and edge shortening" {
+    // Semantic compare (are_equal_lockfiles): a comment-only diff and a
+    // shortened-vs-explicit edge diff both stay up_to_date.
+    const gpa = std.testing.allocator;
+    const path: sources_mod.SourceId = .{ .path = "/repo/app" };
+    const reg: sources_mod.SourceId = .{ .registry = "sparse+https://github.com/rust-lang/crates.io-index" };
+    const v010 = try semver_mod.Version.parse("0.1.0");
+    const v100 = try semver_mod.Version.parse("1.0.0");
+    const app_refs = [_]resolve_mod.ResolvedRef{.{ .name = "lib", .version = v100, .source = reg }};
+    const nodes = [_]resolve_mod.ResolvedNode{
+        .{ .name = "app", .version = v010, .source = path, .deps = &app_refs },
+        .{ .name = "lib", .version = v100, .source = reg, .deps = &.{} },
+    };
+    var graph = resolve_mod.ResolveGraph{ .arena = std.heap.ArenaAllocator.init(gpa), .nodes = &nodes };
+    defer graph.deinit();
+    const src = "registry+https://github.com/rust-lang/crates.io-index";
+    const ck = try lock_mod.checksumKey(gpa, "lib", "1.0.0", src);
+    defer gpa.free(ck);
+    var cksums = std.StringHashMap(?[]const u8).init(gpa);
+    defer cksums.deinit();
+    try cksums.put(ck, "e" ** 64);
+    const bytes = try lock_mod.writeLock(gpa, &graph, &cksums, .v4);
+    defer gpa.free(bytes);
+    try std.testing.expectEqual(LockCheck.up_to_date, checkLock(gpa, bytes, &graph));
+    // Comment-only diff: still up_to_date (bytes differ, semantics don't).
+    const commented = try std.fmt.allocPrint(gpa, "# vendored for offline builds\n{s}", .{bytes});
+    defer gpa.free(commented);
+    try std.testing.expectEqual(LockCheck.up_to_date, checkLock(gpa, commented, &graph));
+    // Malformed previous: would_change (cargo's "create" wording path).
+    try std.testing.expectEqual(LockCheck.would_change, checkLock(gpa, "[[[not toml", &graph));
+}
+
+test "checkLock resolves bare edges before comparing" {
+    // The writer shortens single-version names to bare `"lib"`; the graph
+    // ref stays versioned. checkLock must resolve the bare edge through
+    // the package list (into_resolve tolerance) instead of byte-matching.
+    const gpa = std.testing.allocator;
+    const text =
+        "# This file is automatically @generated by Cargo.\n" ++
+        "# It is not intended for manual editing.\n" ++
+        "version = 4\n\n" ++
+        "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"lib\",\n]\n\n" ++
+        "[[package]]\nname = \"lib\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"" ++ "e" ** 64 ++ "\"\n";
+    const path: sources_mod.SourceId = .{ .path = "/repo/app" };
+    const reg: sources_mod.SourceId = .{ .registry = "sparse+https://github.com/rust-lang/crates.io-index" };
+    const app_refs = [_]resolve_mod.ResolvedRef{.{ .name = "lib", .version = try semver_mod.Version.parse("1.0.0"), .source = reg }};
+    const nodes = [_]resolve_mod.ResolvedNode{
+        .{ .name = "app", .version = try semver_mod.Version.parse("0.1.0"), .source = path, .deps = &app_refs },
+        .{ .name = "lib", .version = try semver_mod.Version.parse("1.0.0"), .source = reg, .deps = &.{} },
+    };
+    var graph = resolve_mod.ResolveGraph{ .arena = std.heap.ArenaAllocator.init(gpa), .nodes = &nodes };
+    defer graph.deinit();
+    try std.testing.expectEqual(LockCheck.up_to_date, checkLock(gpa, text, &graph));
+}
