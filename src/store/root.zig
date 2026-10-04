@@ -153,27 +153,27 @@ pub const Store = struct {
     pub const lease_ttl_ms = state.lease_ttl_ms;
 
     pub fn pin(store: *Store, io: Io, name: []const u8, d: Digest) StateError!void {
-        return state.putPin(io, store.dir, name, d, Io.Timestamp.now(io, .real).toMilliseconds());
+        return state.putPin(io, store.dir, name, d, Io.Timestamp.now(io, .real).toMilliseconds(), &store.index);
     }
 
     pub fn unpin(store: *Store, io: Io, name: []const u8) StateError!void {
-        return state.removePin(io, store.dir, name);
+        return state.removePin(io, store.dir, name, &store.index);
     }
 
     pub fn leasePut(store: *Store, io: Io, build_id: []const u8, digests: []const Digest) StateError!void {
-        return state.putLease(io, store.dir, build_id, digests, Io.Timestamp.now(io, .real).toMilliseconds());
+        return state.putLease(io, store.dir, build_id, digests, Io.Timestamp.now(io, .real).toMilliseconds(), &store.index);
     }
 
     pub fn leaseRenew(store: *Store, io: Io, build_id: []const u8) StateError!void {
-        return state.renewLease(io, store.dir, build_id, Io.Timestamp.now(io, .real).toMilliseconds());
+        return state.renewLease(io, store.dir, build_id, Io.Timestamp.now(io, .real).toMilliseconds(), &store.index);
     }
 
     pub fn leaseDrop(store: *Store, io: Io, build_id: []const u8) StateError!void {
-        return state.dropLease(io, store.dir, build_id);
+        return state.dropLease(io, store.dir, build_id, &store.index);
     }
 
     pub fn retainProject(store: *Store, io: Io, project_id: []const u8, manifests: []const Digest) StateError!void {
-        return state.putRetain(io, std.heap.page_allocator, store.dir, project_id, manifests, Io.Timestamp.now(io, .real).toMilliseconds());
+        return state.putRetain(io, std.heap.page_allocator, store.dir, project_id, manifests, Io.Timestamp.now(io, .real).toMilliseconds(), &store.index);
     }
 
     pub const Manifest = manifest_mod.Manifest;
@@ -284,11 +284,16 @@ pub const Store = struct {
     pub const ActionEntry = action_cache.ActionEntry;
 
     pub fn putAction(store: *Store, io: Io, key: Digest, manifest: Digest) action_cache.PutError!void {
-        return action_cache.putAction(io, store.dir, key, manifest, Io.Timestamp.now(io, .real).toMilliseconds());
+        return action_cache.putAction(io, store.dir, key, manifest, Io.Timestamp.now(io, .real).toMilliseconds(), &store.index);
+    }
+
+    /// Storage-v2 §16 index-backed action read. v1 `getAction` delegates to it.
+    pub fn lookupAction(store: *Store, io: Io, gpa: std.mem.Allocator, key: Digest) action_cache.GetError!?action_cache.ActionEntry {
+        return action_cache.getAction(io, gpa, store.dir, key, &store.index);
     }
 
     pub fn getAction(store: *Store, io: Io, gpa: std.mem.Allocator, key: Digest) action_cache.GetError!?action_cache.ActionEntry {
-        return action_cache.getAction(io, gpa, store.dir, key);
+        return store.lookupAction(io, gpa, key);
     }
 
     pub const Tag = tags_mod.Tag;

@@ -4,6 +4,7 @@ const layout = @import("layout.zig");
 const digest_mod = @import("digest.zig");
 const test_support = @import("test_support.zig");
 const objects = @import("objects.zig");
+const index_mod = @import("index.zig");
 
 const Io = std.Io;
 
@@ -24,7 +25,9 @@ fn entryFull(key: digest_mod.Digest, buf: *[73]u8) []const u8 {
     return buf[0..73];
 }
 
-pub fn putAction(io: Io, store_dir: Io.Dir, key: digest_mod.Digest, manifest: digest_mod.Digest, now_ms: i64) PutError!void {
+/// Write-through (Plan B Task 6): the flat file stays until Task 12, and
+/// the `actions` table row is written in the same call (best-effort).
+pub fn putAction(io: Io, store_dir: Io.Dir, key: digest_mod.Digest, manifest: digest_mod.Digest, now_ms: i64, idx: *index_mod.Index) PutError!void {
     var full_buf: [73]u8 = undefined;
     const full = entryFull(key, &full_buf);
     const hex = manifest.toHex();
@@ -34,9 +37,38 @@ pub fn putAction(io: Io, store_dir: Io.Dir, key: digest_mod.Digest, manifest: di
     }, .{}) catch return error.OutOfMemory;
     defer std.heap.page_allocator.free(bytes);
     try writeEntryAtomic(io, store_dir, full, bytes);
+    const ahex = key.toHex();
+    index_mod.insertAction(idx, &ahex, hex[0..], now_ms) catch {};
 }
 
-pub fn getAction(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir, key: digest_mod.Digest) GetError!?ActionEntry {
+/// Index-first read; filesystem fallback with re-index on file hit
+/// (self-heal for pre-mirror entries). Stale rows (manifest gone) are left
+/// for the gc sweep — same contract as the v1 file path.
+pub fn getAction(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir, key: digest_mod.Digest, idx: *index_mod.Index) GetError!?ActionEntry {
+    const ahex = key.toHex();
+    if (index_mod.getAction(idx, gpa, &ahex)) |row| {
+        if (row) |r| {
+            defer gpa.free(r.manifest_digest);
+            return .{
+                .manifest = digest_mod.Digest.fromHex(r.manifest_digest) catch return error.Unexpected,
+                .created_ms = r.created_ms,
+            };
+        }
+    } else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return error.Canceled,
+        else => {},
+    }
+    const entry = try readFileEntry(io, gpa, store_dir, key);
+    if (entry) |e| {
+        const hex = e.manifest.toHex();
+        index_mod.insertAction(idx, &ahex, hex[0..], e.created_ms) catch {};
+    }
+    return entry;
+}
+
+/// File-only read for the stale sweep (sweep keeps filesystem behavior).
+fn readFileEntry(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir, key: digest_mod.Digest) GetError!?ActionEntry {
     var full_buf: [73]u8 = undefined;
     const full = entryFull(key, &full_buf);
     const bytes = store_dir.readFileAlloc(io, full, gpa, .unlimited) catch |err| switch (err) {
@@ -54,14 +86,17 @@ pub fn getAction(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir, key: digest_
 }
 
 /// Deletes entries whose manifest object no longer exists. Returns count.
+/// Removes the flat file and the index row together so table-first reads
+/// stay consistent with the sweep.
 pub fn sweepStale(
     io: Io,
     gpa: std.mem.Allocator,
     store_dir: Io.Dir,
     is_present: *const fn (ctx: *anyopaque, d: digest_mod.Digest) bool,
     ctx: *anyopaque,
+    idx: *index_mod.Index,
 ) SweepError!u64 {
-    return sweepInner(io, gpa, store_dir, is_present, ctx, true);
+    return sweepInner(io, gpa, store_dir, is_present, ctx, true, idx);
 }
 
 /// Counts stale entries without deleting them. Dry-run counterpart to
@@ -73,8 +108,9 @@ pub fn countStale(
     store_dir: Io.Dir,
     is_present: *const fn (ctx: *anyopaque, d: digest_mod.Digest) bool,
     ctx: *anyopaque,
+    idx: *index_mod.Index,
 ) SweepError!u64 {
-    return sweepInner(io, gpa, store_dir, is_present, ctx, false);
+    return sweepInner(io, gpa, store_dir, is_present, ctx, false, idx);
 }
 
 fn sweepInner(
@@ -84,6 +120,7 @@ fn sweepInner(
     is_present: *const fn (ctx: *anyopaque, d: digest_mod.Digest) bool,
     ctx: *anyopaque,
     delete_stale: bool,
+    idx: *index_mod.Index,
 ) SweepError!u64 {
     var removed: u64 = 0;
     const top = store_dir.openDir(io, layout.actions_dir, .{ .iterate = true }) catch return error.Unexpected;
@@ -104,14 +141,18 @@ fn sweepInner(
             const key = digest_mod.Digest.fromHex(hex_buf[0..64]) catch continue;
             // Corrupt entries must not abort the sweep (or gc); skip them
             // like other unreadable state files. Propagate OOM/cancel.
-            const got = getAction(io, gpa, store_dir, key) catch |err| switch (err) {
+            const got = readFileEntry(io, gpa, store_dir, key) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,
                 error.Unexpected => continue,
             };
             const e = got orelse continue;
             if (is_present(ctx, e.manifest)) continue;
-            if (delete_stale) sub.deleteFile(io, entry.name) catch {};
+            if (delete_stale) {
+                sub.deleteFile(io, entry.name) catch {};
+                const ahex = key.toHex();
+                index_mod.deleteAction(idx, &ahex) catch {};
+            }
             removed += 1;
         }
     }
@@ -185,7 +226,7 @@ test "sweepStale skips corrupt entries without aborting" {
     try ts.store.dir.writeFile(io, .{ .sub_path = corrupt_path, .data = "{not json" });
 
     var cb = ExistsCtx{ .store = &ts.store, .io = io };
-    const removed = try sweepStale(io, gpa, ts.store.dir, ExistsCtx.call, &cb);
+    const removed = try sweepStale(io, gpa, ts.store.dir, ExistsCtx.call, &cb, &ts.store.index);
     try std.testing.expectEqual(@as(u64, 1), removed);
     try std.testing.expect((try ts.store.getAction(io, gpa, stale_key)) == null);
 }
@@ -210,7 +251,21 @@ test "sweepStale removes entries whose manifest object is gone" {
     try ts.store.dir.deleteFile(io, full_buf[0..73]);
 
     var cb = ExistsCtx{ .store = &ts.store, .io = io };
-    const removed = try sweepStale(io, gpa, ts.store.dir, ExistsCtx.call, &cb);
+    const removed = try sweepStale(io, gpa, ts.store.dir, ExistsCtx.call, &cb, &ts.store.index);
     try std.testing.expectEqual(@as(u64, 1), removed);
     try std.testing.expect((try ts.store.getAction(io, gpa, key)) == null);
+}
+
+test "action entries survive through the index mirror" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = std.testing.allocator;
+    var ts = test_support.openTestStore(io, .{});
+    defer ts.deinit(io);
+
+    const man = try ts.store.putBytes(io, "manifest-body", .manifest);
+    const key = root.hashBytes("action-key");
+    try ts.store.putAction(io, key, man);
+    const got = try ts.store.getAction(io, gpa, key);
+    try std.testing.expect(got != null);
+    try std.testing.expectEqual(man.bytes, got.?.manifest.bytes);
 }

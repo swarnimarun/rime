@@ -9,6 +9,7 @@ const layout = @import("layout.zig");
 const manifest_mod = @import("manifest.zig");
 const disk_usage = @import("disk_usage.zig");
 const digest_mod = @import("digest.zig");
+const index_mod = @import("index.zig");
 
 const Io = std.Io;
 
@@ -89,9 +90,9 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
     // Dry runs count stale entries without deleting them.
     var present_cb = PresentCtx{ .store = store, .io = io };
     report.stale_action_entries = if (policy.dry_run)
-        try action_cache.countStale(io, gpa, store.dir, PresentCtx.call, &present_cb)
+        try action_cache.countStale(io, gpa, store.dir, PresentCtx.call, &present_cb, &store.index)
     else
-        try action_cache.sweepStale(io, gpa, store.dir, PresentCtx.call, &present_cb);
+        try action_cache.sweepStale(io, gpa, store.dir, PresentCtx.call, &present_cb, &store.index);
 
     const infos = try scan.scan(store, io, gpa);
     defer gpa.free(infos);
@@ -399,6 +400,12 @@ fn evict(store: *root.Store, io: Io, report: *GcReport, obj: scan.ObjectInfo, dr
         error.FileNotFound => return, // raced with another GC or the owner
         else => return error.Unexpected,
     };
+    // Index mirror (Plan B Task 6): the row dies with the bytes (cascading
+    // tag rows with it). Best-effort — bytes are authoritative.
+    {
+        const hex = obj.digest.toHex();
+        index_mod.deleteObject(&store.index, &hex) catch {};
+    }
     report.evicted_objects += 1;
     switch (obj.tier) {
         .hot => report.freed_bytes_hot += obj.size,
@@ -626,7 +633,7 @@ test "gc counts and expires leases" {
 
     const d = try ts.store.putBytes(io, "leased", .other);
     // Expired relative to gc wall clock (1970 + TTL vs now).
-    try state.putLease(io, ts.store.dir, "old-build", &.{d}, 1000);
+    try state.putLease(io, ts.store.dir, "old-build", &.{d}, 1000, &ts.store.index);
     const report = try ts.store.gc(io, gpa, .{});
     try std.testing.expectEqual(@as(u64, 1), report.expired_leases);
     const remaining = try state.liveLeases(io, gpa, ts.store.dir, std.Io.Timestamp.now(io, .real).toMilliseconds());
@@ -643,7 +650,7 @@ test "dry run counts expiry without deleting leases or actions" {
 
     const a = try ts.store.putBytes(io, "doomed", .other);
     // Expired lease (1970 + TTL vs wall clock now).
-    try state.putLease(io, ts.store.dir, "old-build", &.{a}, 1000);
+    try state.putLease(io, ts.store.dir, "old-build", &.{a}, 1000, &ts.store.index);
 
     // Stale action entry: manifest object deleted behind its back.
     var no_outputs: [0]root.Store.ManifestOutput = .{};

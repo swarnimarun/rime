@@ -3,6 +3,7 @@ const root = @import("root.zig");
 const layout = @import("layout.zig");
 const digest_mod = @import("digest.zig");
 const test_support = @import("test_support.zig");
+const index_mod = @import("index.zig");
 
 const Io = std.Io;
 
@@ -22,7 +23,86 @@ pub const ScanError = error{Unexpected, OutOfMemory} || Io.Cancelable ||
 
 /// Enumerates both tiers. Journal-less objects get kind `.other` (spec §5.2:
 /// kind is best-effort performance metadata, never correctness).
+///
+/// Index-first (Plan B Task 6): object rows are served from the index when
+/// present, with each digest's file verified in either tier. Values are
+/// identical to the filesystem walk — tier/size/mtime come from the stat
+/// (bytes are authoritative, decision D4), kind comes from the index row
+/// (parsed via `stringToEnum`, `.other` fallback) instead of the journal.
+/// Digests indexed but missing on disk self-heal by row delete. When the
+/// index holds no rows but the walk finds objects (pre-migration store),
+/// the walk results are returned and every found object is upserted so the
+/// next scan hits the index path. The `scanTier`/`loadKinds` walk below is
+/// kept untouched as that fallback.
 pub fn scan(store: *root.Store, io: Io, gpa: std.mem.Allocator) ScanError![]ObjectInfo {
+    if (scanIndex(store, io, gpa)) |maybe| {
+        if (maybe) |infos| return infos;
+    } else |_| {}
+    return scanFilesystem(store, io, gpa);
+}
+
+/// Index path. Returns null when the index is empty (caller falls back to
+/// the walk) or unreadable (bytes stay authoritative). Only OutOfMemory and
+/// cancellation propagate; every other index error falls back to the walk.
+fn scanIndex(store: *root.Store, io: Io, gpa: std.mem.Allocator) (error{OutOfMemory} || Io.Cancelable)!?[]ObjectInfo {
+    const rows = index_mod.lruCandidates(&store.index, gpa, null, 1_000_000) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return error.Canceled,
+        else => return null,
+    };
+    defer index_mod.freeRows(gpa, rows);
+    if (rows.len == 0) return null;
+
+    var list: std.ArrayList(ObjectInfo) = .empty;
+    errdefer list.deinit(gpa);
+    for (rows) |r| {
+        const d = digest_mod.Digest.fromHex(&r.digest) catch continue;
+        // Authoritative stat: tier/size/mtime from the file that exists.
+        // mtime_ms stays file-based (v1 §9.2 touch/age semantics): demote
+        // and promote mint fresh files without bumping the index row, so
+        // the file is the correct access-age source on this path.
+        const found = statEitherTier(store, io, d) catch continue;
+        if (found == null) {
+            index_mod.deleteObject(&store.index, &r.digest) catch {};
+            continue;
+        }
+        try list.append(gpa, .{
+            .digest = d,
+            .tier = found.?.tier,
+            .size = found.?.size,
+            .mtime_ms = found.?.mtime_ms,
+            .kind = std.meta.stringToEnum(root.Kind, r.kind) orelse .other,
+        });
+    }
+    return try list.toOwnedSlice(gpa);
+}
+
+const TierStat = struct { tier: Tier, size: u64, mtime_ms: i64 };
+
+/// Stats the hot copy first, then the cold copy. Null when neither exists.
+fn statEitherTier(store: *root.Store, io: Io, d: digest_mod.Digest) ScanError!?TierStat {
+    var rbuf: [65]u8 = undefined;
+    const rel = d.relPath(&rbuf);
+    var hot_buf: [73]u8 = undefined;
+    @memcpy(hot_buf[0..8], "objects/");
+    @memcpy(hot_buf[8..], rel);
+    if (store.dir.statFile(io, hot_buf[0..73], .{})) |st| {
+        return .{ .tier = .hot, .size = st.size, .mtime_ms = st.mtime.toMilliseconds() };
+    } else |_| {}
+    var cold_buf: [70]u8 = undefined;
+    @memcpy(cold_buf[0..5], "cold/");
+    @memcpy(cold_buf[5..70], rel);
+    if (store.dir.statFile(io, cold_buf[0..70], .{})) |st| {
+        return .{ .tier = .cold, .size = st.size, .mtime_ms = st.mtime.toMilliseconds() };
+    } else |_| {}
+    return null;
+}
+
+/// Filesystem walk with index backfill: every found object is upserted
+/// (file mtime seeds `last_access_ms` so ages survive migration; cold rows
+/// record the on-disk (compressed) size in both size fields as the
+/// uncompressed size is unknowable from the walk).
+fn scanFilesystem(store: *root.Store, io: Io, gpa: std.mem.Allocator) ScanError![]ObjectInfo {
     var kinds = try loadKinds(store, io, gpa);
     defer kinds.deinit();
 
@@ -31,6 +111,18 @@ pub fn scan(store: *root.Store, io: Io, gpa: std.mem.Allocator) ScanError![]Obje
 
     try scanTier(io, gpa, store.dir, layout.objects_dir, .hot, &kinds, &list);
     try scanTier(io, gpa, store.dir, layout.cold_dir, .cold, &kinds, &list);
+    for (list.items) |obj| {
+        const hex = obj.digest.toHex();
+        index_mod.upsertObject(&store.index, .{
+            .digest = hex,
+            .size = obj.size,
+            .compressed_size = if (obj.tier == .cold) obj.size else null,
+            .tier = if (obj.tier == .hot) .hot else .cold,
+            .kind = @tagName(obj.kind),
+            .created_ms = obj.mtime_ms,
+            .last_access_ms = obj.mtime_ms,
+        }) catch {};
+    }
     return try list.toOwnedSlice(gpa);
 }
 
@@ -167,4 +259,23 @@ test "touch refreshes mtime only after the throttle interval" {
     ts.store.touch(io, d);
     const st = try ts.store.dir.statFile(io, objectFull(d, &buf), .{});
     try std.testing.expect(st.mtime.toMilliseconds() > 60_000);
+}
+
+test "scan serves indexed objects (index row present; fallback disabled)" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = std.testing.allocator;
+    var ts = test_support.openTestStore(io, .{});
+    defer ts.deinit(io);
+
+    const d = try ts.store.putBytes(io, "indexed", .rlib);
+    // Failing-first gate: the index row must exist (proves the ingest mirror ran).
+    const hex = d.toHex();
+    const row = try index_mod.getObject(&ts.store.index, gpa, &hex);
+    try std.testing.expect(row != null);
+    if (row) |r| gpa.free(r.kind);
+    const infos = try ts.store.scan(io, gpa);
+    defer gpa.free(infos);
+    try std.testing.expectEqual(@as(usize, 1), infos.len);
+    try std.testing.expectEqual(d.bytes, infos[0].digest.bytes);
+    try std.testing.expectEqual(root.Kind.rlib, infos[0].kind);
 }

@@ -317,6 +317,154 @@ pub fn getObject(idx: *Index, gpa: std.mem.Allocator, digest: *const [64]u8) DbE
     };
 }
 
+/// One `INSERT OR REPLACE INTO actions(action_key, manifest_digest, created_ms)`
+/// prepared statement. Manifest digests are hints (§5.3): no FK, stale rows
+/// are found by absence.
+pub fn insertAction(idx: *Index, action_key: *const [64]u8, manifest_digest: []const u8, created_ms: i64) DbError!void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db,
+        "INSERT OR REPLACE INTO actions(action_key,manifest_digest,created_ms) VALUES(?1,?2,?3);",
+        -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, action_key);
+    bindText(stmt, 2, manifest_digest);
+    _ = c.sqlite3_bind_int64(stmt, 3, created_ms);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
+pub fn deleteAction(idx: *Index, action_key: *const [64]u8) DbError!void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db, "DELETE FROM actions WHERE action_key=?1;", -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, action_key);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
+pub const ActionRow = struct { manifest_digest: []u8, created_ms: i64 };
+
+/// Null when the action key is not indexed. Caller frees `row.manifest_digest`.
+pub fn getAction(idx: *Index, gpa: std.mem.Allocator, action_key: *const [64]u8) DbError!?ActionRow {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db,
+        "SELECT manifest_digest,created_ms FROM actions WHERE action_key=?1;",
+        -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, action_key);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+    return ActionRow{
+        .manifest_digest = try gpa.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 0))),
+        .created_ms = c.sqlite3_column_int64(stmt, 1),
+    };
+}
+
+/// Pins mirror: JSON stays authoritative (decision D4); the row is rewritten
+/// in the same call. No children, so REPLACE is cascade-safe.
+pub fn insertPin(idx: *Index, name: []const u8, digest_hex: []const u8, created_ms: i64) DbError!void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db,
+        "INSERT OR REPLACE INTO pins(name,digest,created_ms) VALUES(?1,?2,?3);",
+        -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, name);
+    bindText(stmt, 2, digest_hex);
+    _ = c.sqlite3_bind_int64(stmt, 3, created_ms);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
+pub fn deletePin(idx: *Index, name: []const u8) DbError!void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db, "DELETE FROM pins WHERE name=?1;", -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, name);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
+/// Lease mirror. Callers always follow `insertLease` with a full member
+/// rewrite (`deleteLeaseObjects` + one `insertLeaseObject` per member):
+/// REPLACE on the parent would cascade-wipe members, so the member list is
+/// re-asserted in the same call and never trusted across calls.
+pub fn insertLease(idx: *Index, build_id: []const u8, expires_ms: i64) DbError!void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db,
+        "INSERT OR REPLACE INTO leases(build_id,expires_ms) VALUES(?1,?2);",
+        -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, build_id);
+    _ = c.sqlite3_bind_int64(stmt, 2, expires_ms);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
+pub fn deleteLease(idx: *Index, build_id: []const u8) DbError!void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db, "DELETE FROM leases WHERE build_id=?1;", -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, build_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
+pub fn insertLeaseObject(idx: *Index, build_id: []const u8, digest_hex: []const u8) DbError!void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db,
+        "INSERT OR IGNORE INTO lease_objects(build_id,digest) VALUES(?1,?2);",
+        -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, build_id);
+    bindText(stmt, 2, digest_hex);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
+pub fn deleteLeaseObjects(idx: *Index, build_id: []const u8) DbError!void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db, "DELETE FROM lease_objects WHERE build_id=?1;", -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, build_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
+/// Retain mirror: same full-rewrite discipline as leases (REPLACE the parent,
+/// then re-assert every member row in the same call).
+pub fn insertRetain(idx: *Index, project_id: []const u8, updated_ms: i64) DbError!void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db,
+        "INSERT OR REPLACE INTO retains(project_id,updated_ms) VALUES(?1,?2);",
+        -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, project_id);
+    _ = c.sqlite3_bind_int64(stmt, 2, updated_ms);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
+pub fn insertRetainManifest(idx: *Index, project_id: []const u8, manifest_hex: []const u8) DbError!void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db,
+        "INSERT OR IGNORE INTO retain_manifests(project_id,manifest) VALUES(?1,?2);",
+        -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, project_id);
+    bindText(stmt, 2, manifest_hex);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
+pub fn deleteRetainManifests(idx: *Index, project_id: []const u8) DbError!void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db, "DELETE FROM retain_manifests WHERE project_id=?1;", -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, project_id);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
 test "index opens inside a store dir and creates the schema" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{});

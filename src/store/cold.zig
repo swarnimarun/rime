@@ -3,6 +3,7 @@ const root = @import("root.zig");
 const layout = @import("layout.zig");
 const digest_mod = @import("digest.zig");
 const test_support = @import("test_support.zig");
+const index_mod = @import("index.zig");
 
 const Io = std.Io;
 const flate = std.compress.flate;
@@ -70,6 +71,12 @@ pub fn demote(store: *root.Store, io: Io, digest: digest_mod.Digest) ColdError!v
         defer cf.close(io);
         try cf.setPermissions(io, .fromMode(0o444));
     }
+    // Index mirror (Plan B Task 6): tier column follows the bytes, counting
+    // the compressed size. Best-effort — bytes are authoritative.
+    {
+        const hex = digest.toHex();
+        index_mod.setTier(&store.index, &hex, .cold, @intCast(z.len)) catch {};
+    }
 
     store.dir.deleteFile(io, hot_full) catch {};
 }
@@ -101,6 +108,11 @@ pub fn promote(store: *root.Store, io: Io, digest: digest_mod.Digest) ColdError!
         const hf = try store.dir.openFile(io, hot_full, .{});
         defer hf.close(io);
         try hf.setPermissions(io, .fromMode(0o444));
+    }
+    // Index mirror: back to hot, no compressed copy. Best-effort.
+    {
+        const hex = digest.toHex();
+        index_mod.setTier(&store.index, &hex, .hot, null) catch {};
     }
     store.dir.deleteFile(io, cold_full) catch {};
 }

@@ -3,6 +3,7 @@ const root = @import("root.zig");
 const layout = @import("layout.zig");
 const digest_mod = @import("digest.zig");
 const test_support = @import("test_support.zig");
+const index_mod = @import("index.zig");
 
 const Io = std.Io;
 const Digest = digest_mod.Digest;
@@ -16,6 +17,26 @@ pub const PutError = error{
 const object_mode: Io.File.Permissions = .fromMode(0o444);
 const store_gpa = std.heap.page_allocator;
 
+/// Index mirror (Plan B Task 6): every published object gets an `objects` row
+/// (hot tier, `created_ms = last_access_ms = now`). Best-effort: the bytes
+/// are authoritative, the index rebuildable, so ingest never fails on index
+/// errors. Dedup fast paths re-upsert (refreshing size/tier/kind and
+/// `last_access_ms`); the upsert doubles as self-heal for rows lost to a
+/// deleted or pre-index store.
+fn indexUpsert(store: *root.Store, io: Io, d: Digest, size: u64, kind: root.Kind) void {
+    const now_ms = Io.Timestamp.now(io, .real).toMilliseconds();
+    const hex = d.toHex();
+    index_mod.upsertObject(&store.index, .{
+        .digest = hex,
+        .size = size,
+        .compressed_size = null,
+        .tier = .hot,
+        .kind = @tagName(kind),
+        .created_ms = now_ms,
+        .last_access_ms = now_ms,
+    }) catch {};
+}
+
 /// Publishes `bytes` as an immutable object. Idempotent: if the object
 /// already exists the temp file is discarded. Spec §8.1.
 pub fn putBytes(store: *root.Store, io: Io, bytes: []const u8, kind: root.Kind) PutError!Digest {
@@ -26,8 +47,9 @@ pub fn putBytes(store: *root.Store, io: Io, bytes: []const u8, kind: root.Kind) 
 
     // Fast path: already present. A dedup hit is a cache hit: refresh LRU
     // (spec §9.2) instead of rewriting identical bytes.
-    if (store.dir.statFile(io, full, .{})) |_| {
+    if (store.dir.statFile(io, full, .{})) |st| {
         store.touch(io, d);
+        indexUpsert(store, io, d, st.size, kind);
         return d;
     } else |err| switch (err) {
         error.FileNotFound => {},
@@ -40,8 +62,9 @@ pub fn putBytes(store: *root.Store, io: Io, bytes: []const u8, kind: root.Kind) 
         error.OutOfMemory => return error.OutOfMemory,
         else => {},
     };
-    if (store.dir.statFile(io, full, .{})) |_| {
+    if (store.dir.statFile(io, full, .{})) |st| {
         store.touch(io, d);
+        indexUpsert(store, io, d, st.size, kind);
         return d;
     } else |err| switch (err) {
         error.FileNotFound => {},
@@ -56,6 +79,7 @@ pub fn putBytes(store: *root.Store, io: Io, bytes: []const u8, kind: root.Kind) 
     try tmp.setPermissions(io, object_mode);
     try publish(store, io, tmp_name, full);
     try recordKind(store, io, d, kind);
+    indexUpsert(store, io, d, bytes.len, kind);
     return d;
 }
 
@@ -99,9 +123,10 @@ pub fn putFile(store: *root.Store, io: Io, src: Io.File, kind: root.Kind) PutErr
             else => {}, // absent/unreadable cold copy; publish below
         };
     }
-    if (store.dir.statFile(io, full, .{})) |_| {
+    if (store.dir.statFile(io, full, .{})) |st| {
         store.dir.deleteFile(io, tmp_name) catch {};
         store.touch(io, d);
+        indexUpsert(store, io, d, st.size, kind);
         return d;
     } else |err| switch (err) {
         error.FileNotFound => {},
@@ -109,6 +134,7 @@ pub fn putFile(store: *root.Store, io: Io, src: Io.File, kind: root.Kind) PutErr
     }
     try publish(store, io, tmp_name, full);
     try recordKind(store, io, d, kind);
+    indexUpsert(store, io, d, offset, kind);
     return d;
 }
 

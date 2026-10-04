@@ -3,6 +3,7 @@ const root = @import("root.zig");
 const digest_mod = @import("digest.zig");
 const layout = @import("layout.zig");
 const test_support = @import("test_support.zig");
+const index_mod = @import("index.zig");
 
 const Io = std.Io;
 
@@ -44,7 +45,7 @@ fn subPathAlloc(comptime dir_suffix: []const u8, name: []const u8, suffix: []con
     return std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}/{s}{s}", .{ layout.state_dir, dir_suffix, name, suffix }) catch return error.OutOfMemory;
 }
 
-pub fn putPin(io: Io, store_dir: Io.Dir, name: []const u8, digest: digest_mod.Digest, now_ms: i64) StateError!void {
+pub fn putPin(io: Io, store_dir: Io.Dir, name: []const u8, digest: digest_mod.Digest, now_ms: i64, idx: *index_mod.Index) StateError!void {
     const hex = digest.toHex();
     const bytes = std.json.Stringify.valueAlloc(std.heap.page_allocator, PinJson{
         .name = name,
@@ -55,15 +56,20 @@ pub fn putPin(io: Io, store_dir: Io.Dir, name: []const u8, digest: digest_mod.Di
     const sub = try subPathAlloc("pins", name, "");
     defer std.heap.page_allocator.free(sub);
     try writeJsonAtomic(io, store_dir, sub, bytes);
+    // Index mirror (Plan B Task 6): the JSON file stays authoritative
+    // (decision D4); the row is rewritten in the same call. Best-effort —
+    // bytes/roots files win over the index on any failure.
+    index_mod.insertPin(idx, name, hex[0..], now_ms) catch {};
 }
 
-pub fn removePin(io: Io, store_dir: Io.Dir, name: []const u8) StateError!void {
+pub fn removePin(io: Io, store_dir: Io.Dir, name: []const u8, idx: *index_mod.Index) StateError!void {
     const sub = try subPathAlloc("pins", name, "");
     defer std.heap.page_allocator.free(sub);
     store_dir.deleteFile(io, sub) catch |err| switch (err) {
         error.FileNotFound => return error.NoSuchPin,
         else => return error.Unexpected,
     };
+    index_mod.deletePin(idx, name) catch {};
 }
 
 pub fn listPins(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir) StateError![]Pin {
@@ -117,7 +123,7 @@ pub fn freePins(gpa: std.mem.Allocator, pins: []Pin) void {
     gpa.free(pins);
 }
 
-pub fn putLease(io: Io, store_dir: Io.Dir, build_id: []const u8, digests: []const digest_mod.Digest, now_ms: i64) StateError!void {
+pub fn putLease(io: Io, store_dir: Io.Dir, build_id: []const u8, digests: []const digest_mod.Digest, now_ms: i64, idx: *index_mod.Index) StateError!void {
     const page = std.heap.page_allocator;
     const hexes = page.alloc([]const u8, digests.len) catch return error.OutOfMemory;
     var done: usize = 0;
@@ -139,15 +145,24 @@ pub fn putLease(io: Io, store_dir: Io.Dir, build_id: []const u8, digests: []cons
     const sub = try subPathAlloc("leases", build_id, "");
     defer page.free(sub);
     try writeJsonAtomic(io, store_dir, sub, bytes);
+    // Full member rewrite in the same call (REPLACE-safe: the member list
+    // is re-asserted, never trusted across calls).
+    mirrorLease(idx, build_id, hexes, now_ms + lease_ttl_ms);
 }
 
-pub fn renewLease(io: Io, store_dir: Io.Dir, build_id: []const u8, now_ms: i64) StateError!void {
+fn mirrorLease(idx: *index_mod.Index, build_id: []const u8, hexes: []const []const u8, expires_ms: i64) void {
+    index_mod.insertLease(idx, build_id, expires_ms) catch {};
+    index_mod.deleteLeaseObjects(idx, build_id) catch {};
+    for (hexes) |h| index_mod.insertLeaseObject(idx, build_id, h) catch {};
+}
+
+pub fn renewLease(io: Io, store_dir: Io.Dir, build_id: []const u8, now_ms: i64, idx: *index_mod.Index) StateError!void {
     const page = std.heap.page_allocator;
     const sub = try subPathAlloc("leases", build_id, "");
     defer page.free(sub);
     const bytes = store_dir.readFileAlloc(io, sub, page, .unlimited) catch |err| switch (err) {
         // No lease yet: write a fresh one carrying only the build id.
-        error.FileNotFound => return putLease(io, store_dir, build_id, &.{}, now_ms),
+        error.FileNotFound => return putLease(io, store_dir, build_id, &.{}, now_ms, idx),
         else => return error.Unexpected,
     };
     defer page.free(bytes);
@@ -160,9 +175,11 @@ pub fn renewLease(io: Io, store_dir: Io.Dir, build_id: []const u8, now_ms: i64) 
     }, .{}) catch return error.OutOfMemory;
     defer page.free(out);
     try writeJsonAtomic(io, store_dir, sub, out);
+    // Full rewrite (not UPDATE): the row may predate the mirror.
+    mirrorLease(idx, build_id, parsed.value.digest_hexes, now_ms + lease_ttl_ms);
 }
 
-pub fn dropLease(io: Io, store_dir: Io.Dir, build_id: []const u8) StateError!void {
+pub fn dropLease(io: Io, store_dir: Io.Dir, build_id: []const u8, idx: *index_mod.Index) StateError!void {
     const sub = try subPathAlloc("leases", build_id, "");
     defer std.heap.page_allocator.free(sub);
     // Idempotent: dropping an absent lease is a no-op.
@@ -170,6 +187,7 @@ pub fn dropLease(io: Io, store_dir: Io.Dir, build_id: []const u8) StateError!voi
         error.FileNotFound => {},
         else => return error.Unexpected,
     };
+    index_mod.deleteLease(idx, build_id) catch {}; // cascades to lease_objects
 }
 
 /// Returns live leases, deleting expired lease files as a side effect.
@@ -268,7 +286,7 @@ pub fn freeLeases(gpa: std.mem.Allocator, leases: []Lease) void {
     gpa.free(leases);
 }
 
-pub fn putRetain(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir, project_id: []const u8, manifests: []const digest_mod.Digest, now_ms: i64) StateError!void {
+pub fn putRetain(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir, project_id: []const u8, manifests: []const digest_mod.Digest, now_ms: i64, idx: *index_mod.Index) StateError!void {
     const page = std.heap.page_allocator;
     const hexes = gpa.alloc([]const u8, manifests.len) catch return error.OutOfMemory;
     var done: usize = 0;
@@ -290,6 +308,10 @@ pub fn putRetain(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir, project_id: 
     const sub = try subPathAlloc("projects", project_id, ".json");
     defer page.free(sub);
     try writeJsonAtomic(io, store_dir, sub, bytes);
+    // Full member rewrite in the same call (same REPLACE discipline as leases).
+    index_mod.insertRetain(idx, project_id, now_ms) catch {};
+    index_mod.deleteRetainManifests(idx, project_id) catch {};
+    for (hexes) |h| index_mod.insertRetainManifest(idx, project_id, h) catch {};
 }
 
 pub fn listRetains(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir) StateError![]ProjectRetain {
@@ -356,13 +378,13 @@ test "pins round trip and remove" {
     defer ts.deinit(io);
 
     const d = root.hashBytes("pinned");
-    try putPin(io, ts.store.dir, "corpus", d, 1000);
+    try putPin(io, ts.store.dir, "corpus", d, 1000, &ts.store.index);
     const pins = try listPins(io, gpa, ts.store.dir);
     defer freePins(gpa, pins);
     try std.testing.expectEqual(@as(usize, 1), pins.len);
     try std.testing.expectEqualStrings("corpus", pins[0].name);
 
-    try removePin(io, ts.store.dir, "corpus");
+    try removePin(io, ts.store.dir, "corpus", &ts.store.index);
     const none = try listPins(io, gpa, ts.store.dir);
     defer freePins(gpa, none);
     try std.testing.expectEqual(@as(usize, 0), none.len);
@@ -375,7 +397,7 @@ test "leases expire by wall clock" {
     defer ts.deinit(io);
 
     const d = root.hashBytes("leased");
-    try putLease(io, ts.store.dir, "build-1", &.{d}, 1000);
+    try putLease(io, ts.store.dir, "build-1", &.{d}, 1000, &ts.store.index);
 
     // Still live one minute after creation (lease TTL is 2 h).
     const live = try liveLeases(io, gpa, ts.store.dir, 1000 + 60 * 1000);
@@ -395,7 +417,7 @@ test "retains record project manifests" {
     defer ts.deinit(io);
 
     const m = root.hashBytes("manifest");
-    try putRetain(io, gpa, ts.store.dir, "proj1", &.{m}, 42);
+    try putRetain(io, gpa, ts.store.dir, "proj1", &.{m}, 42, &ts.store.index);
     const rs = try listRetains(io, gpa, ts.store.dir);
     defer freeRetains(gpa, rs);
     try std.testing.expectEqual(@as(usize, 1), rs.len);
