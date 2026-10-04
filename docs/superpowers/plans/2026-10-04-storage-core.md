@@ -46,10 +46,13 @@ concern; `Store.gc` is the primitive.
   **1 h**; `cold_after` **7 d**; `max_age` **90 d**; lease TTL **2 h**;
   `incremental_limit` **4 GiB** per project; `incremental_max_age` **5 d**.
 - Platforms: macOS and Linux. `else => @compileError` in platform shims.
-- Commits (repo is colocated git + jj; commands below use git, jj equivalents
-  fine): summary ≤50 chars, imperative, capitalized, no trailing period, no
-  Conventional-Commit prefixes. Body wrapped at ≤72 chars when needed. One
-  logical change per commit.
+- All VCS operations use **jj** (the repo is jj-managed, colocated with git):
+  `jj status`, `jj log`, `jj diff`, `jj commit <paths> -m "…"`, `jj describe`,
+  `jj new`. Never run git write commands (`git add`, `git commit`, …) and never
+  `jj git push`. `jj` auto-snapshots the working copy; `.gitignore` covers
+  `.zig-cache/`, `zig-out/`, `.pi-subagents/`. Commit summaries: ≤50 chars,
+  imperative, capitalized, no trailing period, no Conventional-Commit prefixes.
+  Body wrapped at ≤72 chars when needed. One logical change per commit.
 - Scratch experiments go in `/tmp`, never in the repo. The repo contains only
   `build.zig`, `build.zig.zon`, `src/`, `docs/`, README.
 - Digest text form is `b3-<64 lowercase hex>` in all user-facing output;
@@ -275,8 +278,7 @@ Expected: tests pass (3 tests, exit 0); binary prints `rime storage core <64-hex
 - [ ] **Step 7: Commit**
 
 ```bash
-git add build.zig build.zig.zon src/
-git commit -m "Add project skeleton and digest module"
+jj commit build.zig build.zig.zon src/ -m "Add project skeleton and digest module"
 ```
 
 ---
@@ -506,8 +508,7 @@ Expected: all tests pass, including `disk usage is sane on the real filesystem`.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/config.zig src/store/disk_usage.zig src/store/root.zig
-git commit -m "Add config limits and disk usage shim"
+jj commit src/store/config.zig src/store/disk_usage.zig src/store/root.zig -m "Add config limits and disk usage shim"
 ```
 
 ---
@@ -756,8 +757,7 @@ Expected: all tests pass. The two new Store tests pass (the second expects
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/layout.zig src/store/test_support.zig src/store/root.zig
-git commit -m "Add store layout and open close lifecycle"
+jj commit src/store/layout.zig src/store/test_support.zig src/store/root.zig -m "Add store layout and open close lifecycle"
 ```
 
 ---
@@ -986,8 +986,7 @@ Task 5 — keep the `or true` form exactly as written there.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/ingest.zig src/store/root.zig
-git commit -m "Add atomic object ingest with dedup"
+jj commit src/store/ingest.zig src/store/root.zig -m "Add atomic object ingest with dedup"
 ```
 
 ---
@@ -1123,8 +1122,7 @@ Expected: all tests pass, including the corruption-detection test.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/objects.zig src/store/root.zig src/store/ingest.zig
-git commit -m "Add object read and integrity verification"
+jj commit src/store/objects.zig src/store/root.zig src/store/ingest.zig -m "Add object read and integrity verification"
 ```
 
 ---
@@ -1278,8 +1276,7 @@ Expected: all tests pass (both manifest tests).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/manifest.zig src/store/root.zig
-git commit -m "Add output manifests and store round trip"
+jj commit src/store/manifest.zig src/store/root.zig -m "Add output manifests and store round trip"
 ```
 
 ---
@@ -1532,8 +1529,7 @@ valid outcomes; the assertions accept either.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/clone.zig src/store/materialize.zig src/store/root.zig
-git commit -m "Add clone-first materialization with copy fallback"
+jj commit src/store/clone.zig src/store/materialize.zig src/store/root.zig -m "Add clone-first materialization with copy fallback"
 ```
 
 ---
@@ -1761,8 +1757,7 @@ Expected: all tests pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/scan.zig src/store/root.zig
-git commit -m "Add store scan touch and kind journal"
+jj commit src/store/scan.zig src/store/root.zig -m "Add store scan touch and kind journal"
 ```
 
 ---
@@ -1938,8 +1933,7 @@ Expected: all tests pass, including the expiry test with injected `now_ms`.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/state.zig src/store/root.zig
-git commit -m "Add pins leases and project retains"
+jj commit src/store/state.zig src/store/root.zig -m "Add pins leases and project retains"
 ```
 
 ---
@@ -2263,8 +2257,7 @@ touches nothing, age trim evicts the backdated object.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/gc.zig src/store/root.zig
-git commit -m "Add garbage collection with roots and quotas"
+jj commit src/store/gc.zig src/store/root.zig -m "Add garbage collection with roots and quotas"
 ```
 
 ---
@@ -2469,8 +2462,7 @@ plus a nonzero `stale_action_entries` where applicable).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/action_cache.zig src/store/gc.zig src/store/root.zig
-git commit -m "Add action cache entries and stale sweep"
+jj commit src/store/action_cache.zig src/store/gc.zig src/store/root.zig -m "Add action cache entries and stale sweep"
 ```
 
 ---
@@ -2673,8 +2665,7 @@ cold reads (`verifyObject` succeeds with only `cold/` populated).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/cold.zig src/store/objects.zig src/store/gc.zig src/store/test_support.zig src/store/root.zig
-git commit -m "Add cold tier with gzip demote and promote"
+jj commit src/store/cold.zig src/store/objects.zig src/store/gc.zig src/store/test_support.zig src/store/root.zig -m "Add cold tier with gzip demote and promote"
 ```
 
 ---
@@ -2899,8 +2890,7 @@ Expected: tests pass; `cache stat` shows the ingested object under a pin;
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/main.zig src/store/root.zig src/store/gc.zig README.md
-git commit -m "Add rime cache CLI stats and durable store"
+jj commit src/main.zig src/store/root.zig src/store/gc.zig README.md -m "Add rime cache CLI stats and durable store"
 ```
 
 ---
