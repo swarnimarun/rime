@@ -1,0 +1,306 @@
+const std = @import("std");
+const toml = @import("toml.zig"); // wired via the cargo module; see build.zig note in Plan C Task 5
+
+pub const ManifestError = error{ InvalidManifest, UnsupportedKey, OutOfMemory, ParseError, UnsupportedType };
+pub const DependencyKind = union(enum) {
+    version_req: []const u8, // "1.0" (owns no memory; borrows doc arena)
+    path: []const u8, // { path = "../x" }
+    git: GitSpec, // { git = "url", rev/branch/tag = … }
+    workspace_inherit: void, // { workspace = true }
+};
+pub const GitSpec = struct { url: []const u8, ref: ?[]const u8 };
+pub const TargetDesc = struct { name: []const u8, path: ?[]const u8, kind: TargetKind };
+// `test` is a Zig keyword, so the field is declared escaped: its identifier
+// is still `test` (@tagName returns "test"), spelled `.@"test"` at use sites.
+pub const TargetKind = enum { lib, bin, example, @"test", bench };
+pub const Package = struct {
+    name: []const u8,
+    version: []const u8,
+    edition: []const u8, // default "2021" when absent
+    build_script: ?[]const u8, // None, "build.rs" default when file exists (checked by workspace task)
+};
+pub const Manifest = struct {
+    arena: std.heap.ArenaAllocator, // owns ALL borrowed strings/slices below; deinit frees arena + deps map header
+    pkg: ?Package, // null for virtual workspace roots
+    deps: std.StringHashMap(DependencyKind),
+    targets: []TargetDesc, // explicit [lib]/[[bin]] or defaults
+    workspace_members: ?[]const []const u8, // [workspace] members globs, if present
+    workspace_exclude: []const []const u8,
+    pub fn deinit(self: *Manifest) void {
+        self.deps.deinit();
+        self.arena.deinit();
+    }
+};
+
+pub fn parseManifest(gpa: std.mem.Allocator, text: []const u8) ManifestError!Manifest {
+    const doc = toml.parseDocument(gpa, text) catch |e| return switch (e) {
+        toml.TomlError.ParseError => ManifestError.ParseError,
+        toml.TomlError.UnsupportedType => ManifestError.UnsupportedType,
+        toml.TomlError.OutOfMemory => ManifestError.OutOfMemory,
+    };
+    // NOTE: doc.arena outlives the Manifest — Manifest borrows strings from it.
+    // Ownership transfer (exact): move doc.arena into the returned Manifest; Manifest.deinit frees it.
+    // `doc` itself is never deinitialized; only the moved arena is.
+    var m = Manifest{
+        .arena = doc.arena,
+        .pkg = null,
+        .deps = std.StringHashMap(DependencyKind).init(gpa),
+        .targets = &.{},
+        .workspace_members = null,
+        .workspace_exclude = &.{},
+    };
+    errdefer {
+        m.deps.deinit();
+        m.arena.deinit();
+    }
+    const alloc = m.arena.allocator();
+    if (doc.root.get("package")) |pv| {
+        if (pv.* != .table) return ManifestError.InvalidManifest;
+        const pt = &pv.table; // *const TomlTable: no map-header copy (pv is *const TomlValue)
+        try checkPackageKeys(pt);
+        m.pkg = Package{
+            .name = try requiredString(pt, "name"),
+            .version = try requiredString(pt, "version"),
+            .edition = optionalString(pt, "edition") orelse "2021",
+            .build_script = try optionalBuildScript(pt),
+        };
+    }
+    if (doc.root.get("dependencies")) |dv| {
+        if (dv.* != .table) return ManifestError.InvalidManifest;
+        const dt = &dv.table; // *const TomlTable: no map-header copy
+        var it = dt.entries.iterator();
+        while (it.next()) |kv| {
+            // Pointer, not a copy: TomlValue holds a TomlTable holding a map header.
+            const dep = try parseDep(&kv.value_ptr.value);
+            try m.deps.put(kv.key_ptr.*, dep);
+        }
+    }
+    // Explicit [lib] / [[bin]] targets. When absent, targets stays empty and
+    // the workspace task resolves the default single lib-or-bin via file probe.
+    // M1 models lib/bin only: [example]/[test]/[bench] sections are ignored.
+    var targets: std.ArrayList(TargetDesc) = .empty;
+    if (doc.root.get("lib")) |lv| {
+        if (lv.* != .table) return ManifestError.InvalidManifest;
+        const lt = &lv.table;
+        try targets.append(alloc, .{
+            .name = try targetName(alloc, lt, m.pkg, .lib),
+            .path = optionalString(lt, "path"),
+            .kind = .lib,
+        });
+    }
+    if (doc.root.get("bin")) |bv| {
+        if (bv.* != .array) return ManifestError.InvalidManifest;
+        for (bv.array) |*bval| {
+            if (bval.* != .table) return ManifestError.InvalidManifest;
+            const bt = &bval.table;
+            try targets.append(alloc, .{
+                .name = try targetName(alloc, bt, m.pkg, .bin),
+                .path = optionalString(bt, "path"),
+                .kind = .bin,
+            });
+        }
+    }
+    m.targets = try targets.toOwnedSlice(alloc);
+    // [workspace] members/exclude string arrays when present. Other workspace
+    // keys (e.g. resolver) and non-dependencies sections ([dev-dependencies],
+    // [build-dependencies], [features], [profile.*]) are ignored in M1: the
+    // Manifest model has no fields for them yet (M3 owns features/profiles).
+    if (doc.root.get("workspace")) |wv| {
+        if (wv.* != .table) return ManifestError.InvalidManifest;
+        const wt = &wv.table;
+        if (wt.get("members")) |mv| {
+            m.workspace_members = try stringArray(alloc, mv);
+        }
+        if (wt.get("exclude")) |ev| {
+            m.workspace_exclude = try stringArray(alloc, ev);
+        }
+    }
+    return m;
+}
+
+fn requiredString(t: *const toml.TomlTable, key: []const u8) ManifestError![]const u8 {
+    const v = t.get(key) orelse return ManifestError.InvalidManifest;
+    if (v.* != .string) return ManifestError.InvalidManifest;
+    return v.string;
+}
+
+fn optionalString(t: *const toml.TomlTable, key: []const u8) ?[]const u8 {
+    const v = t.get(key) orelse return null;
+    if (v.* != .string) return null;
+    return v.string;
+}
+
+/// `build` / `build-script`: path string verbatim; `false` disables (null);
+/// `true` selects the conventional default; absent stays null so the
+/// workspace task can probe for build.rs.
+fn optionalBuildScript(t: *const toml.TomlTable) ManifestError! ?[]const u8 {
+    const v = t.get("build") orelse t.get("build-script") orelse return null;
+    switch (v.*) {
+        .string => |s| return s,
+        .boolean => |b| return if (b) "build.rs" else null,
+        else => return ManifestError.InvalidManifest,
+    }
+}
+
+fn checkPackageKeys(t: *const toml.TomlTable) ManifestError!void {
+    const allowed = [_][]const u8{ "name", "version", "edition", "build", "build-script", "rust-version", "description", "license" };
+    var it = t.entries.iterator();
+    while (it.next()) |kv| {
+        var ok = false;
+        for (allowed) |a| {
+            if (std.mem.eql(u8, kv.key_ptr.*, a)) {
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) return ManifestError.UnsupportedKey;
+    }
+}
+
+/// Pointer, not a copy (see parseManifest call site). Precedence for combined
+/// forms (e.g. `{ version, path }`): path, then git, then workspace-inherit,
+/// then version. `optional`/`features`/`default-features` keys are accepted
+/// and ignored: parsed, never resolved (resolution is M3).
+fn parseDep(val: *const toml.TomlValue) ManifestError!DependencyKind {
+    if (val.* == .string) return .{ .version_req = val.string };
+    if (val.* != .table) return ManifestError.InvalidManifest;
+    const t = &val.table; // *const TomlTable: no map-header copy
+    if (t.get("path")) |pv| {
+        if (pv.* != .string) return ManifestError.InvalidManifest;
+        return .{ .path = pv.string };
+    }
+    if (t.get("git")) |gv| {
+        if (gv.* != .string) return ManifestError.InvalidManifest;
+        // rev wins over branch wins over tag; absent means the default branch.
+        var ref: ?[]const u8 = null;
+        if (t.get("rev")) |rv| {
+            if (rv.* != .string) return ManifestError.InvalidManifest;
+            ref = rv.string;
+        } else if (t.get("branch")) |bv| {
+            if (bv.* != .string) return ManifestError.InvalidManifest;
+            ref = bv.string;
+        } else if (t.get("tag")) |tv| {
+            if (tv.* != .string) return ManifestError.InvalidManifest;
+            ref = tv.string;
+        }
+        return .{ .git = .{ .url = gv.string, .ref = ref } };
+    }
+    if (t.get("workspace")) |wv| {
+        if (wv.* != .boolean or !wv.boolean) return ManifestError.InvalidManifest;
+        return .workspace_inherit;
+    }
+    if (t.get("version")) |vv| {
+        if (vv.* != .string) return ManifestError.InvalidManifest;
+        return .{ .version_req = vv.string };
+    }
+    return ManifestError.InvalidManifest;
+}
+
+/// Explicit target name, else the package name. Default lib names map `-` to
+/// `_` per cargo (bins keep dashes). Requires [package] when unnamed.
+fn targetName(alloc: std.mem.Allocator, t: *const toml.TomlTable, pkg: ?Package, kind: TargetKind) ManifestError![]const u8 {
+    if (optionalString(t, "name")) |n| return n;
+    const p = pkg orelse return ManifestError.InvalidManifest;
+    if (kind == .lib and std.mem.indexOfScalar(u8, p.name, '-') != null) {
+        const buf = try alloc.dupe(u8, p.name);
+        for (buf) |*c| {
+            if (c.* == '-') c.* = '_';
+        }
+        return buf;
+    }
+    return p.name;
+}
+
+fn stringArray(alloc: std.mem.Allocator, val: *const toml.TomlValue) ManifestError![]const []const u8 {
+    if (val.* != .array) return ManifestError.InvalidManifest;
+    var list: std.ArrayList([]const u8) = .empty;
+    for (val.array) |*item| {
+        if (item.* != .string) return ManifestError.InvalidManifest;
+        try list.append(alloc, item.string);
+    }
+    return try list.toOwnedSlice(alloc);
+}
+
+test "manifest parses minimal package" {
+    // Runtime read (not @embedFile): the plan's snippet embeds
+    // "../../testdata/…", but that escapes the module package path, so it
+    // cannot compile under standalone `zig test src/cargo/manifest.zig`.
+    // Repo-root-relative reads match the plan's own Task 4 test convention
+    // (tests run with cwd = repo root).
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, "testdata/cargo/minimal/Cargo.toml", std.testing.allocator, .limited(1 << 20));
+    defer std.testing.allocator.free(text);
+    var m = try parseManifest(std.testing.allocator, text);
+    defer m.deinit();
+    try std.testing.expectEqualStrings("rime-minimal", m.pkg.?.name);
+    try std.testing.expectEqualStrings("1.0", m.deps.get("serde").?.version_req);
+    try std.testing.expectEqualStrings("../rime-dep", m.deps.get("rime-dep").?.path);
+}
+
+test "manifest rejects unknown package keys loudly" {
+    try std.testing.expectError(ManifestError.UnsupportedKey, parseManifest(std.testing.allocator, "[package]\nname = \"a\"\nversion = \"0.1.0\"\nflux-capacitor = true\n"));
+}
+
+test "manifest parses git and workspace-inherit deps" {
+    const text = "[package]\nname = \"a\"\nversion = \"0.1.0\"\n[dependencies]\ng = { git = \"https://example.com/r.git\", rev = \"abc123\" }\nw = { workspace = true }\n";
+    var m = try parseManifest(std.testing.allocator, text);
+    defer m.deinit();
+    try std.testing.expectEqualStrings("https://example.com/r.git", m.deps.get("g").?.git.url);
+    try std.testing.expect(m.deps.get("w").? == .workspace_inherit);
+}
+
+test "manifest defaults edition and parses workspace and targets" {
+    const text =
+        \\[package]
+        \\name = "my-crate"
+        \\version = "0.2.0"
+        \\
+        \\[lib]
+        \\path = "src/mylib.rs"
+        \\
+        \\[[bin]]
+        \\name = "tool"
+        \\
+        \\[[bin]]
+        \\name = "other"
+        \\path = "src/other.rs"
+        \\
+        \\[workspace]
+        \\members = ["crates/*"]
+        \\exclude = ["crates/skip"]
+        \\
+    ;
+    var m = try parseManifest(std.testing.allocator, text);
+    defer m.deinit();
+    try std.testing.expectEqualStrings("2021", m.pkg.?.edition);
+    try std.testing.expect(m.pkg.?.build_script == null);
+    try std.testing.expectEqual(@as(usize, 3), m.targets.len);
+    // Default lib name maps '-' to '_' per cargo.
+    try std.testing.expectEqualStrings("my_crate", m.targets[0].name);
+    try std.testing.expect(m.targets[0].kind == .lib);
+    try std.testing.expectEqualStrings("src/mylib.rs", m.targets[0].path.?);
+    try std.testing.expectEqualStrings("tool", m.targets[1].name);
+    try std.testing.expect(m.targets[1].path == null);
+    try std.testing.expectEqualStrings("src/other.rs", m.targets[2].path.?);
+    try std.testing.expectEqual(@as(usize, 1), m.workspace_members.?.len);
+    try std.testing.expectEqualStrings("crates/*", m.workspace_members.?[0]);
+    try std.testing.expectEqual(@as(usize, 1), m.workspace_exclude.len);
+    try std.testing.expectEqualStrings("crates/skip", m.workspace_exclude[0]);
+}
+
+test "manifest parses virtual workspace root and versioned table deps" {
+    const text =
+        \\[workspace]
+        \\members = ["a", "b"]
+        \\
+        \\[dependencies]
+        \\serde = { version = "1.0", optional = true }
+        \\
+    ;
+    var m = try parseManifest(std.testing.allocator, text);
+    defer m.deinit();
+    try std.testing.expect(m.pkg == null);
+    try std.testing.expectEqualStrings("1.0", m.deps.get("serde").?.version_req);
+    try std.testing.expectEqual(@as(usize, 2), m.workspace_members.?.len);
+    try std.testing.expectEqual(@as(usize, 0), m.targets.len);
+}
