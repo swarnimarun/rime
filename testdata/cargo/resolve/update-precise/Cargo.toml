@@ -1,0 +1,9 @@
+# Task 11 case 13 (--precise): log=1.0.5 pins the exact version even though
+# 1.0.9 is newer; log=9.9.9 must error. Registry-dependent: rime-only.
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "^1.0.0"

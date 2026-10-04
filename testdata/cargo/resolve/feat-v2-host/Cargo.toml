@@ -1,0 +1,17 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+resolver = "2"
+members = ["tool", "shared"]
+
+[dependencies]
+shared = { path = "shared", version = "1" }
+
+[build-dependencies]
+tool = { path = "tool", version = "1", features = ["h"] }
+
+[features]
+f = ["shared/normal-only"]

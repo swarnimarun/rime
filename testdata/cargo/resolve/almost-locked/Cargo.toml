@@ -1,0 +1,13 @@
+# Task 11 case 1 (conservative keep): the previous lock below pins
+# shared 1.1.0 while a newer 1.2.0 exists in the stub index; rime must
+# keep 1.1.0. Path-only workspace so the live-cargo oracle byte-compares.
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = ["shared"]
+
+[dependencies]
+shared = { path = "shared", version = "^1.0" }

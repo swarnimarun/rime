@@ -1,0 +1,10 @@
+# Task 11 case 2 (yanked filtering): newest serde is yanked in the stub
+# index below, so resolution must hide it. Registry-dependent: rime-only
+# assertions over index.json (no cargo spawn).
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1"

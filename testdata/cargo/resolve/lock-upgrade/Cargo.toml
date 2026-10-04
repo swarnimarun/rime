@@ -1,0 +1,10 @@
+# Task 11 case 12: v1-era input (no version line, checksums in [metadata]).
+# Rime must attach the metadata checksum, then rewrite at v4 with an inline
+# checksum line and no [metadata] table.
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lib = "1"

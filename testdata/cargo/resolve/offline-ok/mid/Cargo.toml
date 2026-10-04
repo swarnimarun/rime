@@ -1,0 +1,7 @@
+[package]
+name = "mid"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+leaf = { path = "../leaf", version = "0.3" }

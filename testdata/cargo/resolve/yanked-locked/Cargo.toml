@@ -1,0 +1,10 @@
+# Task 11 case 3 (yanked rescue): the previous lock pins the now-yanked
+# serde 1.0.201, so Task-4 rule (6) rescues it via allow_yanked +
+# preference. Registry-dependent: rime-only assertions (no cargo spawn).
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1"

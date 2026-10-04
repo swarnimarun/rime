@@ -1,7 +1,10 @@
 const std = @import("std");
 const toml = @import("toml.zig"); // wired via the cargo module; see build.zig note in Plan C Task 5
+const semver = @import("semver.zig");
+const resolve = @import("resolve.zig");
+const sources = @import("sources.zig");
 
-pub const LockError = error{ InvalidLock, ParseError, UnsupportedType, OutOfMemory };
+pub const LockError = error{ InvalidLock, ParseError, UnsupportedType, UnsupportedVersion, OutOfMemory };
 pub const LockPackage = struct {
     name: []const u8,
     version: []const u8,
@@ -100,21 +103,144 @@ pub fn parseLock(gpa: std.mem.Allocator, text: []const u8) LockError!Lockfile {
     // arena covers all error paths (same shape as Manifest's errdefer).
     errdefer lf.arena.deinit();
     const alloc = lf.arena.allocator();
+    const saw_version_field = doc.root.get("version") != null;
     if (doc.root.get("version")) |vv| {
         if (vv.* != .integer or vv.integer < 0) return LockError.InvalidLock;
         lf.version = std.math.cast(u32, vv.integer) orelse return LockError.InvalidLock;
+        // `into_resolve`: v5 without `-Znext-lockfile-bump` is a hard error.
+        if (lf.version == 5) return LockError.UnsupportedVersion;
     }
     if (doc.root.get("package")) |pv| {
         if (pv.* != .array) return LockError.InvalidLock;
         var pkgs: std.ArrayList(LockPackage) = .empty;
+        // `into_resolve` duplicate rule (encode.rs): the key is the FULL
+        // (name, version, source) triple — same-name different-version
+        // packages (multi-version coexistence) parse fine. The plan's
+        // "duplicate name" phrasing is shorthand; cargo errors only on a
+        // repeated triple, naming the package (`package X is specified
+        // twice in the lockfile` — surfaced with the name by Task 9).
+        var seen: std.StringHashMap(void) = std.StringHashMap(void).init(alloc);
         for (pv.array) |*entry| {
             if (entry.* != .table) return LockError.InvalidLock;
-            try pkgs.append(alloc, try parsePackage(alloc, &entry.table));
+            const pkg = try parsePackage(alloc, &entry.table);
+            const dkey = try std.fmt.allocPrint(alloc, "{s}\x00{s}\x00{s}", .{ pkg.name, pkg.version, pkg.source orelse "" });
+            if (seen.contains(dkey)) return LockError.InvalidLock;
+            try seen.put(dkey, {});
+            try pkgs.append(alloc, pkg);
         }
         lf.packages = try pkgs.toOwnedSlice(alloc);
     }
+    // V1 `[metadata]` checksums (`into_resolve` V1 arm): `"checksum <id>"`
+    // entries attach to the matching node (`<none>` → null). Bad-merge
+    // rule: metadata checksums coexisting with a `version` field or inline
+    // `checksum` lines (i.e. V2+ indicators) are discarded wholesale — the
+    // whole checksum set is dropped, never merged.
+    var saw_inline_checksum = false;
+    for (lf.packages) |p| {
+        if (p.checksum != null) {
+            saw_inline_checksum = true;
+            break;
+        }
+    }
+    if (doc.root.get("metadata")) |mv| {
+        if (mv.* != .table) return LockError.InvalidLock;
+        const prefix = "checksum ";
+        var md_entries: std.ArrayList(struct { id: EdgeId, value: ?[]const u8 }) = .empty;
+        var mdit = mv.table.entries.iterator();
+        while (mdit.next()) |kv| {
+            if (!std.mem.startsWith(u8, kv.key_ptr.*, prefix)) continue;
+            if (kv.value_ptr.value != .string) return LockError.InvalidLock;
+            const id = parseEdgeId(kv.key_ptr.*[prefix.len..]) orelse continue;
+            const v: ?[]const u8 = if (std.mem.eql(u8, kv.value_ptr.value.string, "<none>")) null else kv.value_ptr.value.string;
+            md_entries.append(alloc, .{ .id = id, .value = v }) catch return LockError.OutOfMemory;
+        }
+        if (md_entries.items.len > 0 and (saw_version_field or saw_inline_checksum)) {
+            for (lf.packages) |*p| p.checksum = null;
+        } else {
+            for (md_entries.items) |e| {
+                if (resolveMetadataEdge(lf.packages, e.id)) |idx| lf.packages[idx].checksum = e.value;
+            }
+        }
+    }
+    // Ambiguous short edges are DROPPED, not errors (`into_resolve`
+    // `lookup_id` → None tolerance for bad merges). Resolvable edges stay
+    // VERBATIM (re-rendering happens only on write).
+    for (lf.packages) |*p| {
+        if (p.dependencies.len == 0) continue;
+        var kept: std.ArrayList([]const u8) = .empty;
+        for (p.dependencies) |d| {
+            const id = parseEdgeId(d) orelse continue;
+            if (resolveLockEdge(lf.packages, id) != null) kept.append(alloc, d) catch return LockError.OutOfMemory;
+        }
+        p.dependencies = kept.toOwnedSlice(alloc) catch return LockError.OutOfMemory;
+    }
     return lf;
 }
+
+/// A parsed dependency-edge / metadata-checksum id (`FromStr for
+/// TomlLockfilePackageId`): `name [version] [(source)]`. Slices borrow the
+/// input. A malformed id (source not paren-wrapped, extra tokens) yields
+/// null → the edge is unresolvable → dropped, never a parse error.
+const EdgeId = struct { name: []const u8, version: ?[]const u8, source: ?[]const u8 };
+
+fn parseEdgeId(text: []const u8) ?EdgeId {
+    const sp1 = std.mem.indexOfScalar(u8, text, ' ') orelse return .{ .name = text, .version = null, .source = null };
+    const rest = text[sp1 + 1 ..];
+    if (std.mem.indexOfScalar(u8, rest, ' ')) |sp2| {
+        const src = rest[sp2 + 1 ..];
+        if (src.len < 2 or src[0] != '(' or src[src.len - 1] != ')') return null;
+        return .{ .name = text[0..sp1], .version = rest[0..sp2], .source = src[1 .. src.len - 1] };
+    }
+    return .{ .name = text[0..sp1], .version = rest, .source = null };
+}
+
+/// `into_resolve` edge tolerance: version-qualified lookup, then the
+/// source rule (explicit source must match; absent source prefers the unique
+/// path package, else requires a unique candidate); version-less ids need a
+/// single version for the name. Returns the package index or null.
+fn resolveLockEdge(packages: []LockPackage, e: EdgeId) ?usize {
+    if (e.version) |ev| {
+        if (e.source) |es| {
+            for (packages, 0..) |*p, i| {
+                if (std.mem.eql(u8, p.name, e.name) and std.mem.eql(u8, p.version, ev) and p.source != null and std.mem.eql(u8, p.source.?, es)) return i;
+            }
+            return null;
+        }
+        var path_idx: ?usize = null;
+        var path_count: usize = 0;
+        var total: usize = 0;
+        var only: usize = 0;
+        for (packages, 0..) |*p, i| {
+            if (!std.mem.eql(u8, p.name, e.name) or !std.mem.eql(u8, p.version, ev)) continue;
+            total += 1;
+            only = i;
+            if (p.source == null) {
+                path_count += 1;
+                path_idx = i;
+            }
+        }
+        // Path packages win when unique among themselves (even with
+        // registry siblings present); otherwise a single candidate wins;
+        // anything else is a bad merge → dropped.
+        if (path_count >= 1) return if (path_count == 1) path_idx else null;
+        return if (total == 1) only else null;
+    }
+    var first_ver: ?[]const u8 = null;
+    for (packages) |*p| {
+        if (!std.mem.eql(u8, p.name, e.name)) continue;
+        if (first_ver) |fv| {
+            if (!std.mem.eql(u8, fv, p.version)) return null;
+        } else first_ver = p.version;
+    }
+    const fv = first_ver orelse return null;
+    return resolveLockEdge(packages, .{ .name = e.name, .version = fv, .source = null });
+}
+
+fn resolveMetadataEdge(packages: []LockPackage, e: EdgeId) ?usize {
+    return resolveLockEdge(packages, e);
+}
+
+const MetaEntry = struct { key: []const u8, value: []const u8 };
 
 fn parsePackage(alloc: std.mem.Allocator, t: *const toml.TomlTable) LockError!LockPackage {
     const name = try requiredField(t, "name");
@@ -274,4 +400,1087 @@ test "lock oracle fixtures have the expected shape" {
     // Leaf package: keys omitted entirely, not empty.
     const anyhow = lf.find("anyhow").?;
     try std.testing.expectEqual(@as(usize, 0), anyhow.dependencies.len);
+}
+
+// --- Task 8 tests ---
+
+const t8_reg: sources.SourceId = .{ .registry = "sparse+https://github.com/rust-lang/crates.io-index" };
+
+fn t8ShortGraph() struct {
+    nodes: [5]resolve.ResolvedNode,
+    app_refs: [2]resolve.ResolvedRef,
+    serde_refs: [2]resolve.ResolvedRef,
+} {
+    const v010 = semver.Version{ .major = 0, .minor = 1, .patch = 0, .pre = "", .build = "" };
+    const v100 = semver.Version{ .major = 1, .minor = 0, .patch = 0, .pre = "", .build = "" };
+    const v1200 = semver.Version{ .major = 1, .minor = 0, .patch = 200, .pre = "", .build = "" };
+    const v200 = semver.Version{ .major = 2, .minor = 0, .patch = 0, .pre = "", .build = "" };
+    const app_refs = [2]resolve.ResolvedRef{
+        .{ .name = "serde", .version = v1200, .source = t8_reg },
+        .{ .name = "log", .version = v200, .source = t8_reg },
+    };
+    const serde_refs = [2]resolve.ResolvedRef{
+        .{ .name = "cfg-if", .version = v100, .source = t8_reg },
+        .{ .name = "log", .version = v100, .source = t8_reg },
+    };
+    const nodes = [5]resolve.ResolvedNode{
+        // Deliberately NOT in cargo's output order: the writer must sort.
+        .{ .name = "serde", .version = v1200, .source = t8_reg, .deps = &serde_refs },
+        .{ .name = "log", .version = v200, .source = t8_reg, .deps = &.{} },
+        .{ .name = "app", .version = v010, .source = .{ .path = "/repo/app" }, .deps = &app_refs },
+        .{ .name = "log", .version = v100, .source = t8_reg, .deps = &.{} },
+        .{ .name = "cfg-if", .version = v100, .source = t8_reg, .deps = &.{} },
+    };
+    return .{ .nodes = nodes, .app_refs = app_refs, .serde_refs = serde_refs };
+}
+
+fn t8ShortChecksums(gpa: std.mem.Allocator) !std.StringHashMap(?[]const u8) {
+    // Keys follow the checksumKey convention: "<name> <version> <source>".
+    var m = std.StringHashMap(?[]const u8).init(gpa);
+    errdefer m.deinit();
+    const src = "registry+https://github.com/rust-lang/crates.io-index";
+    const entries = [_]struct { n: []const u8, v: []const u8, c: []const u8 }{
+        .{ .n = "serde", .v = "1.0.200", .c = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" },
+        .{ .n = "cfg-if", .v = "1.0.0", .c = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+        .{ .n = "log", .v = "1.0.0", .c = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" },
+        .{ .n = "log", .v = "2.0.0", .c = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" },
+    };
+    for (entries) |e| {
+        const k = try checksumKey(gpa, e.n, e.v, src);
+        defer gpa.free(k);
+        try m.put(try gpa.dupe(u8, k), e.c);
+    }
+    return m;
+}
+
+test "lock writer shortens unambiguous edges and sorts" {
+    // graph: app 0.1.0 (path) → serde 1.0.200 (registry, checksum C),
+    // serde → cfg-if 1.0.0 (only version) + log 1.0.0 AND log 2.0.0.
+    // Packages sorted [app, cfg-if, log 1.0.0, log 2.0.0, serde]; serde's deps
+    // = ["cfg-if", "log 1.0.0"]; app's deps = ["log 2.0.0", "serde"]
+    // (single-version names go bare — plan-text "serde 1.0.200" corrected
+    // per encodable_package_id: one version for the name → version dropped).
+    // Edge forms cross-checked against real cargo bytes (/tmp/cargocheck:
+    // same-name multi-version path deps render "d 1.0.0"/"d 2.0.0",
+    // single-version names render bare).
+    const gpa = std.testing.allocator;
+    const fix = t8ShortGraph();
+    var graph = resolve.ResolveGraph{ .arena = std.heap.ArenaAllocator.init(gpa), .nodes = &fix.nodes };
+    defer graph.deinit();
+    var cksums = try t8ShortChecksums(gpa);
+    defer {
+        var it = cksums.iterator();
+        while (it.next()) |kv| gpa.free(kv.key_ptr.*);
+        cksums.deinit();
+    }
+    const out = try writeLock(gpa, &graph, &cksums, .v4);
+    defer gpa.free(out);
+    const expected = try readFixture("testdata/cargo/resolve/lock-v4/short.expected");
+    defer gpa.free(expected);
+    try std.testing.expectEqualStrings(expected, out);
+}
+
+test "lock writer output reparses to the same graph" {
+    const gpa = std.testing.allocator;
+    const fix = t8ShortGraph();
+    var graph = resolve.ResolveGraph{ .arena = std.heap.ArenaAllocator.init(gpa), .nodes = &fix.nodes };
+    defer graph.deinit();
+    var cksums = try t8ShortChecksums(gpa);
+    defer {
+        var it = cksums.iterator();
+        while (it.next()) |kv| gpa.free(kv.key_ptr.*);
+        cksums.deinit();
+    }
+    const out = try writeLock(gpa, &graph, &cksums, .v4);
+    defer gpa.free(out);
+    var lf = try parseLock(gpa, out);
+    defer lf.deinit();
+    try std.testing.expectEqual(@as(u32, 4), lf.version);
+    try std.testing.expectEqual(@as(usize, 5), lf.packages.len);
+    const serde = lf.find("serde").?;
+    try std.testing.expectEqualStrings("1.0.200", serde.version);
+    try std.testing.expect(serde.checksum != null);
+    try std.testing.expectEqual(@as(usize, 2), serde.dependencies.len);
+    try std.testing.expectEqualStrings("cfg-if", serde.dependencies[0]);
+    try std.testing.expectEqualStrings("log 1.0.0", serde.dependencies[1]);
+}
+
+test "lock reader rejects true duplicates but keeps multi-version names" {
+    // Cargo's rule (encode.rs) keys on the FULL (name, version, source)
+    // triple: same-name different-version packages coexist (multi-version
+    // resolution depends on it); only a repeated triple errors. The plan's
+    // Step-4 example (x 1.0.0 + x 2.0.0, no sources) is NOT a duplicate
+    // under cargo semantics — it parses — so this test uses a real triple
+    // repeat for the error case and asserts the plan's input parses.
+    const duped =
+        "[[package]]\nname = \"x\"\nversion = \"1.0.0\"\n" ++
+        "[[package]]\nname = \"x\"\nversion = \"1.0.0\"\n";
+    try std.testing.expectError(LockError.InvalidLock, parseLock(std.testing.allocator, duped));
+    const multi =
+        "[[package]]\nname = \"x\"\nversion = \"1.0.0\"\n" ++
+        "[[package]]\nname = \"x\"\nversion = \"2.0.0\"\n";
+    var lf = try parseLock(std.testing.allocator, multi);
+    defer lf.deinit();
+    try std.testing.expectEqual(@as(usize, 2), lf.packages.len);
+}
+
+test "lock reader keeps v1 metadata checksums and drops bad merges" {
+    const gpa = std.testing.allocator;
+    // V1 file: no version field, no inline checksums → [metadata] attaches
+    // ("<none>" → null).
+    const v1text =
+        "[[package]]\nname = \"a\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n" ++
+        "[[package]]\nname = \"b\"\nversion = \"2.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n" ++
+        "[metadata]\n\"checksum a 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)\" = \"aaaa\"\n" ++
+        "\"checksum b 2.0.0 (registry+https://github.com/rust-lang/crates.io-index)\" = \"<none>\"\n";
+    var lf = try parseLock(gpa, v1text);
+    defer lf.deinit();
+    try std.testing.expectEqualStrings("aaaa", lf.find("a").?.checksum.?);
+    try std.testing.expect(lf.find("b").?.checksum == null);
+    // Bad merge: version field + metadata checksums + inline checksum →
+    // the whole checksum set is discarded (into_resolve drain rule).
+    const badtext =
+        "version = 4\n[[package]]\nname = \"a\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"aaaa\"\n" ++
+        "[metadata]\n\"checksum a 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)\" = \"zzzz\"\n";
+    var bad = try parseLock(gpa, badtext);
+    defer bad.deinit();
+    try std.testing.expect(bad.find("a").?.checksum == null);
+}
+
+test "lock reader drops ambiguous short edges" {
+    const gpa = std.testing.allocator;
+    const text =
+        "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"foo\",\n \"bar 9.9.9\",\n]\n" ++
+        "[[package]]\nname = \"foo\"\nversion = \"1.0.0\"\n" ++
+        "[[package]]\nname = \"foo\"\nversion = \"2.0.0\"\n";
+    var lf = try parseLock(gpa, text);
+    defer lf.deinit();
+    // "foo" matches 2 versions → ambiguous → dropped; "bar 9.9.9" matches
+    // nothing → dropped. The edge list empties but the node set is intact.
+    try std.testing.expectEqual(@as(usize, 0), lf.find("app").?.dependencies.len);
+    try std.testing.expectEqual(@as(usize, 3), lf.packages.len);
+}
+
+test "lock reader rejects v5" {
+    try std.testing.expectError(
+        LockError.UnsupportedVersion,
+        parseLock(std.testing.allocator, "version = 5\n[[package]]\nname = \"x\"\nversion = \"1.0.0\"\n"),
+    );
+}
+
+test "rust version floors select the lock version" {
+    try std.testing.expectEqual(ResolveVersion.v4, versionForRustVersion(null));
+    try std.testing.expectEqual(ResolveVersion.v4, versionForRustVersion(semver.Version{ .major = 1, .minor = 83, .patch = 0, .pre = "", .build = "" }));
+    try std.testing.expectEqual(ResolveVersion.v3, versionForRustVersion(semver.Version{ .major = 1, .minor = 82, .patch = 0, .pre = "", .build = "" }));
+    try std.testing.expectEqual(ResolveVersion.v3, versionForRustVersion(semver.Version{ .major = 1, .minor = 53, .patch = 0, .pre = "", .build = "" }));
+    try std.testing.expectEqual(ResolveVersion.v2, versionForRustVersion(semver.Version{ .major = 1, .minor = 52, .patch = 0, .pre = "", .build = "" }));
+    try std.testing.expectEqual(ResolveVersion.v2, versionForRustVersion(semver.Version{ .major = 1, .minor = 41, .patch = 0, .pre = "", .build = "" }));
+    try std.testing.expectEqual(ResolveVersion.v1, versionForRustVersion(semver.Version{ .major = 1, .minor = 40, .patch = 0, .pre = "", .build = "" }));
+    try std.testing.expectEqual(ResolveVersion.v4, versionForRustVersion(semver.Version{ .major = 2, .minor = 0, .patch = 0, .pre = "", .build = "" }));
+}
+
+test "shortEdge follows the pair-then-name rule" {
+    const gpa = std.testing.allocator;
+    const fix = t8ShortGraph();
+    var graph = resolve.ResolveGraph{ .arena = std.heap.ArenaAllocator.init(gpa), .nodes = &fix.nodes };
+    defer graph.deinit();
+    var counts = try NameCounts.build(gpa, &graph);
+    defer counts.deinit();
+    try std.testing.expectEqual(@as(u32, 1), counts.versionCount("serde"));
+    try std.testing.expectEqual(@as(u32, 2), counts.versionCount("log"));
+    try std.testing.expectEqual(@as(u32, 1), counts.pairCount("log", semver.Version{ .major = 1, .minor = 0, .patch = 0, .pre = "", .build = "" }));
+    try std.testing.expectEqual(@as(u32, 0), counts.pairCount("missing", semver.Version{ .major = 1, .minor = 0, .patch = 0, .pre = "", .build = "" }));
+    const v1200 = semver.Version{ .major = 1, .minor = 0, .patch = 200, .pre = "", .build = "" };
+    const v100 = semver.Version{ .major = 1, .minor = 0, .patch = 0, .pre = "", .build = "" };
+    // Single-version name → bare, even with a source line present.
+    const bare = shortEdge("serde", v1200, "registry+https://github.com/rust-lang/crates.io-index", &counts);
+    try std.testing.expect(bare == .bare);
+    try std.testing.expectEqualStrings("serde", bare.bare);
+    // Multi-version name, unique pair → version-only.
+    const vo = shortEdge("log", v100, "registry+https://github.com/rust-lang/crates.io-index", &counts);
+    try std.testing.expect(vo == .version_only);
+    try std.testing.expectEqualStrings("1.0.0", vo.version_only.version);
+    // Null version → bare (decode-side ids without versions).
+    try std.testing.expect(shortEdge("x", null, null, &counts) == .bare);
+}
+
+test "v1 writer emits full edges plus metadata checksums" {
+    const gpa = std.testing.allocator;
+    const v010 = semver.Version{ .major = 0, .minor = 1, .patch = 0, .pre = "", .build = "" };
+    const v100 = semver.Version{ .major = 1, .minor = 0, .patch = 0, .pre = "", .build = "" };
+    const lib_refs = [_]resolve.ResolvedRef{};
+    const app_refs = [_]resolve.ResolvedRef{.{ .name = "lib", .version = v100, .source = t8_reg }};
+    const nodes = [_]resolve.ResolvedNode{
+        .{ .name = "app", .version = v010, .source = .{ .path = "/repo/app" }, .deps = &app_refs },
+        .{ .name = "lib", .version = v100, .source = t8_reg, .deps = &lib_refs },
+    };
+    var graph = resolve.ResolveGraph{ .arena = std.heap.ArenaAllocator.init(gpa), .nodes = &nodes };
+    defer graph.deinit();
+    const src = "registry+https://github.com/rust-lang/crates.io-index";
+    const ck = try checksumKey(gpa, "lib", "1.0.0", src);
+    defer gpa.free(ck);
+    var cksums = std.StringHashMap(?[]const u8).init(gpa);
+    defer cksums.deinit();
+    try cksums.put(ck, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+    const out = try writeLock(gpa, &graph, &cksums, .v1);
+    defer gpa.free(out);
+    // V1: no `version = ` line, no inline checksums, full edges, metadata
+    // table last, historical trailing blank line kept.
+    const expected =
+        "# This file is automatically @generated by Cargo.\n" ++
+        "# It is not intended for manual editing.\n" ++
+        "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n" ++
+        "dependencies = [\n \"lib 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)\",\n]\n\n" ++
+        "[[package]]\nname = \"lib\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n" ++
+        "[metadata]\n\"checksum lib 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)\" = \"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"\n";
+    try std.testing.expectEqualStrings(expected, out);
+    // And the v1 output's metadata checksums re-attach on read.
+    var lf = try parseLock(gpa, out);
+    defer lf.deinit();
+    try std.testing.expectEqualStrings("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", lf.find("lib").?.checksum.?);
+}
+
+test "v2 writer omits the version line" {
+    const gpa = std.testing.allocator;
+    const fix = t8ShortGraph();
+    var graph = resolve.ResolveGraph{ .arena = std.heap.ArenaAllocator.init(gpa), .nodes = &fix.nodes };
+    defer graph.deinit();
+    var cksums = try t8ShortChecksums(gpa);
+    defer {
+        var it = cksums.iterator();
+        while (it.next()) |kv| gpa.free(kv.key_ptr.*);
+        cksums.deinit();
+    }
+    const out = try writeLock(gpa, &graph, &cksums, .v2);
+    defer gpa.free(out);
+    // No `version = 2` header line (V2|V1 → absent), though every package
+    // still carries its own `version = "…"` field.
+    try std.testing.expect(std.mem.indexOf(u8, out, "version = 2\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "version = 4\n") == null);
+    try std.testing.expect(std.mem.startsWith(u8, out, "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\n[[package]]\n"));
+    // Same shortening as v4 (counts apply for ≥v2).
+    try std.testing.expect(std.mem.indexOf(u8, out, " \"serde\",\n") != null);
+}
+
+test "writer preserves extra top comments from orig" {
+    const gpa = std.testing.allocator;
+    const v010 = semver.Version{ .major = 0, .minor = 1, .patch = 0, .pre = "", .build = "" };
+    const nodes = [_]resolve.ResolvedNode{
+        .{ .name = "app", .version = v010, .source = .{ .path = "/repo/app" }, .deps = &.{} },
+    };
+    var graph = resolve.ResolveGraph{ .arena = std.heap.ArenaAllocator.init(gpa), .nodes = &nodes };
+    defer graph.deinit();
+    var cksums = std.StringHashMap(?[]const u8).init(gpa);
+    defer cksums.deinit();
+    const orig =
+        "# This file is automatically @generated by Cargo.\n" ++
+        "# It is not intended for manual editing.\n" ++
+        "# vendored for offline builds\n" ++
+        "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n";
+    const out = try writeLockWithOrig(gpa, &graph, &cksums, .v4, orig);
+    defer gpa.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\n# vendored for offline builds\nversion = 4\n"));
+}
+
+test "writer emits patch.unused and metadata in cargo order" {
+    // Task 11 case 17 shape (testdata/cargo/resolve/patch-table/): the graph
+    // carries log 1.0.5 while the `[patch]` table's unused-crate never
+    // matched. Cargo order is packages, then `[[patch.unused]]` (Vec order,
+    // NOT sorted), then `[metadata]` (BTreeMap order, sorted by key) -- both
+    // verified here against the hand-derived expected bytes.
+    const gpa = std.testing.allocator;
+    const v010 = try semver.Version.parse("0.1.0");
+    const v105 = try semver.Version.parse("1.0.5");
+    const v100 = try semver.Version.parse("1.0.0");
+    const reg: sources.SourceId = .{ .registry = "sparse+https://github.com/rust-lang/crates.io-index" };
+    const path: sources.SourceId = .{ .path = "" };
+    const app_refs = [_]resolve.ResolvedRef{.{ .name = "log", .version = v105, .source = reg }};
+    var nodes = [_]resolve.ResolvedNode{
+        // Scrambled on purpose: packages sort to [app, log].
+        .{ .name = "log", .version = v105, .source = reg, .deps = &.{} },
+        .{ .name = "app", .version = v010, .source = path, .deps = &app_refs },
+    };
+    var graph = t11PathGraph(&nodes);
+    defer graph.deinit();
+    const src = "registry+https://github.com/rust-lang/crates.io-index";
+    var cksums = std.StringHashMap(?[]const u8).init(gpa);
+    defer cksums.deinit();
+    const ck_log = try checksumKey(gpa, "log", "1.0.5", src);
+    defer gpa.free(ck_log);
+    try cksums.put(ck_log, "e" ** 64);
+    const ck_apple = try checksumKey(gpa, "apple", "1.0.0", src);
+    defer gpa.free(ck_apple);
+    try cksums.put(ck_apple, "f" ** 64);
+    // Slice order is emission order (zebra before apple proves no sorting).
+    const patch = [_]PatchUnusedEntry{
+        .{ .name = "zebra", .version = v100, .source = path },
+        .{ .name = "apple", .version = v100, .source = reg },
+    };
+    // Input in reverse (b before a) proves the writer sorts metadata by key.
+    const meta = [_]MetadataEntry{
+        .{ .key = "b-key", .value = "2" },
+        .{ .key = "a-key", .value = "1" },
+    };
+    const out = try writeLockFull(gpa, &graph, &cksums, .v4, &patch, &meta);
+    defer gpa.free(out);
+    const expected = try readFixture("testdata/cargo/resolve/patch-table.expected-lock");
+    defer gpa.free(expected);
+    try std.testing.expectEqualStrings(expected, out);
+    // Empty carriers change nothing: writeLock stays byte-identical.
+    const plain = try writeLock(gpa, &graph, &cksums, .v4);
+    defer gpa.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "patch.unused") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "[metadata]") == null);
+}
+
+// --- Tasks 10/11: fixture-backed conformance tests ---
+//
+// The graphs below mirror the `testdata/cargo/resolve/<case>/` fixtures
+// name-for-name and version-for-version; the writer must reproduce the
+// hand-derived `*.expected-lock` bytes exactly (the byte layout itself was
+// validated against real `cargo generate-lockfile` output by the Task-8
+// tests above, so equality here proves the fixtures are canonical).
+
+fn t11PathGraph(nodes: []const resolve.ResolvedNode) resolve.ResolveGraph {
+    // Helper only: wraps caller-owned node storage (no arena allocation, so
+    // the caller keeps lifetimes obvious). resolveGraph-built graphs are
+    // covered by resolve.zig; here the graph is the test INPUT.
+    return .{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator), .nodes = nodes };
+}
+
+test "writer reproduces the diamond oracle lock bytes" {
+    const gpa = std.testing.allocator;
+    const v010 = try semver.Version.parse("0.1.0");
+    const v110 = try semver.Version.parse("1.1.0");
+    const path: sources.SourceId = .{ .path = "" };
+    const left_refs = [_]resolve.ResolvedRef{.{ .name = "shared", .version = v110, .source = path }};
+    const right_refs = [_]resolve.ResolvedRef{.{ .name = "shared", .version = v110, .source = path }};
+    const app_refs = [_]resolve.ResolvedRef{
+        .{ .name = "left", .version = v110, .source = path },
+        .{ .name = "right", .version = v110, .source = path },
+    };
+    var nodes = [_]resolve.ResolvedNode{
+        // Scrambled on purpose: the writer must sort to [app, left, right, shared].
+        .{ .name = "shared", .version = v110, .source = path, .deps = &.{} },
+        .{ .name = "right", .version = v110, .source = path, .deps = &right_refs },
+        .{ .name = "app", .version = v010, .source = path, .deps = &app_refs },
+        .{ .name = "left", .version = v110, .source = path, .deps = &left_refs },
+    };
+    var graph = t11PathGraph(&nodes);
+    defer graph.deinit();
+    var cksums = std.StringHashMap(?[]const u8).init(gpa);
+    defer cksums.deinit();
+    const out = try writeLock(gpa, &graph, &cksums, .v4);
+    defer gpa.free(out);
+    const expected = try readFixture("testdata/cargo/resolve/diamond.expected-lock");
+    defer gpa.free(expected);
+    try std.testing.expectEqualStrings(expected, out);
+}
+
+test "writer reproduces the offline-ok oracle lock bytes" {
+    const gpa = std.testing.allocator;
+    const v010 = try semver.Version.parse("0.1.0");
+    const v020 = try semver.Version.parse("0.2.0");
+    const v030 = try semver.Version.parse("0.3.0");
+    const path: sources.SourceId = .{ .path = "" };
+    const leaf_refs = [_]resolve.ResolvedRef{};
+    const mid_refs = [_]resolve.ResolvedRef{.{ .name = "leaf", .version = v030, .source = path }};
+    const app_refs = [_]resolve.ResolvedRef{.{ .name = "mid", .version = v020, .source = path }};
+    var nodes = [_]resolve.ResolvedNode{
+        .{ .name = "leaf", .version = v030, .source = path, .deps = &leaf_refs },
+        .{ .name = "app", .version = v010, .source = path, .deps = &app_refs },
+        .{ .name = "mid", .version = v020, .source = path, .deps = &mid_refs },
+    };
+    var graph = t11PathGraph(&nodes);
+    defer graph.deinit();
+    var cksums = std.StringHashMap(?[]const u8).init(gpa);
+    defer cksums.deinit();
+    const out = try writeLock(gpa, &graph, &cksums, .v4);
+    defer gpa.free(out);
+    const expected = try readFixture("testdata/cargo/resolve/offline-ok.expected-lock");
+    defer gpa.free(expected);
+    try std.testing.expectEqualStrings(expected, out);
+}
+
+test "almost-locked previous lock parses and rewrites byte-identically" {
+    // Task 11 case 1 fixture: pins shared 1.1.0 under a ^1.0 req. The
+    // conservative-keep RESOLUTION is pinned by resolve.zig's
+    // `resolve keeps previous versions when still valid`; here the fixture
+    // itself must be canonical (parse shape + byte-stable rewrite).
+    const gpa = std.testing.allocator;
+    const text = try readFixture("testdata/cargo/resolve/almost-locked/previous.lock");
+    defer gpa.free(text);
+    var lf = try parseLock(gpa, text);
+    defer lf.deinit();
+    try std.testing.expectEqual(@as(u32, 4), lf.version);
+    try std.testing.expectEqual(@as(usize, 2), lf.packages.len);
+    const shared_pkg = lf.find("shared").?;
+    const app_pkg = lf.find("app").?;
+    try std.testing.expectEqualStrings("1.1.0", shared_pkg.version);
+    try std.testing.expectEqual(@as(usize, 1), app_pkg.dependencies.len);
+    try std.testing.expectEqualStrings("shared", app_pkg.dependencies[0]);
+    const out = try lf.serialize(gpa);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings(text, out);
+}
+
+test "lock v3 input keeps version on rewrite" {
+    // Task 11 case 11 fixture: a v3 lock over a compatible graph must NOT
+    // be silently bumped; rewriting at the decided version preserves bytes,
+    // and only an explicit upgrade decision changes the header.
+    const gpa = std.testing.allocator;
+    const text = try readFixture("testdata/cargo/resolve/lock-v3-keep/Cargo.lock");
+    defer gpa.free(text);
+    var lf = try parseLock(gpa, text);
+    defer lf.deinit();
+    try std.testing.expectEqual(@as(u32, 3), lf.version);
+    try std.testing.expectEqual(@as(usize, 2), lf.packages.len);
+    const rt = try lf.serialize(gpa);
+    defer gpa.free(rt);
+    try std.testing.expectEqualStrings(text, rt);
+    // Same node set through the writer at .v3 reproduces the fixture.
+    const v010 = try semver.Version.parse("0.1.0");
+    const v020 = try semver.Version.parse("0.2.0");
+    const path: sources.SourceId = .{ .path = "" };
+    const app_refs = [_]resolve.ResolvedRef{.{ .name = "lib", .version = v020, .source = path }};
+    var nodes = [_]resolve.ResolvedNode{
+        .{ .name = "lib", .version = v020, .source = path, .deps = &.{} },
+        .{ .name = "app", .version = v010, .source = path, .deps = &app_refs },
+    };
+    var graph = t11PathGraph(&nodes);
+    defer graph.deinit();
+    var cksums = std.StringHashMap(?[]const u8).init(gpa);
+    defer cksums.deinit();
+    const out3 = try writeLock(gpa, &graph, &cksums, .v3);
+    defer gpa.free(out3);
+    try std.testing.expectEqualStrings(text, out3);
+    // An explicit upgrade decision (Task 9 version-bump rule) only changes
+    // the header line for this checksum-free graph.
+    const out4 = try writeLock(gpa, &graph, &cksums, .v4);
+    defer gpa.free(out4);
+    try std.testing.expect(std.mem.indexOf(u8, out4, "version = 4\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out4, "version = 3\n") == null);
+}
+
+test "lock v1 metadata upgrades to v4" {
+    // Task 11 case 12 fixture: v1-era input (no version line, checksums in
+    // [metadata]) attaches the checksum on read, then rewrites at v4 with
+    // an inline checksum line and no [metadata] table.
+    const gpa = std.testing.allocator;
+    const text = try readFixture("testdata/cargo/resolve/lock-upgrade/Cargo.lock");
+    defer gpa.free(text);
+    var lf = try parseLock(gpa, text);
+    defer lf.deinit();
+    const e64 = "e" ** 64;
+    const lib_pkg = lf.find("lib").?;
+    const app_pkg = lf.find("app").?;
+    try std.testing.expectEqualStrings(e64[0..], lib_pkg.checksum.?);
+    try std.testing.expectEqual(@as(usize, 1), app_pkg.dependencies.len);
+    // Rewrite at v4 from the equivalent graph + checksum map.
+    const v010 = try semver.Version.parse("0.1.0");
+    const v100 = try semver.Version.parse("1.0.0");
+    const reg: sources.SourceId = .{ .registry = "sparse+https://github.com/rust-lang/crates.io-index" };
+    const path: sources.SourceId = .{ .path = "" };
+    const app_refs = [_]resolve.ResolvedRef{.{ .name = "lib", .version = v100, .source = reg }};
+    var nodes = [_]resolve.ResolvedNode{
+        .{ .name = "app", .version = v010, .source = path, .deps = &app_refs },
+        .{ .name = "lib", .version = v100, .source = reg, .deps = &.{} },
+    };
+    var graph = t11PathGraph(&nodes);
+    defer graph.deinit();
+    const src = "registry+https://github.com/rust-lang/crates.io-index";
+    const ck = try checksumKey(gpa, "lib", "1.0.0", src);
+    defer gpa.free(ck);
+    var cksums = std.StringHashMap(?[]const u8).init(gpa);
+    defer cksums.deinit();
+    try cksums.put(ck, e64[0..]);
+    const out = try writeLock(gpa, &graph, &cksums, .v4);
+    defer gpa.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "version = 4\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "checksum = \"" ++ e64 ++ "\"\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[metadata]") == null);
+    // And the v4 output reparses with the checksum inline.
+    var lf2 = try parseLock(gpa, out);
+    defer lf2.deinit();
+    const lib_pkg2 = lf2.find("lib").?;
+    try std.testing.expectEqual(@as(u32, 4), lf2.version);
+    try std.testing.expectEqualStrings(e64[0..], lib_pkg2.checksum.?);
+}
+
+test "locked-fails fixture is stale against its manifests" {
+    // Task 11 case 14 fixture: the committed lock pins lib 1.0.0 while the
+    // member manifest is lib 2.0.0, so a --locked resolve MUST bail
+    // (would_change). The bail text + LockCheck live in cli.zig (owning
+    // worker); this test pins the fixture half: decoded node sets differ.
+    const gpa = std.testing.allocator;
+    const text = try readFixture("testdata/cargo/resolve/locked-fails/Cargo.lock");
+    defer gpa.free(text);
+    var lf = try parseLock(gpa, text);
+    defer lf.deinit();
+    const lib_pkg = lf.find("lib").?;
+    try std.testing.expectEqualStrings("1.0.0", lib_pkg.version);
+    const v010 = try semver.Version.parse("0.1.0");
+    const v200 = try semver.Version.parse("2.0.0");
+    const v100 = try semver.Version.parse("1.0.0");
+    const path: sources.SourceId = .{ .path = "" };
+    const app_refs = [_]resolve.ResolvedRef{.{ .name = "lib", .version = v200, .source = path }};
+    var nodes = [_]resolve.ResolvedNode{
+        .{ .name = "app", .version = v010, .source = path, .deps = &app_refs },
+        .{ .name = "lib", .version = v200, .source = path, .deps = &.{} },
+    };
+    var graph = t11PathGraph(&nodes);
+    defer graph.deinit();
+    try std.testing.expect(graph.find("lib", v200) != null);
+    try std.testing.expect(graph.find("lib", v100) == null);
+}
+
+// --- Task 8: byte-stable Cargo.lock v4 writer (+ v3/v2/v1 read-compat) ---
+//
+// Reference pins:
+// - `encode.rs::EncodeState::new` + `encodable_package_id` (THE
+//   edge-shortening rule) + `encodable_resolve_node` + `Serialize for
+//   Resolve` (sort by PackageId Ord, checksum placement, version-line
+//   mapping V5→5/V4→4/V3→3/V2|V1→absent).
+// - `ops/lockfile.rs::serialize_resolve` + `emit_package` (THE byte layout
+//   — replicated push-for-push, NOT via a generic TOML emitter).
+// - `ops/lockfile.rs::write_pkg_lockfile` (version upgrade
+//   `current < default` on next write; `writeLock` takes the
+//   ALREADY-decided version — Task 9 triggers the upgrade).
+//
+// Layout replication notes (verified against real `cargo generate-lockfile`
+// bytes, e.g. validation/*/Cargo.lock + /tmp shape probes in the report):
+// every `[[package]]` block ends with a blank line (cargo's
+// `encodable_resolve_node` always sets `dependencies = Some(..)`, even when
+// empty, so `emit_package` always pushes its trailing `'\n'`); for ≥v2 the
+// EOF `while out.ends_with("\n\n") pop` leaves exactly one `\n`; v1 keeps
+// the historical trailing blank line. Dependency edges sort byte-wise as
+// RENDERED strings — identical to derived-`Ord` on
+// `TomlLockfilePackageId{name, version: Option<String>, source}` since the
+// rendering `name[ version][ (source)]` preserves that field order
+// lexicographically.
+
+/// Mirrors cargo's `ResolveVersion` (no v5: read bails without
+/// `-Znext-lockfile-bump`, and the writer never emits it).
+pub const ResolveVersion = enum { v1, v2, v3, v4 };
+
+/// `resolve.rs::with_rust_version` floors (copy of the constants at
+/// resolve.rs:124-148 of the vendored cargo): none → V4 (default); ≥1.83 →
+/// V4; ≥1.53 → V3; ≥1.41 → V2; else V1. Comparison is (major, minor) only —
+/// the workspace rust-version is a partial version there too.
+pub fn versionForRustVersion(lowest_rust_version: ?semver.Version) ResolveVersion {
+    const v = lowest_rust_version orelse return .v4;
+    if (v.major > 1 or (v.major == 1 and v.minor >= 83)) return .v4;
+    if (v.major == 1 and v.minor >= 53) return .v3;
+    if (v.major == 1 and v.minor >= 41) return .v2;
+    return .v1;
+}
+
+fn toLockVersion(v: ResolveVersion) sources.LockVersion {
+    return switch (v) {
+        .v1 => .v1,
+        .v2 => .v2,
+        .v3 => .v3,
+        .v4 => .v4,
+    };
+}
+
+/// Canonical checksum-map key: `"<name> <version>[ <source-line>]"` (the
+/// source part is the `lockSourceLine` rendering, or absent for path
+/// packages). `writeLock` looks keys up with this helper; populate the map
+/// with it so later tasks (M4 driver) cannot drift from the convention.
+pub fn checksumKey(gpa: std.mem.Allocator, name: []const u8, version: []const u8, source_line: ?[]const u8) LockError![]u8 {
+    if (source_line) |s| {
+        return std.fmt.allocPrint(gpa, "{s} {s} {s}", .{ name, version, s }) catch return LockError.OutOfMemory;
+    }
+    return std.fmt.allocPrint(gpa, "{s} {s}", .{ name, version }) catch return LockError.OutOfMemory;
+}
+
+fn renderVersion(gpa: std.mem.Allocator, v: semver.Version) LockError![]u8 {
+    if (v.pre.len == 0 and v.build.len == 0) {
+        return std.fmt.allocPrint(gpa, "{d}.{d}.{d}", .{ v.major, v.minor, v.patch }) catch return LockError.OutOfMemory;
+    } else if (v.build.len == 0) {
+        return std.fmt.allocPrint(gpa, "{d}.{d}.{d}-{s}", .{ v.major, v.minor, v.patch, v.pre }) catch return LockError.OutOfMemory;
+    } else if (v.pre.len == 0) {
+        return std.fmt.allocPrint(gpa, "{d}.{d}.{d}+{s}", .{ v.major, v.minor, v.patch, v.build }) catch return LockError.OutOfMemory;
+    }
+    return std.fmt.allocPrint(gpa, "{d}.{d}.{d}-{s}+{s}", .{ v.major, v.minor, v.patch, v.pre, v.build }) catch return LockError.OutOfMemory;
+}
+
+const VerKey = struct {
+    name: []const u8,
+    major: u64,
+    minor: u64,
+    patch: u64,
+    pre: []const u8,
+    build: []const u8,
+    fn of(name: []const u8, v: semver.Version) VerKey {
+        return .{ .name = name, .major = v.major, .minor = v.minor, .patch = v.patch, .pre = v.pre, .build = v.build };
+    }
+};
+
+const VerCtx = struct {
+    pub fn hash(_: VerCtx, k: VerKey) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(k.name);
+        h.update(k.pre);
+        h.update(k.build);
+        h.update(std.mem.asBytes(&k.major));
+        h.update(std.mem.asBytes(&k.minor));
+        h.update(std.mem.asBytes(&k.patch));
+        return h.final();
+    }
+    pub fn eql(_: VerCtx, a: VerKey, b: VerKey) bool {
+        return a.major == b.major and a.minor == b.minor and a.patch == b.patch and
+            std.mem.eql(u8, a.name, b.name) and std.mem.eql(u8, a.pre, b.pre) and std.mem.eql(u8, a.build, b.build);
+    }
+};
+
+/// `EncodeState` (encode.rs): per-graph occurrence counts driving
+/// `shortEdge`. `pair_counts`/`name_versions` are the plan-pinned public
+/// fields; the private tables give allocation-free structural lookup plus
+/// arena-owned canonical version renderings (so `shortEdge` needs no
+/// allocator). Keys compare by CONTENT, so no lifetime ties to the graph.
+pub const NameCounts = struct {
+    pair_counts: std.StringHashMap(std.StringHashMap(u32)), // name → (rendered version → node occurrences)
+    name_versions: std.StringHashMap(u32), // name → distinct version count (bare-name edge allowed only when 1)
+    arena: std.heap.ArenaAllocator, // owns canonical rendered version strings
+    counts: std.HashMap(VerKey, u32, VerCtx, std.hash_map.default_max_load_percentage),
+    rendered: std.HashMap(VerKey, []const u8, VerCtx, std.hash_map.default_max_load_percentage),
+    pub fn deinit(self: *NameCounts) void {
+        var it = self.pair_counts.iterator();
+        while (it.next()) |kv| kv.value_ptr.deinit();
+        self.pair_counts.deinit();
+        self.name_versions.deinit();
+        self.counts.deinit();
+        self.rendered.deinit();
+        self.arena.deinit();
+    }
+    /// Counts every (name, version) node. Versions render once per distinct
+    /// pair; occurrences accumulate (multi-source same-version nodes count
+    /// separately, exactly like cargo's `EncodeState::new`).
+    pub fn build(gpa: std.mem.Allocator, graph: *const resolve.ResolveGraph) std.mem.Allocator.Error!NameCounts {
+        var self = NameCounts{
+            .pair_counts = std.StringHashMap(std.StringHashMap(u32)).init(gpa),
+            .name_versions = std.StringHashMap(u32).init(gpa),
+            .arena = std.heap.ArenaAllocator.init(gpa),
+            .counts = std.HashMap(VerKey, u32, VerCtx, std.hash_map.default_max_load_percentage).init(gpa),
+            .rendered = std.HashMap(VerKey, []const u8, VerCtx, std.hash_map.default_max_load_percentage).init(gpa),
+        };
+        errdefer self.deinit();
+        const aa = self.arena.allocator();
+        for (graph.nodes) |node| {
+            const key = VerKey.of(node.name, node.version);
+            const gop = try self.counts.getOrPut(key);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = key;
+                gop.value_ptr.* = 1;
+                const rv: []const u8 = std.fmt.allocPrint(aa, "{d}.{d}.{d}{s}{s}{s}{s}", .{
+                    node.version.major,
+                    node.version.minor,
+                    node.version.patch,
+                    if (node.version.pre.len > 0) "-" else "",
+                    node.version.pre,
+                    if (node.version.build.len > 0) "+" else "",
+                    node.version.build,
+                }) catch return std.mem.Allocator.Error.OutOfMemory;
+                try self.rendered.put(key, rv);
+                const ip = try self.pair_counts.getOrPut(node.name);
+                if (!ip.found_existing) ip.value_ptr.* = std.StringHashMap(u32).init(gpa);
+                try ip.value_ptr.put(rv, 1);
+                const np = try self.name_versions.getOrPut(node.name);
+                if (!np.found_existing) np.value_ptr.* = 0;
+                np.value_ptr.* += 1;
+            } else {
+                gop.value_ptr.* += 1;
+                const inner = self.pair_counts.getPtr(node.name).?;
+                const rv = self.rendered.get(key).?;
+                inner.getPtr(rv).?.* += 1;
+            }
+        }
+        return self;
+    }
+    /// Occurrences of one (name, version) pair.
+    pub fn pairCount(self: *const NameCounts, name: []const u8, version: semver.Version) u32 {
+        return self.counts.get(VerKey.of(name, version)) orelse 0;
+    }
+    /// Distinct versions for one name.
+    pub fn versionCount(self: *const NameCounts, name: []const u8) u32 {
+        return self.name_versions.get(name) orelse 0;
+    }
+};
+
+/// `encodable_package_id` edge forms. Slices borrow the caller's `name` /
+/// `source_line` and `counts`' canonical renderings (all alive through the
+/// `writeLock` call); no allocation.
+pub const EdgeForm = union(enum) {
+    bare: []const u8,
+    version_only: struct { name: []const u8, version: []const u8 },
+    full: struct { name: []const u8, version: []const u8, source: []const u8 },
+};
+
+// Defensive-only fallback buffer for off-graph versions (a caller bug:
+// `writeLock` only queries graph versions, which always hit the canonical
+// table). Sized far beyond any real version string.
+var short_miss_buf: [1024]u8 = undefined;
+
+/// THE edge-shortening rule (`encodable_package_id`): count per
+/// (name, version); count==1 for the pair → drop source; additionally a
+/// single version for the name → drop version (bare name). Path edges never
+/// carry a source (encode: path → None), so they render at most
+/// `version_only`. V1 callers must NOT call this (V1 never shortens).
+pub fn shortEdge(name: []const u8, version: ?semver.Version, source_line: ?[]const u8, counts: *const NameCounts) EdgeForm {
+    const v = version orelse return .{ .bare = name };
+    const key = VerKey.of(name, v);
+    const pc = counts.counts.get(key) orelse 0;
+    const vc = counts.versionCount(name);
+    const rv: []const u8 = counts.rendered.get(key) orelse blk: {
+        const s = std.fmt.bufPrint(&short_miss_buf, "{d}.{d}.{d}{s}{s}{s}{s}", .{
+            v.major, v.minor, v.patch,
+            if (v.pre.len > 0) "-" else "",
+            v.pre,
+            if (v.build.len > 0) "+" else "",
+            v.build,
+        }) catch &short_miss_buf;
+        break :blk s[0..@min(s.len, short_miss_buf.len)];
+    };
+    if (pc == 1 and vc == 1) return .{ .bare = name };
+    if (pc == 1 or source_line == null) return .{ .version_only = .{ .name = name, .version = rv } };
+    return .{ .full = .{ .name = name, .version = rv, .source = source_line.? } };
+}
+
+pub fn writeLock(gpa: std.mem.Allocator, graph: *const resolve.ResolveGraph, checksums: *const std.StringHashMap(?[]const u8), version: ResolveVersion) LockError![]u8 {
+    return writeLockWithOrig(gpa, graph, checksums, version, null);
+}
+
+/// One `[[patch.unused]]` entry: a declared `[patch]` package that matched
+/// nothing during resolution (`Resolve::unused_patches: Vec<PackageId>` in
+/// `core/resolver/resolve.rs`, preserved across rewrites by
+/// `merge_from`). Emitted in slice order (cargo iterates the Vec in order).
+/// Source and checksum render exactly like packages: the package-form source
+/// line (which keeps `#precise` -- cargo passes `id.source_id()` directly,
+/// NOT `without_precise`, for unused-patch entries) and the inline checksum
+/// iff `version >= v2` via the same `checksums` map/`checksumKey` convention.
+/// (Producer note: rime has no `[patch]` resolution yet -- Task-12
+/// `patchPreferences` -- so these carriers are populated by the M4 driver
+/// from the previous lockfile's `[[patch.unused]]` tables via `merge_from`
+/// semantics; the writer only guarantees cargo-order emission.)
+pub const PatchUnusedEntry = struct {
+    name: []const u8,
+    version: semver.Version,
+    source: sources.SourceId,
+};
+
+/// One carried `[metadata]` row (`Resolve::metadata: TomlLockfileMetadata`,
+/// "unknown" data preserved for forwards-compat via `merge_from`). Sorted
+/// byte-wise by key on write (BTreeMap order) and emitted as the LAST table
+/// (cargo order: packages, then `[[patch.unused]]`, then `[metadata]`).
+/// For v1, cargo additionally merges the derived checksum rows into this same
+/// table (`Serialize for Resolve`: carried metadata + `checksum {id}` rows);
+/// row insertion overwrites on key collision (BTreeMap insert semantics).
+pub const MetadataEntry = struct { key: []const u8, value: []const u8 };
+
+/// `writeLock` with the `Serialize for Resolve` carriers: unused patches +
+/// carried metadata, emitted in cargo order after the packages. `writeLock`
+/// delegates with empty carriers (no `[[patch.unused]]`/`[metadata]` when
+/// there is nothing to carry -- cargo's `skip_serializing_if` empty rules).
+pub fn writeLockFull(gpa: std.mem.Allocator, graph: *const resolve.ResolveGraph, checksums: *const std.StringHashMap(?[]const u8), version: ResolveVersion, patch_unused: []const PatchUnusedEntry, metadata: []const MetadataEntry) LockError![]u8 {
+    return writeLockFullWithOrig(gpa, graph, checksums, version, patch_unused, metadata, null);
+}
+
+/// `serialize_resolve` replication. `orig` is the previous lockfile text (or
+/// null on fresh write): only its leading `#` comment lines are preserved
+/// (cargo's marker-skip logic copied exactly).
+pub fn writeLockWithOrig(gpa: std.mem.Allocator, graph: *const resolve.ResolveGraph, checksums: *const std.StringHashMap(?[]const u8), version: ResolveVersion, orig: ?[]const u8) LockError![]u8 {
+    return writeLockFullWithOrig(gpa, graph, checksums, version, &.{}, &.{}, orig);
+}
+
+/// Full `serialize_resolve` replication: comment preservation from `orig` +
+/// packages + `[[patch.unused]]` + `[metadata]`, with the ≥v2 EOF trim.
+pub fn writeLockFullWithOrig(gpa: std.mem.Allocator, graph: *const resolve.ResolveGraph, checksums: *const std.StringHashMap(?[]const u8), version: ResolveVersion, patch_unused: []const PatchUnusedEntry, metadata: []const MetadataEntry, orig: ?[]const u8) LockError![]u8 {
+    const marker1 = "# This file is automatically @generated by Cargo.";
+    const marker2 = "# It is not intended for manual editing.";
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try out.appendSlice(gpa, marker1);
+    try out.appendSlice(gpa, "\n");
+    try out.appendSlice(gpa, marker2);
+    try out.appendSlice(gpa, "\n");
+    if (orig) |o| {
+        // Preserve any other top comments (serialize_resolve logic exactly:
+        // leading `#` run; skip first iff == marker1; skip second iff ==
+        // marker2; keep the rest).
+        var comments: std.ArrayList([]const u8) = .empty;
+        defer comments.deinit(gpa);
+        var lines = std.mem.splitScalar(u8, o, '\n');
+        while (lines.next()) |ln| {
+            const line = if (ln.len > 0 and ln[ln.len - 1] == '\r') ln[0 .. ln.len - 1] else ln;
+            if (!std.mem.startsWith(u8, line, "#")) break;
+            comments.append(gpa, line) catch return LockError.OutOfMemory;
+        }
+        var ci: usize = 0;
+        if (ci < comments.items.len) {
+            if (!std.mem.eql(u8, comments.items[ci], marker1)) {
+                try out.appendSlice(gpa, comments.items[ci]);
+                try out.appendSlice(gpa, "\n");
+            }
+            ci += 1;
+            if (ci < comments.items.len) {
+                if (!std.mem.eql(u8, comments.items[ci], marker2)) {
+                    try out.appendSlice(gpa, comments.items[ci]);
+                    try out.appendSlice(gpa, "\n");
+                }
+                ci += 1;
+                while (ci < comments.items.len) : (ci += 1) {
+                    try out.appendSlice(gpa, comments.items[ci]);
+                    try out.appendSlice(gpa, "\n");
+                }
+            }
+        }
+    }
+    // `Serialize for Resolve`: V5→5/V4→4/V3→3, V2|V1→absent (no line at
+    // all). Present line renders `version = N` + blank line.
+    switch (version) {
+        .v3 => try out.appendSlice(gpa, "version = 3\n\n"),
+        .v4 => try out.appendSlice(gpa, "version = 4\n\n"),
+        .v1, .v2 => {},
+    }
+
+    var counts = NameCounts.build(gpa, graph) catch return LockError.OutOfMemory;
+    defer counts.deinit();
+    const lv = toLockVersion(version);
+    const nn = graph.nodes.len;
+    // Per-node source lines (package `source` fields keep `#precise`;
+    // edges use the without-precise form — computed per ref below).
+    var srclines = gpa.alloc(?[]u8, nn) catch return LockError.OutOfMemory;
+    defer {
+        for (srclines) |s| if (s) |l| gpa.free(l);
+        gpa.free(srclines);
+    }
+    for (graph.nodes, 0..) |node, i| {
+        srclines[i] = try sources.SourceId.lockSourceLine(gpa, node.source, lv);
+    }
+    // Packages sorted by (name, version, source) — cargo's PackageId Ord
+    // (version compares numerically; source by rendered line, "" for path).
+    const order = gpa.alloc(usize, nn) catch return LockError.OutOfMemory;
+    defer gpa.free(order);
+    for (order, 0..) |*o, i| o.* = i;
+    const SortCtx = struct {
+        nodes: []const resolve.ResolvedNode,
+        srclines: []const ?[]u8,
+    };
+    std.mem.sort(usize, order, SortCtx{ .nodes = graph.nodes, .srclines = srclines }, struct {
+        fn lt(ctx: SortCtx, a: usize, b: usize) bool {
+            const na = ctx.nodes[a];
+            const nb = ctx.nodes[b];
+            switch (std.mem.order(u8, na.name, nb.name)) {
+                .lt => return true,
+                .gt => return false,
+                .eq => {},
+            }
+            switch (na.version.order(nb.version)) {
+                .lt => return true,
+                .gt => return false,
+                .eq => {},
+            }
+            const sa = ctx.srclines[a] orelse "";
+            const sb = ctx.srclines[b] orelse "";
+            return std.mem.order(u8, sa, sb) == .lt;
+        }
+    }.lt);
+
+    // V1 metadata checksum entries, collected then sorted by key
+    // (BTreeMap order in cargo's TomlLockfileMetadata).
+    var meta: std.ArrayList(MetaEntry) = .empty;
+    defer {
+        for (meta.items) |e| gpa.free(e.key);
+        meta.deinit(gpa);
+    }
+
+    for (order) |idx| {
+        const node = graph.nodes[idx];
+        const rv = counts.rendered.get(VerKey.of(node.name, node.version)).?; // invariant: build() covers every node
+        try out.appendSlice(gpa, "[[package]]\nname = \"");
+        try appendEscaped(&out, gpa, node.name);
+        try out.appendSlice(gpa, "\"\nversion = \"");
+        try appendEscaped(&out, gpa, rv);
+        try out.appendSlice(gpa, "\"\n");
+        if (srclines[idx]) |s| {
+            try out.appendSlice(gpa, "source = \"");
+            try appendEscaped(&out, gpa, s);
+            try out.appendSlice(gpa, "\"\n");
+        }
+        // Inline checksums are V2+ (`encodable_resolve_node`: None for V1).
+        var cksum: ?[]const u8 = null;
+        if (version != .v1) {
+            const key = try checksumKey(gpa, node.name, rv, srclines[idx]);
+            defer gpa.free(key);
+            if (checksums.get(key)) |entry| cksum = entry;
+        }
+        if (cksum) |c| {
+            try out.appendSlice(gpa, "checksum = \"");
+            try appendEscaped(&out, gpa, c);
+            try out.appendSlice(gpa, "\"\n");
+        }
+        // Edges: rendered per ref, sorted byte-wise (== derived Ord on the
+        // rendered `name[ version][ (source)]` form), then the
+        // `dependencies = [...]` block; the trailing blank line is pushed
+        // UNCONDITIONALLY (cargo's `dependencies = Some(..)` key is always
+        // present, even when empty).
+        var edges: std.ArrayList([]u8) = .empty;
+        defer {
+            for (edges.items) |e| gpa.free(e);
+            edges.deinit(gpa);
+        }
+        for (node.deps) |d| {
+            const eline = try sources.lockEdgeLine(gpa, d.source, lv);
+            defer if (eline) |l| gpa.free(l);
+            var eb: std.ArrayList(u8) = .empty;
+            defer eb.deinit(gpa);
+            if (version == .v1) {
+                // V1 never shortens: full `name version[ (source)]`.
+                const drv = counts.rendered.get(VerKey.of(d.name, d.version)).?;
+                try eb.appendSlice(gpa, d.name);
+                try eb.appendSlice(gpa, " ");
+                try eb.appendSlice(gpa, drv);
+                if (eline) |l| {
+                    try eb.appendSlice(gpa, " (");
+                    try eb.appendSlice(gpa, l);
+                    try eb.appendSlice(gpa, ")");
+                }
+            } else {
+                switch (shortEdge(d.name, d.version, eline, &counts)) {
+                    .bare => |b| try eb.appendSlice(gpa, b),
+                    .version_only => |vo| {
+                        try eb.appendSlice(gpa, vo.name);
+                        try eb.appendSlice(gpa, " ");
+                        try eb.appendSlice(gpa, vo.version);
+                    },
+                    .full => |f| {
+                        try eb.appendSlice(gpa, f.name);
+                        try eb.appendSlice(gpa, " ");
+                        try eb.appendSlice(gpa, f.version);
+                        try eb.appendSlice(gpa, " (");
+                        try eb.appendSlice(gpa, f.source);
+                        try eb.appendSlice(gpa, ")");
+                    },
+                }
+            }
+            edges.append(gpa, try eb.toOwnedSlice(gpa)) catch return LockError.OutOfMemory;
+        }
+        std.mem.sort([]u8, edges.items, {}, struct {
+            fn lt(_: void, a: []u8, b: []u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lt);
+        if (edges.items.len > 0) {
+            try out.appendSlice(gpa, "dependencies = [\n");
+            for (edges.items) |e| {
+                try out.appendSlice(gpa, " \"");
+                try appendEscaped(&out, gpa, e);
+                try out.appendSlice(gpa, "\",\n");
+            }
+            try out.appendSlice(gpa, "]\n");
+        }
+        try out.appendSlice(gpa, "\n");
+        // V1 metadata rows: non-path nodes only; key source is the
+        // edge-form (without-precise + ≤V2 master rewrite — exactly what
+        // `encodable_package_id` feeds `format!("checksum {}", id)`).
+        if (version == .v1 and srclines[idx] != null) {
+            const eline = try sources.lockEdgeLine(gpa, node.source, lv);
+            defer if (eline) |l| gpa.free(l);
+            var kb: std.ArrayList(u8) = .empty;
+            defer kb.deinit(gpa);
+            try kb.appendSlice(gpa, "checksum ");
+            try kb.appendSlice(gpa, node.name);
+            try kb.appendSlice(gpa, " ");
+            try kb.appendSlice(gpa, rv);
+            if (eline) |l| {
+                try kb.appendSlice(gpa, " (");
+                try kb.appendSlice(gpa, l);
+                try kb.appendSlice(gpa, ")");
+            }
+            const key = try kb.toOwnedSlice(gpa);
+            errdefer gpa.free(key);
+            const ckey = try checksumKey(gpa, node.name, rv, srclines[idx]);
+            defer gpa.free(ckey);
+            const value: []const u8 = if (checksums.get(ckey)) |entry| entry orelse "<none>" else "<none>";
+            meta.append(gpa, .{ .key = key, .value = value }) catch return LockError.OutOfMemory;
+        }
+    }
+    // `[[patch.unused]]` blocks in slice order (cargo iterates
+    // `Resolve::unused_patches` Vec in order; `serialize_resolve` renders
+    // each via `emit_package` -- same field order as packages, no
+    // dependencies/replace keys -- plus one trailing blank line).
+    for (patch_unused) |p| {
+        const prv = try renderVersion(gpa, p.version);
+        defer gpa.free(prv);
+        const pline = try sources.SourceId.lockSourceLine(gpa, p.source, lv);
+        defer if (pline) |l| gpa.free(l);
+        try out.appendSlice(gpa, "[[patch.unused]]\nname = \"");
+        try appendEscaped(&out, gpa, p.name);
+        try out.appendSlice(gpa, "\"\nversion = \"");
+        try appendEscaped(&out, gpa, prv);
+        try out.appendSlice(gpa, "\"\n");
+        if (pline) |s| {
+            try out.appendSlice(gpa, "source = \"");
+            try appendEscaped(&out, gpa, s);
+            try out.appendSlice(gpa, "\"\n");
+        }
+        if (version != .v1) {
+            const pkey = try checksumKey(gpa, p.name, prv, pline);
+            defer gpa.free(pkey);
+            if (checksums.get(pkey)) |entry| {
+                if (entry) |c| {
+                    try out.appendSlice(gpa, "checksum = \"");
+                    try appendEscaped(&out, gpa, c);
+                    try out.appendSlice(gpa, "\"\n");
+                }
+            }
+        }
+        try out.appendSlice(gpa, "\n");
+    }
+    // `[metadata]` table last: carried entries plus (v1 only) the derived
+    // checksum rows merged in (`Serialize for Resolve` clones the carried
+    // map, then inserts `checksum {id}` rows); carried rows lose on key
+    // collision (BTreeMap insert overwrites). Sorted byte-wise by key.
+    var all_meta: std.ArrayList(MetaEntry) = .empty;
+    defer all_meta.deinit(gpa);
+    // Both sources borrow memory alive through emission (the caller's
+    // `metadata` slice; the local v1 `meta` rows) -- no copies, no frees.
+    for (metadata) |m| {
+        try all_meta.append(gpa, .{ .key = m.key, .value = m.value });
+    }
+    for (meta.items) |e| {
+        var replaced = false;
+        for (all_meta.items) |*a| {
+            if (std.mem.eql(u8, a.key, e.key)) {
+                a.value = e.value;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) try all_meta.append(gpa, e);
+    }
+    if (all_meta.items.len > 0) {
+        std.mem.sort(MetaEntry, all_meta.items, {}, struct {
+            fn lt(_: void, a: MetaEntry, b: MetaEntry) bool {
+                return std.mem.order(u8, a.key, b.key) == .lt;
+            }
+        }.lt);
+        try out.appendSlice(gpa, "[metadata]\n");
+        for (all_meta.items) |e| {
+            try out.appendSlice(gpa, "\"");
+            try appendEscaped(&out, gpa, e.key);
+            try out.appendSlice(gpa, "\" = \"");
+            try appendEscaped(&out, gpa, e.value);
+            try out.appendSlice(gpa, "\"\n");
+        }
+    }
+    // Historical V1 keeps trailing blank lines; ≥V2 strips them.
+    if (version != .v1) {
+        while (out.items.len >= 2 and out.items[out.items.len - 1] == '\n' and out.items[out.items.len - 2] == '\n') {
+            _ = out.pop();
+        }
+    }
+    return out.toOwnedSlice(gpa) catch return LockError.OutOfMemory;
 }

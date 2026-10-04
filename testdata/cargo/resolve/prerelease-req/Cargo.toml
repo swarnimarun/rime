@@ -1,0 +1,10 @@
+# Task 11 case 4 (stock prerelease gating): the manifest req below admits
+# the prerelease on the same patch only via the RFC 3493 --precise path;
+# stock matching excludes it. Registry-dependent: rime-only (no spawn).
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+some-crate = ">=1.0.0-alpha, <2.0.0"

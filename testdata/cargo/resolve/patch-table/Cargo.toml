@@ -1,0 +1,14 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = []
+
+[dependencies]
+log = "1"
+
+[patch.crates-io]
+log = { path = "vendor-log" }
+unused-crate = { path = "vendor-unused" }

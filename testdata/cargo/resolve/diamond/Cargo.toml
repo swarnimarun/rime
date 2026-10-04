@@ -1,0 +1,11 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = ["left", "right", "shared"]
+
+[dependencies]
+left = { path = "left", version = "1" }
+right = { path = "right", version = "1" }

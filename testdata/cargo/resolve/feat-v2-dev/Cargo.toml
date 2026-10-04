@@ -1,0 +1,14 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+resolver = "2"
+members = ["dtest", "shared"]
+
+[dependencies]
+shared = { path = "shared", version = "1" }
+
+[dev-dependencies]
+dtest = { path = "dtest", version = "1", features = ["t"] }

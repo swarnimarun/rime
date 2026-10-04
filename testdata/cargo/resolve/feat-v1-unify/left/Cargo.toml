@@ -1,0 +1,10 @@
+[package]
+name = "left"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+shared = { path = "../shared", version = "1" }
+
+[features]
+f = ["shared/feat-a"]

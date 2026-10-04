@@ -1,0 +1,14 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = ["opt"]
+
+[dependencies]
+opt = { path = "opt", version = "1", optional = true }
+
+[features]
+default = []
+f = ["opt?/feat"]

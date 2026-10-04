@@ -1,0 +1,7 @@
+[package]
+name = "m"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mylib.workspace = true

@@ -1,0 +1,4 @@
+[package]
+name = "unused-crate"
+version = "9.9.9"
+edition = "2021"

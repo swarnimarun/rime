@@ -1,0 +1,11 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = ["x", "y"]
+
+[dependencies]
+x = { path = "x", version = "1" }
+y = { path = "y", version = "1" }

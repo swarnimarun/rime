@@ -1,0 +1,13 @@
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = ["real"]
+
+[dependencies]
+old = { package = "real", path = "real", version = "1" }
+
+[features]
+f = ["real/feat"]
