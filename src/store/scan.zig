@@ -24,16 +24,16 @@ pub const ScanError = error{Unexpected, OutOfMemory} || Io.Cancelable ||
 /// Enumerates both tiers. Journal-less objects get kind `.other` (spec §5.2:
 /// kind is best-effort performance metadata, never correctness).
 ///
-/// Index-first (Plan B Task 6): object rows are served from the index when
-/// present, with each digest's file verified in either tier. Values are
-/// identical to the filesystem walk — tier/size/mtime come from the stat
-/// (bytes are authoritative, decision D4), kind comes from the index row
-/// (parsed via `stringToEnum`, `.other` fallback) instead of the journal.
-/// Digests indexed but missing on disk self-heal by row delete. When the
-/// index holds no rows but the walk finds objects (pre-migration store),
-/// the walk results are returned and every found object is upserted so the
-/// next scan hits the index path. The `scanTier`/`loadKinds` walk below is
-/// kept untouched as that fallback.
+/// Index-first (Plan B Task 6; journal retired in Task 12): object rows are
+/// served from the index when present, with each digest's file verified in
+/// either tier. Values are identical to the filesystem walk — tier/size/
+/// mtime come from the stat (bytes are authoritative, decision D4), kind
+/// comes from the index row (parsed via `stringToEnum`, `.other` fallback)
+/// instead of the retired `kinds.jsonl` journal. Digests indexed but missing
+/// on disk self-heal by row delete. When the index holds no rows but the
+/// walk finds objects (pre-migration store), the walk results are returned
+/// and every found object is upserted as `.other` so the next scan hits the
+/// index path. The `scanTier` walk below is that fallback.
 pub fn scan(store: *root.Store, io: Io, gpa: std.mem.Allocator) ScanError![]ObjectInfo {
     if (scanIndex(store, io, gpa)) |maybe| {
         if (maybe) |infos| return infos;
@@ -149,21 +149,36 @@ fn statEitherTier(store: *root.Store, io: Io, d: digest_mod.Digest) ScanError!?T
     return null;
 }
 
-/// Filesystem walk with index backfill: every found object is upserted
-/// (file mtime seeds `last_access_ms` so ages survive migration; cold rows
-/// record the on-disk (compressed) size in both size fields as the
-/// uncompressed size is unknowable from the walk).
+/// Filesystem walk with index backfill: only objects missing from the index
+/// are upserted as `.other` (file mtime seeds `last_access_ms` so ages
+/// survive migration; cold rows record the on-disk (compressed) size in both
+/// size fields as the uncompressed size is unknowable from the walk). Rows
+/// already present keep their recorded kind — unconditionally upserting
+/// would clobber indexed `bin`/`dylib` kinds back to `.other` and make them
+/// look demotable (spec §9.4). Already-indexed entries also report their
+/// recorded kind instead of `.other` so GC demote gates see the true kind.
+/// Kind lives only in the index row after the Task 12 journal retirement —
+/// the walk cannot recover it for unindexed objects, so those report
+/// `.other` (spec §5.2: kind is best-effort performance metadata, never
+/// correctness).
 fn scanFilesystem(store: *root.Store, io: Io, gpa: std.mem.Allocator) ScanError![]ObjectInfo {
-    var kinds = try loadKinds(store, io, gpa);
-    defer kinds.deinit();
-
     var list: std.ArrayList(ObjectInfo) = .empty;
     errdefer list.deinit(gpa);
 
-    try scanTier(io, gpa, store.dir, layout.objects_dir, .hot, &kinds, &list);
-    try scanTier(io, gpa, store.dir, layout.cold_dir, .cold, &kinds, &list);
-    for (list.items) |obj| {
+    try scanTier(io, gpa, store.dir, layout.objects_dir, .hot, &list);
+    try scanTier(io, gpa, store.dir, layout.cold_dir, .cold, &list);
+    for (list.items) |*obj| {
         const hex = obj.digest.toHex();
+        const existing = index_mod.getObject(&store.index, gpa, &hex) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Canceled => return error.Canceled,
+            else => continue,
+        };
+        if (existing) |row| {
+            defer gpa.free(row.kind);
+            obj.kind = std.meta.stringToEnum(root.Kind, row.kind) orelse .other;
+            continue;
+        }
         index_mod.upsertObject(&store.index, .{
             .digest = hex,
             .size = obj.size,
@@ -183,7 +198,6 @@ fn scanTier(
     store_dir: Io.Dir,
     tier_dir: []const u8,
     tier: Tier,
-    kinds: *const KindMap,
     list: *std.ArrayList(ObjectInfo),
 ) ScanError!void {
     const top = store_dir.openDir(io, tier_dir, .{ .iterate = true }) catch return error.Unexpected;
@@ -209,44 +223,10 @@ fn scanTier(
                 .tier = tier,
                 .size = st.size,
                 .mtime_ms = st.mtime.toMilliseconds(),
-                .kind = kinds.get(d.bytes) orelse .other,
+                .kind = .other,
             });
         }
     }
-}
-
-const KindMap = std.AutoHashMap([32]u8, root.Kind);
-
-fn loadKinds(store: *root.Store, io: Io, gpa: std.mem.Allocator) ScanError!KindMap {
-    var map = KindMap.init(gpa);
-    errdefer map.deinit();
-    const path = layout.state_dir ++ "/kinds.jsonl";
-    const bytes = store.dir.readFileAlloc(io, path, gpa, .unlimited) catch |err| switch (err) {
-        error.FileNotFound => return map,
-        else => return error.Unexpected,
-    };
-    defer gpa.free(bytes);
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        const kv = parseKindLine(line) catch continue;
-        try map.put(kv.digest, kv.kind);
-    }
-    return map;
-}
-
-const KindEntry = struct { digest: [32]u8, kind: root.Kind };
-
-fn parseKindLine(line: []const u8) error{InvalidLine}!KindEntry {
-    const d_start = std.mem.indexOf(u8, line, "\"digest\":\"") orelse return error.InvalidLine;
-    const d_val = line[d_start + 10 ..];
-    const d_end = std.mem.indexOfScalar(u8, d_val, '"') orelse return error.InvalidLine;
-    const d = digest_mod.Digest.fromHex(d_val[0..d_end]) catch return error.InvalidLine;
-    const k_start = std.mem.indexOf(u8, line, "\"kind\":\"") orelse return error.InvalidLine;
-    const k_val = line[k_start + 8 ..];
-    const k_end = std.mem.indexOfScalar(u8, k_val, '"') orelse return error.InvalidLine;
-    const kind = std.meta.stringToEnum(root.Kind, k_val[0..k_end]) orelse return error.InvalidLine;
-    return .{ .digest = d.bytes, .kind = kind };
 }
 
 /// Updates mtime on cache hits at most once per touch_interval_ns (spec §9.2).
@@ -324,9 +304,11 @@ test "scan serves indexed objects (index row present; fallback disabled)" {
     const row = try index_mod.getObject(&ts.store.index, gpa, &hex);
     try std.testing.expect(row != null);
     if (row) |r| gpa.free(r.kind);
-    // Disable the filesystem fallback: without kinds.jsonl the walk can only
-    // report kind .other, so kind rlib below proves the index path served it.
-    try ts.store.dir.deleteFile(io, "state/kinds.jsonl");
+    // The retired journal never exists on Task 12 stores; the walk below can
+    // only report kind .other, so kind rlib above proves the index path
+    // served it. Tolerate absence (pre-Task-12 residue deletes it when
+    // present to exercise the same fallback-blindness).
+    ts.store.dir.deleteFile(io, "state/kinds.jsonl") catch {};
     const infos = try ts.store.scan(io, gpa);
     defer gpa.free(infos);
     try std.testing.expectEqual(@as(usize, 1), infos.len);
