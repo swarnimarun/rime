@@ -109,7 +109,11 @@ pub const Index = struct {
             &db,
             c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_FULLMUTEX,
             null,
-        ) != c.SQLITE_OK) return error.DbOpen;
+        ) != c.SQLITE_OK) {
+            // SQLite allocates the handle even on failure; close(NULL) is safe.
+            _ = c.sqlite3_close(db);
+            return error.DbOpen;
+        }
         errdefer _ = c.sqlite3_close(db);
 
         var idx = Index{ .db = db };
@@ -160,13 +164,16 @@ fn bindText(stmt: ?*c.sqlite3_stmt, col: c_int, text: []const u8) void {
     _ = c.sqlite3_bind_text(stmt, col, text.ptr, @intCast(text.len), sqliteTransient());
 }
 
-/// INSERT OR REPLACE: ingest is idempotent, so re-put of the same digest
-/// refreshes size/tier/kind but never duplicates the row.
+/// INSERT ... ON CONFLICT DO UPDATE: ingest is idempotent, so re-put of the same digest
+/// refreshes size/tier/kind but never duplicates the row. ON CONFLICT preserves
+/// object_tags rows; INSERT OR REPLACE would delete + re-insert and cascade-wipe tags.
 pub fn upsertObject(idx: *Index, row: ObjectRow) DbError!void {
     var stmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(idx.db,
-        "INSERT OR REPLACE INTO objects(digest,size,compressed_size,tier,kind,created_ms,last_access_ms)" ++
-        " VALUES(?1,?2,?3,?4,?5,?6,?7);", -1, &stmt, null) != c.SQLITE_OK)
+        "INSERT INTO objects(digest,size,compressed_size,tier,kind,created_ms,last_access_ms)" ++
+        " VALUES(?1,?2,?3,?4,?5,?6,?7)" ++
+        " ON CONFLICT(digest) DO UPDATE SET size=excluded.size,compressed_size=excluded.compressed_size," ++
+        "tier=excluded.tier,kind=excluded.kind,created_ms=excluded.created_ms,last_access_ms=excluded.last_access_ms;", -1, &stmt, null) != c.SQLITE_OK)
         return error.DbPrepare;
     defer _ = c.sqlite3_finalize(stmt);
     bindText(stmt, 1, &row.digest);
@@ -209,7 +216,10 @@ pub fn lruCandidates(idx: *Index, gpa: std.mem.Allocator, tier: ?Tier, limit: u3
     if (tier) |t| bindText(stmt, 2, if (t == .hot) "hot" else if (t == .cold) "cold" else "both");
 
     var list: std.ArrayList(ObjectRow) = .empty;
-    errdefer list.deinit(gpa);
+    errdefer {
+        for (list.items) |r| gpa.free(r.kind);
+        list.deinit(gpa);
+    }
     while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
         var row = ObjectRow{
             .digest = undefined,
@@ -227,7 +237,10 @@ pub fn lruCandidates(idx: *Index, gpa: std.mem.Allocator, tier: ?Tier, limit: u3
         @memcpy(&row.digest, std.mem.span(hex_ptr)[0..64]);
         row.kind = try gpa.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 4)));
         // NOTE: kind strings are one dupe per row; freed by freeRows below.
-        try list.append(gpa, row);
+        list.append(gpa, row) catch |append_err| {
+            gpa.free(row.kind);
+            return append_err;
+        };
     }
     return try list.toOwnedSlice(gpa);
 }
