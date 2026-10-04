@@ -140,10 +140,41 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
         cold_used += obj.size;
     }
     const cold_target = store.limits.cold * 90 / 100;
+
+    // -- Phase 2c: age-based demotion (spec §9.4). Hot objects unaccessed
+    // for longer than cold_after_ns move to cold while it has headroom,
+    // independent of hot quota pressure. Roots and non-demotable kinds
+    // stay hot. `demoted` tracks this run's demotions so the quota loops
+    // below (which walk the pre-run snapshot) skip them; dry runs track
+    // the same set so each object is counted exactly once.
+    var demoted = LiveSet.init(gpa);
+    defer demoted.deinit();
+    for (sorted) |obj| {
+        if (obj.tier != .hot) continue;
+        if (live.contains(obj.digest.bytes)) continue;
+        if (!policy.dry_run and isOlderThan(obj, now_ms, max_age_ns)) continue; // gone in phase 2
+        if (!isOlderThan(obj, now_ms, store.config.cold_after_ns)) continue;
+        if (!cold.isDemotable(obj.kind)) continue;
+        if (cold_used >= cold_target) break; // cold full; the 3b sweep trims it
+        if (!policy.dry_run) {
+            cold.demote(store, io, obj.digest) catch |err| switch (err) {
+                error.ObjectNotFound => continue, // raced; treat as gone
+                error.Canceled => return error.Canceled,
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.Unexpected,
+            };
+            cold_used += coldByteSize(store, io, obj.digest);
+            hot_used -= @min(hot_used, obj.size);
+        }
+        try demoted.put(obj.digest.bytes, {});
+        report.demoted_objects += 1;
+    }
+
     for (sorted) |obj| {
         if (hot_used <= hot_target) break;
         if (obj.tier != .hot) continue;
         if (live.contains(obj.digest.bytes)) continue;
+        if (demoted.contains(obj.digest.bytes)) continue; // handled in phase 2c
         if (!policy.dry_run and isOlderThan(obj, now_ms, max_age_ns)) continue; // evicted in phase 2
         // Demote before evicting: demotable hot objects move to cold while
         // the cold tier has headroom (spec §9.7 order, step 3 before 4).
@@ -502,6 +533,31 @@ test "cold quota sweep evicts oldest unrooted first" {
     try std.testing.expect(!ts.store.exists(io, a)); // oldest unrooted gone
     try std.testing.expect(ts.store.exists(io, b)); // pinned survives
     try std.testing.expect(ts.store.exists(io, c)); // newer unrooted kept
+}
+
+test "idle hot objects demote past cold_after" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = std.testing.allocator;
+    var ts = test_support.openTestStore(io, fixedConfig(10));
+    defer ts.deinit(io);
+    ts.store.limits = .{ .hot = 100 * root.config.GiB, .cold = 100 * root.config.GiB, .reserve = 0 };
+    ts.store.config.max_age_ns = std.math.maxInt(u64);
+    ts.store.config.cold_after_ns = std.time.ns_per_hour; // 1 h idle -> demote
+
+    const a = try ts.store.putBytes(io, "idle payload", .other);
+    const b = try ts.store.putBytes(io, "executable", .bin);
+    // 1970: older than cold_after, younger than max_age.
+    try setMtime(io, &ts.store, a, 1_000);
+    try setMtime(io, &ts.store, b, 1_000);
+
+    const report = try ts.store.gc(io, gpa, .{});
+    try std.testing.expectEqual(@as(u64, 1), report.demoted_objects);
+    try std.testing.expectEqual(@as(u64, 0), report.evicted_objects);
+    // Demoted object stays readable; the hot copy is gone.
+    try std.testing.expect(ts.store.exists(io, a));
+    try std.testing.expect(!ts.store.dirHasHot(io, a));
+    // Executable kinds never demote (spec §9.4), even when idle.
+    try std.testing.expect(ts.store.dirHasHot(io, b));
 }
 
 test "incremental sweep trims old files and counts freed bytes" {
