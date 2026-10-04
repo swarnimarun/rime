@@ -219,6 +219,30 @@ pub fn liveLeases(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir, now_ms: i64
     return try list.toOwnedSlice(gpa);
 }
 
+/// Counts expired leases without deleting them. Powers GcReport
+/// accounting and dry-run expiry estimates (liveLeases deletes).
+/// Skips unreadable/corrupt files like liveLeases does.
+pub fn countExpiredLeases(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir, now_ms: i64) StateError!u64 {
+    var expired: u64 = 0;
+    const leases_dir = store_dir.openDir(io, layout.state_dir ++ "/leases", .{ .iterate = true }) catch return error.Unexpected;
+    defer leases_dir.close(io);
+    var it = leases_dir.iterate();
+    while (try it.next(io)) |entry| {
+        const bytes = leases_dir.readFileAlloc(io, entry.name, gpa, .unlimited) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        defer gpa.free(bytes);
+        const parsed = std.json.parseFromSlice(LeaseJson, gpa, bytes, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
+        defer parsed.deinit();
+        if (now_ms >= parsed.value.expires_ms) expired += 1;
+    }
+    return expired;
+}
+
 pub fn freeLeases(gpa: std.mem.Allocator, leases: []Lease) void {
     for (leases) |l| {
         gpa.free(l.build_id);

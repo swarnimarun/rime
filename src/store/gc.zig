@@ -41,6 +41,8 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
 
     // -- Phase 0: roots (pins, live leases, project retains + manifests). --
     // liveLeases deletes expired lease files as a side effect (expiry).
+    // Count first: after liveLeases the expired files are gone.
+    report.expired_leases = try state.countExpiredLeases(io, gpa, store.dir, now_ms);
     var live = LiveSet.init(gpa);
     defer live.deinit();
 
@@ -277,4 +279,22 @@ test "age trim removes unrooted objects older than max_age" {
     const report = try ts.store.gc(io, gpa, .{});
     try std.testing.expect(report.evicted_objects >= 1);
     try std.testing.expect(!ts.store.exists(io, a));
+}
+
+test "gc counts and expires leases" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = std.testing.allocator;
+    var ts = test_support.openTestStore(io, .{});
+    defer ts.deinit(io);
+    ts.store.limits = .{ .hot = 100 * root.config.GiB, .cold = 100 * root.config.GiB, .reserve = 0 };
+    ts.store.config.max_age_ns = std.math.maxInt(u64);
+
+    const d = try ts.store.putBytes(io, "leased", .other);
+    // Expired relative to gc wall clock (1970 + TTL vs now).
+    try state.putLease(io, ts.store.dir, "old-build", &.{d}, 1000);
+    const report = try ts.store.gc(io, gpa, .{});
+    try std.testing.expectEqual(@as(u64, 1), report.expired_leases);
+    const remaining = try state.liveLeases(io, gpa, ts.store.dir, std.Io.Timestamp.now(io, .real).toMilliseconds());
+    defer state.freeLeases(gpa, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
