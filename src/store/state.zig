@@ -168,7 +168,18 @@ pub fn dropLease(io: Io, store_dir: Io.Dir, build_id: []const u8) StateError!voi
 }
 
 /// Returns live leases, deleting expired lease files as a side effect.
+/// Returns live leases, deleting expired lease files as a side effect.
 pub fn liveLeases(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir, now_ms: i64) StateError![]Lease {
+    return collectLiveLeases(io, gpa, store_dir, now_ms, true);
+}
+
+/// Returns live leases without deleting expired files. Dry-run counterpart
+/// to liveLeases so `gc(.dry_run)` deletes nothing (spec invariant).
+pub fn peekLiveLeases(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir, now_ms: i64) StateError![]Lease {
+    return collectLiveLeases(io, gpa, store_dir, now_ms, false);
+}
+
+fn collectLiveLeases(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir, now_ms: i64, delete_expired: bool) StateError![]Lease {
     var list: std.ArrayList(Lease) = .empty;
     errdefer {
         for (list.items) |l| {
@@ -193,7 +204,7 @@ pub fn liveLeases(io: Io, gpa: std.mem.Allocator, store_dir: Io.Dir, now_ms: i64
         gpa.free(bytes);
         defer parsed.deinit();
         if (now_ms >= parsed.value.expires_ms) {
-            leases_dir.deleteFile(io, entry.name) catch {};
+            if (delete_expired) leases_dir.deleteFile(io, entry.name) catch {};
             continue;
         }
         const id = gpa.dupe(u8, parsed.value.build_id) catch return error.OutOfMemory;

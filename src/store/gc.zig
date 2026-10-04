@@ -40,13 +40,17 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
     const now_ms = Io.Timestamp.now(io, .real).toMilliseconds();
 
     // -- Phase 0: roots (pins, live leases, project retains + manifests). --
-    // liveLeases deletes expired lease files as a side effect (expiry).
-    // Count first: after liveLeases the expired files are gone.
+    // liveLeases deletes expired lease files as a side effect (expiry), so
+    // dry runs peek without deleting. Count first: after liveLeases the
+    // expired files are gone.
     report.expired_leases = try state.countExpiredLeases(io, gpa, store.dir, now_ms);
     var live = LiveSet.init(gpa);
     defer live.deinit();
 
-    const leases = try state.liveLeases(io, gpa, store.dir, now_ms);
+    const leases = if (policy.dry_run)
+        try state.peekLiveLeases(io, gpa, store.dir, now_ms)
+    else
+        try state.liveLeases(io, gpa, store.dir, now_ms);
     defer state.freeLeases(gpa, leases);
     for (leases) |lease| {
         for (lease.digest_hexes) |hex| {
@@ -79,8 +83,12 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
     }
 
     // -- Phase 1: inventory + stale action sweep. --
+    // Dry runs count stale entries without deleting them.
     var present_cb = PresentCtx{ .store = store, .io = io };
-    report.stale_action_entries = try action_cache.sweepStale(io, gpa, store.dir, PresentCtx.call, &present_cb);
+    report.stale_action_entries = if (policy.dry_run)
+        try action_cache.countStale(io, gpa, store.dir, PresentCtx.call, &present_cb)
+    else
+        try action_cache.sweepStale(io, gpa, store.dir, PresentCtx.call, &present_cb);
 
     const infos = try scan.scan(store, io, gpa);
     defer gpa.free(infos);
@@ -297,4 +305,38 @@ test "gc counts and expires leases" {
     const remaining = try state.liveLeases(io, gpa, ts.store.dir, std.Io.Timestamp.now(io, .real).toMilliseconds());
     defer state.freeLeases(gpa, remaining);
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
+test "dry run counts expiry without deleting leases or actions" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = std.testing.allocator;
+    var ts = test_support.openTestStore(io, .{});
+    defer ts.deinit(io);
+    ts.store.limits = .{ .hot = 1, .cold = 1, .reserve = 0 };
+
+    const a = try ts.store.putBytes(io, "doomed", .other);
+    // Expired lease (1970 + TTL vs wall clock now).
+    try state.putLease(io, ts.store.dir, "old-build", &.{a}, 1000);
+
+    // Stale action entry: manifest object deleted behind its back.
+    var no_outputs: [0]root.Store.ManifestOutput = .{};
+    const man = try ts.store.putManifest(io, .{ .kind = .bin, .outputs = &no_outputs });
+    const key = root.hashBytes("dry-run-stale");
+    try ts.store.putAction(io, key, man);
+    var mbuf: [75]u8 = undefined;
+    var rbuf: [67]u8 = undefined;
+    const mrel = man.relPath(&rbuf);
+    @memcpy(mbuf[0..8], "objects/");
+    @memcpy(mbuf[8..], mrel);
+    try ts.store.dir.deleteFile(io, mbuf[0..75]);
+
+    const report = try ts.store.gc(io, gpa, .{ .dry_run = true });
+    try std.testing.expect(report.dry_run);
+    try std.testing.expectEqual(@as(u64, 1), report.expired_leases);
+    try std.testing.expectEqual(@as(u64, 1), report.stale_action_entries);
+    try std.testing.expect(report.evicted_objects >= 1);
+    // Nothing deleted: object, expired lease file, and stale entry remain.
+    try std.testing.expect(ts.store.exists(io, a));
+    try std.testing.expectEqual(@as(u64, 1), try state.countExpiredLeases(io, gpa, ts.store.dir, std.Io.Timestamp.now(io, .real).toMilliseconds()));
+    try std.testing.expect((try ts.store.getAction(io, gpa, key)) != null);
 }

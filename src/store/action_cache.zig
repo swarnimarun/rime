@@ -61,6 +61,30 @@ pub fn sweepStale(
     is_present: *const fn (ctx: *anyopaque, d: digest_mod.Digest) bool,
     ctx: *anyopaque,
 ) SweepError!u64 {
+    return sweepInner(io, gpa, store_dir, is_present, ctx, true);
+}
+
+/// Counts stale entries without deleting them. Dry-run counterpart to
+/// sweepStale: same stale definition and corrupt-skip, delete gated off so
+/// `gc(.dry_run)` deletes nothing (spec invariant).
+pub fn countStale(
+    io: Io,
+    gpa: std.mem.Allocator,
+    store_dir: Io.Dir,
+    is_present: *const fn (ctx: *anyopaque, d: digest_mod.Digest) bool,
+    ctx: *anyopaque,
+) SweepError!u64 {
+    return sweepInner(io, gpa, store_dir, is_present, ctx, false);
+}
+
+fn sweepInner(
+    io: Io,
+    gpa: std.mem.Allocator,
+    store_dir: Io.Dir,
+    is_present: *const fn (ctx: *anyopaque, d: digest_mod.Digest) bool,
+    ctx: *anyopaque,
+    delete_stale: bool,
+) SweepError!u64 {
     var removed: u64 = 0;
     const top = store_dir.openDir(io, layout.actions_dir, .{ .iterate = true }) catch return error.Unexpected;
     defer top.close(io);
@@ -83,7 +107,7 @@ pub fn sweepStale(
             };
             const e = got orelse continue;
             if (is_present(ctx, e.manifest)) continue;
-            sub.deleteFile(io, entry.name) catch {};
+            if (delete_stale) sub.deleteFile(io, entry.name) catch {};
             removed += 1;
         }
     }
