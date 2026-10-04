@@ -127,6 +127,10 @@ fn writeEntryAtomic(io: Io, store_dir: Io.Dir, full: []const u8, bytes: []const 
     var tmp_buf: [80]u8 = undefined;
     const tmp = std.fmt.bufPrint(&tmp_buf, "{s}/a-{s}", .{ layout.tmp_dir, rand_hex[0..] }) catch return error.Unexpected;
     store_dir.writeFile(io, .{ .sub_path = tmp, .data = bytes }) catch return error.Unexpected;
+    // Sync before rename so a crash cannot publish a torn entry (spec §8.3).
+    const f = store_dir.openFile(io, tmp, .{}) catch return error.Unexpected;
+    defer f.close(io);
+    f.sync(io) catch return error.Unexpected;
     store_dir.rename(tmp, store_dir, full, io) catch return error.Unexpected;
 }
 

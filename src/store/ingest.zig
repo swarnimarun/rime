@@ -99,8 +99,14 @@ fn recordKind(store: *root.Store, io: Io, d: Digest, kind: root.Kind) PutError!v
     const path = layout.state_dir ++ "/kinds.jsonl";
     const f = try store.dir.createFile(io, path, .{ .read = true, .truncate = false });
     defer f.close(io);
+    // Serialize length + positional write across processes; concurrent
+    // ingests would otherwise interleave journal lines. Sync so the
+    // kind record is durable with the object it describes.
+    f.lock(io, .exclusive) catch return error.Unexpected;
+    defer f.unlock(io);
     const len = try f.length(io);
     try f.writePositionalAll(io, line, len);
+    f.sync(io) catch return error.Unexpected;
 }
 
 /// Store-relative object path: "objects/<hex[0..2]>/<hex[2..]>"

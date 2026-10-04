@@ -32,6 +32,11 @@ fn writeJsonAtomic(io: Io, store_dir: Io.Dir, sub_path: []const u8, json_bytes: 
     var tmp_buf: [128]u8 = undefined;
     const tmp = std.fmt.bufPrint(&tmp_buf, "{s}/w-{s}", .{ layout.state_dir, rand_hex[0..] }) catch return error.Unexpected;
     store_dir.writeFile(io, .{ .sub_path = tmp, .data = json_bytes }) catch return error.Unexpected;
+    // Sync the tmp file before rename so a crash cannot publish a
+    // torn state file (spec §8.3 atomic durable writes).
+    const f = store_dir.openFile(io, tmp, .{}) catch return error.Unexpected;
+    defer f.close(io);
+    f.sync(io) catch return error.Unexpected;
     store_dir.rename(tmp, store_dir, sub_path, io) catch return error.Unexpected;
 }
 
