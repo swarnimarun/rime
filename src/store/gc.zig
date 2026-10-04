@@ -5,6 +5,7 @@ const state = @import("state.zig");
 const objects = @import("objects.zig");
 const action_cache = @import("action_cache.zig");
 const cold = @import("cold.zig");
+const layout = @import("layout.zig");
 const manifest_mod = @import("manifest.zig");
 const disk_usage = @import("disk_usage.zig");
 const digest_mod = @import("digest.zig");
@@ -22,6 +23,7 @@ pub const GcReport = struct {
     evicted_objects: u64 = 0,
     freed_bytes_hot: u64 = 0,
     freed_bytes_cold: u64 = 0,
+    freed_bytes_incremental: u64 = 0,
     demoted_objects: u64 = 0,
     expired_leases: u64 = 0,
     stale_action_entries: u64 = 0,
@@ -112,6 +114,11 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
         try evict(store, io, &report, obj, policy.dry_run);
     }
 
+    // -- Phase 2b: incremental class sweep (spec §9.5). Project-local rustc
+    // sessions live outside the shared object space
+    // (`state/projects/<id>/incremental/`) with their own age/size bounds.
+    report.freed_bytes_incremental = try sweepIncremental(store, io, gpa, policy.dry_run);
+
     // -- Phase 3: quota sweep to 90% hysteresis (spec §9.1). --
     // Evict oldest unrooted hot objects first until hot usage is at target.
     const hot_target = policy.target_bytes orelse store.limits.hot * 90 / 100;
@@ -172,6 +179,114 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
     }
 
     return report;
+}
+
+/// Project-local incremental state: `state/projects/<id>/incremental/`
+/// (spec §9.5). Deletes files older than `incremental_max_age_ns`, then
+/// trims oldest-first past `incremental_limit` per project. Dry runs count
+/// without deleting.
+fn sweepIncremental(store: *root.Store, io: Io, gpa: std.mem.Allocator, dry_run: bool) GcError!u64 {
+    var freed: u64 = 0;
+    const now_ms = Io.Timestamp.now(io, .real).toMilliseconds();
+    const projs = store.dir.openDir(io, layout.state_dir ++ "/projects", .{ .iterate = true }) catch return error.Unexpected;
+    defer projs.close(io);
+    var it = projs.iterate();
+    while (try it.next(io)) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const incr_path = std.fmt.allocPrint(gpa, "{s}/projects/{s}/incremental", .{ layout.state_dir, entry.name }) catch return error.OutOfMemory;
+        defer gpa.free(incr_path);
+        const incr = store.dir.openDir(io, incr_path, .{ .iterate = true }) catch continue;
+        defer incr.close(io);
+        freed += try sweepOneIncremental(store, io, gpa, incr, now_ms, dry_run);
+    }
+    return freed;
+}
+
+fn sweepOneIncremental(store: *root.Store, io: Io, gpa: std.mem.Allocator, incr: Io.Dir, now_ms: i64, dry_run: bool) GcError!u64 {
+    var files: std.ArrayList(IncrEntry) = .empty;
+    defer {
+        for (files.items) |f| gpa.free(f.rel);
+        files.deinit(gpa);
+    }
+    collectFiles(io, gpa, incr, "", &files) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.Unexpected,
+    };
+    std.sort.heap(IncrEntry, files.items, {}, struct {
+        fn lt(_: void, x: IncrEntry, y: IncrEntry) bool {
+            return x.mtime_ms < y.mtime_ms;
+        }
+    }.lt);
+
+    var freed: u64 = 0;
+    var live_total: u64 = 0;
+    for (files.items) |f| live_total += f.size;
+    for (files.items) |f| {
+        const age_ns = @as(u64, @intCast(@max(0, now_ms - f.mtime_ms))) * std.time.ns_per_ms;
+        const too_old = age_ns > store.config.incremental_max_age_ns;
+        if (!too_old and live_total <= store.config.incremental_limit) continue;
+        if (!dry_run) incr.deleteFile(io, f.rel) catch continue;
+        freed += f.size;
+        live_total -= @min(live_total, f.size);
+    }
+    return freed;
+}
+
+const IncrEntry = struct { rel: []u8, size: u64, mtime_ms: i64 };
+
+const CollectError = error{OutOfMemory} || Io.Cancelable || Io.Dir.Iterator.Error;
+
+/// Recursively collects files under `dir`; `rel` paths are relative to the
+/// incremental root. Unreadable entries are skipped (best effort).
+fn collectFiles(io: Io, gpa: std.mem.Allocator, dir: Io.Dir, prefix: []const u8, out: *std.ArrayList(IncrEntry)) CollectError!void {
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        const sep: []const u8 = if (prefix.len == 0) "" else "/";
+        const rel = try std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ prefix, sep, entry.name });
+        errdefer gpa.free(rel);
+        const st = dir.statFile(io, entry.name, .{}) catch {
+            gpa.free(rel);
+            continue;
+        };
+        if (st.kind == .directory) {
+            const sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch {
+                gpa.free(rel);
+                continue;
+            };
+            defer sub.close(io);
+            try collectFiles(io, gpa, sub, rel, out);
+            gpa.free(rel);
+            continue;
+        }
+        try out.append(gpa, .{ .rel = rel, .size = st.size, .mtime_ms = st.mtime.toMilliseconds() });
+    }
+}
+
+/// Sums bytes under `state/projects/*/incremental/` (spec §9.5) for `stats`.
+/// Shares the best-effort walk with the sweep above.
+pub fn incrementalBytes(store: *root.Store, io: Io, gpa: std.mem.Allocator) GcError!u64 {
+    var total: u64 = 0;
+    const projs = store.dir.openDir(io, layout.state_dir ++ "/projects", .{ .iterate = true }) catch return error.Unexpected;
+    defer projs.close(io);
+    var it = projs.iterate();
+    while (try it.next(io)) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const incr_path = std.fmt.allocPrint(gpa, "{s}/projects/{s}/incremental", .{ layout.state_dir, entry.name }) catch return error.OutOfMemory;
+        defer gpa.free(incr_path);
+        const incr = store.dir.openDir(io, incr_path, .{ .iterate = true }) catch continue;
+        defer incr.close(io);
+        var files: std.ArrayList(IncrEntry) = .empty;
+        defer {
+            for (files.items) |f| gpa.free(f.rel);
+            files.deinit(gpa);
+        }
+        collectFiles(io, gpa, incr, "", &files) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.Unexpected,
+        };
+        for (files.items) |f| total += f.size;
+    }
+    return total;
 }
 
 /// Callback adapter: action entries are stale when their manifest object
@@ -325,6 +440,33 @@ test "quota pressure demotes demotable objects before evicting" {
     const got = try ts.store.readObject(io, a, gpa);
     defer gpa.free(got);
     try std.testing.expectEqualStrings("aaaa", got);
+}
+
+test "incremental sweep trims old files and counts freed bytes" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = std.testing.allocator;
+    var ts = test_support.openTestStore(io, .{});
+    defer ts.deinit(io);
+    ts.store.limits = .{ .hot = 100 * root.config.GiB, .cold = 100 * root.config.GiB, .reserve = 0 };
+    ts.store.config.max_age_ns = std.math.maxInt(u64);
+
+    try ts.store.dir.createDirPath(io, "state/projects/proj1/incremental");
+    try ts.store.dir.writeFile(io, .{ .sub_path = "state/projects/proj1/incremental/old.bin", .data = "0123456789" });
+    try ts.store.dir.writeFile(io, .{ .sub_path = "state/projects/proj1/incremental/new.bin", .data = "abc" });
+    // Backdate one file beyond the default 5-day incremental max age.
+    const f = try ts.store.dir.openFile(io, "state/projects/proj1/incremental/old.bin", .{});
+    defer f.close(io);
+    try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(1_000_000_000) } });
+
+    const dry = try ts.store.gc(io, gpa, .{ .dry_run = true });
+    try std.testing.expectEqual(@as(u64, 10), dry.freed_bytes_incremental);
+    // Dry run deletes nothing.
+    _ = try ts.store.dir.statFile(io, "state/projects/proj1/incremental/old.bin", .{});
+
+    const real = try ts.store.gc(io, gpa, .{});
+    try std.testing.expectEqual(@as(u64, 10), real.freed_bytes_incremental);
+    try std.testing.expectError(error.FileNotFound, ts.store.dir.statFile(io, "state/projects/proj1/incremental/old.bin", .{}));
+    _ = try ts.store.dir.statFile(io, "state/projects/proj1/incremental/new.bin", .{});
 }
 
 test "dry run deletes nothing" {

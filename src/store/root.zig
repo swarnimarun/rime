@@ -10,7 +10,8 @@ const manifest_mod = @import("manifest.zig");
 const clone_mod = @import("clone.zig");
 const materialize_mod = @import("materialize.zig");
 const scan_mod = @import("scan.zig");
-const state = @import("state.zig");
+/// State file helpers (pins/leases/retains); the CLI lists pins through here.
+pub const state = @import("state.zig");
 const gc_mod = @import("gc.zig");
 const action_cache = @import("action_cache.zig");
 const cold_mod = @import("cold.zig");
@@ -215,6 +216,63 @@ pub const Store = struct {
         return test_support.dirHasHot(store, io, d);
     }
 
+    pub const Stats = struct {
+        hot_bytes: u64,
+        hot_objects: u64,
+        cold_bytes: u64,
+        cold_objects: u64,
+        incremental_bytes: u64,
+        pinned_bytes: u64,
+        lease_count: u64,
+        limits: config_mod.ResolvedLimits,
+        free_bytes: u64,
+    };
+
+    pub const StatsError = error{Unexpected, OutOfMemory} || Io.Cancelable ||
+        scan_mod.ScanError || state.StateError || disk_usage_mod.DiskUsageError || gc_mod.GcError;
+
+    /// Tier usage vs limits, root usage, and free space (spec §9.7).
+    /// Read-only: expired leases are peeked, never reaped.
+    pub fn stats(store: *Store, io: Io, gpa: std.mem.Allocator) StatsError!Stats {
+        var s = Stats{
+            .hot_bytes = 0,
+            .hot_objects = 0,
+            .cold_bytes = 0,
+            .cold_objects = 0,
+            .incremental_bytes = 0,
+            .pinned_bytes = 0,
+            .lease_count = 0,
+            .limits = store.limits,
+            .free_bytes = 0,
+        };
+        const infos = try scan_mod.scan(store, io, gpa);
+        defer gpa.free(infos);
+        for (infos) |obj| switch (obj.tier) {
+            .hot => {
+                s.hot_bytes += obj.size;
+                s.hot_objects += 1;
+            },
+            .cold => {
+                s.cold_bytes += obj.size;
+                s.cold_objects += 1;
+            },
+        };
+        s.incremental_bytes = try gc_mod.incrementalBytes(store, io, gpa);
+        const pins = try state.listPins(io, gpa, store.dir);
+        defer state.freePins(gpa, pins);
+        for (pins) |entry| {
+            const d = Digest.fromHex(entry.digest_hex) catch continue;
+            s.pinned_bytes += objectByteSize(store, io, d);
+        }
+        const now_ms = Io.Timestamp.now(io, .real).toMilliseconds();
+        const leases = try state.peekLiveLeases(io, gpa, store.dir, now_ms);
+        defer state.freeLeases(gpa, leases);
+        s.lease_count = @intCast(leases.len);
+        const usage = try disk_usage_mod.readDiskUsage(io, store.dir);
+        s.free_bytes = usage.free_bytes;
+        return s;
+    }
+
     pub const ActionEntry = action_cache.ActionEntry;
 
     pub fn putAction(store: *Store, io: Io, key: Digest, manifest: Digest) action_cache.PutError!void {
@@ -223,6 +281,27 @@ pub const Store = struct {
 
     pub fn getAction(store: *Store, io: Io, gpa: std.mem.Allocator, key: Digest) action_cache.GetError!?action_cache.ActionEntry {
         return action_cache.getAction(io, gpa, store.dir, key);
+    }
+
+    /// Size of either tier copy of an object; 0 when absent. Pinned-byte
+    /// accounting counts cold copies at their compressed size (spec §9.4).
+    fn objectByteSize(store: *Store, io: Io, d: Digest) u64 {
+        var rbuf: [67]u8 = undefined;
+        const rel = d.relPath(&rbuf);
+        var hot_buf: [75]u8 = undefined;
+        @memcpy(hot_buf[0..8], "objects/");
+        @memcpy(hot_buf[8..], rel);
+        if (store.dir.statFile(io, hot_buf[0..75], .{})) |st| {
+            return st.size;
+        } else |_| {}
+        var cold_buf: [75]u8 = undefined;
+        @memcpy(cold_buf[0..5], "cold/");
+        @memcpy(cold_buf[5..72], rel);
+        if (store.dir.statFile(io, cold_buf[0..72], .{})) |st| {
+            return st.size;
+        } else |_| {
+            return 0;
+        }
     }
 
     fn sweepTmp(io: Io, dir: Io.Dir) OpenError!void {
