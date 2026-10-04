@@ -10,6 +10,7 @@ const manifest_mod = @import("manifest.zig");
 const clone_mod = @import("clone.zig");
 const materialize_mod = @import("materialize.zig");
 const scan_mod = @import("scan.zig");
+const state = @import("state.zig");
 
 const Io = std.Io;
 
@@ -133,6 +134,36 @@ pub const Store = struct {
         return scan_mod.touch(store, io, d);
     }
 
+    pub const Pin = state.Pin;
+    pub const Lease = state.Lease;
+    pub const ProjectRetain = state.ProjectRetain;
+    pub const StateError = state.StateError;
+    pub const lease_ttl_ms = state.lease_ttl_ms;
+
+    pub fn pin(store: *Store, io: Io, name: []const u8, d: Digest) StateError!void {
+        return state.putPin(io, store.dir, name, d, Io.Timestamp.now(io, .real).toMilliseconds());
+    }
+
+    pub fn unpin(store: *Store, io: Io, name: []const u8) StateError!void {
+        return state.removePin(io, store.dir, name);
+    }
+
+    pub fn leasePut(store: *Store, io: Io, build_id: []const u8, digests: []const Digest) StateError!void {
+        return state.putLease(io, store.dir, build_id, digests, Io.Timestamp.now(io, .real).toMilliseconds());
+    }
+
+    pub fn leaseRenew(store: *Store, io: Io, build_id: []const u8) StateError!void {
+        return state.renewLease(io, store.dir, build_id, Io.Timestamp.now(io, .real).toMilliseconds());
+    }
+
+    pub fn leaseDrop(store: *Store, io: Io, build_id: []const u8) StateError!void {
+        return state.dropLease(io, store.dir, build_id);
+    }
+
+    pub fn retainProject(store: *Store, io: Io, project_id: []const u8, manifests: []const Digest) StateError!void {
+        return state.putRetain(io, std.heap.page_allocator, store.dir, project_id, manifests, Io.Timestamp.now(io, .real).toMilliseconds());
+    }
+
     pub const Manifest = manifest_mod.Manifest;
     pub const ManifestOutput = manifest_mod.Output;
     pub const GetManifestError = ReadError || manifest_mod.DecodeError;
@@ -195,4 +226,5 @@ test {
     _ = @import("clone.zig");
     _ = @import("materialize.zig");
     _ = @import("scan.zig");
+    _ = @import("state.zig");
 }
