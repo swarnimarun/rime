@@ -7,6 +7,8 @@ const test_support = @import("test_support.zig");
 const ingest = @import("ingest.zig");
 const objects = @import("objects.zig");
 const manifest_mod = @import("manifest.zig");
+const clone_mod = @import("clone.zig");
+const materialize_mod = @import("materialize.zig");
 
 const Io = std.Io;
 
@@ -111,6 +113,14 @@ pub const Store = struct {
         return objects.verifyObject(store, io, d);
     }
 
+    pub const MaterializeMethod = materialize_mod.MaterializeMethod;
+    pub const MaterializeError = materialize_mod.MaterializeError;
+
+    /// Clone-or-copy materialization; relative paths resolve under the store.
+    pub fn materialize(store: *Store, io: Io, d: Digest, dest_path: []const u8, mode: u32) MaterializeError!MaterializeMethod {
+        return materialize_mod.materialize(store, io, d, dest_path, mode, .clone_first);
+    }
+
     pub const Manifest = manifest_mod.Manifest;
     pub const ManifestOutput = manifest_mod.Output;
     pub const GetManifestError = ReadError || manifest_mod.DecodeError;
@@ -170,4 +180,6 @@ test {
     _ = @import("ingest.zig");
     _ = @import("objects.zig");
     _ = @import("manifest.zig");
+    _ = @import("clone.zig");
+    _ = @import("materialize.zig");
 }
