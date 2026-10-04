@@ -13,6 +13,7 @@ const scan_mod = @import("scan.zig");
 const state = @import("state.zig");
 const gc_mod = @import("gc.zig");
 const action_cache = @import("action_cache.zig");
+const cold_mod = @import("cold.zig");
 
 const Io = std.Io;
 
@@ -199,6 +200,21 @@ pub const Store = struct {
         store.lock_file.unlock(io);
     }
 
+    pub const ColdError = cold_mod.ColdError;
+
+    pub fn demote(store: *Store, io: Io, d: Digest) ColdError!void {
+        return cold_mod.demote(store, io, d);
+    }
+
+    pub fn promote(store: *Store, io: Io, d: Digest) ColdError!void {
+        return cold_mod.promote(store, io, d);
+    }
+
+    /// Test aid: true when the hot-tier copy of an object exists.
+    pub fn dirHasHot(store: *Store, io: Io, d: Digest) bool {
+        return test_support.dirHasHot(store, io, d);
+    }
+
     pub const ActionEntry = action_cache.ActionEntry;
 
     pub fn putAction(store: *Store, io: Io, key: Digest, manifest: Digest) action_cache.PutError!void {
@@ -258,4 +274,5 @@ test {
     _ = @import("state.zig");
     _ = @import("gc.zig");
     _ = @import("action_cache.zig");
+    _ = @import("cold.zig");
 }

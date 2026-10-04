@@ -20,3 +20,15 @@ pub fn openTestStore(io: std.Io, cfg: config_mod.Config) TestStore {
     };
     return .{ .tmp = tmp, .store = store };
 }
+
+/// Test aid: true when the hot-tier copy of an object exists. Objects live
+/// at "objects/ab/<hex>" (spec §6), so the fanout prefix is required.
+pub fn dirHasHot(store: *root.Store, io: std.Io, d: root.Digest) bool {
+    var rbuf: [67]u8 = undefined;
+    const rel = d.relPath(&rbuf);
+    var full: [75]u8 = undefined;
+    @memcpy(full[0..8], "objects/");
+    @memcpy(full[8..], rel);
+    _ = store.dir.statFile(io, full[0..75], .{}) catch return false;
+    return true;
+}

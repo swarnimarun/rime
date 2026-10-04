@@ -2,6 +2,7 @@ const std = @import("std");
 const root = @import("root.zig");
 const layout = @import("layout.zig");
 const digest_mod = @import("digest.zig");
+const cold = @import("cold.zig");
 const test_support = @import("test_support.zig");
 
 const Io = std.Io;
@@ -25,31 +26,60 @@ fn objectFull(digest: Digest, buf: *[75]u8) []const u8 {
     return buf[0..75];
 }
 
+/// Store-relative cold path "cold/ab/cdef…" (spec §9.4).
+fn coldFull(digest: Digest, buf: *[75]u8) []const u8 {
+    var rbuf: [67]u8 = undefined;
+    const rel = digest.relPath(&rbuf);
+    @memcpy(buf[0..5], "cold/");
+    @memcpy(buf[5..72], rel);
+    return buf[0..72];
+}
+
+/// Cold-aware: an object exists when either tier holds it.
 pub fn exists(store: *root.Store, io: Io, digest: Digest) bool {
-    var path_buf: [75]u8 = undefined;
-    _ = store.dir.statFile(io, objectFull(digest, &path_buf), .{}) catch return false;
+    var hot_buf: [75]u8 = undefined;
+    if (store.dir.statFile(io, objectFull(digest, &hot_buf), .{})) |_| {
+        return true;
+    } else |_| {}
+    var cold_buf: [75]u8 = undefined;
+    const cold_full = coldFull(digest, &cold_buf);
+    _ = store.dir.statFile(io, cold_full, .{}) catch return false;
     return true;
 }
 
-/// Reads a whole object. Verifies length only; use verifyObject for hashing.
+/// Reads a whole object. Hot tier first; cold tier is gunzipped
+/// transparently (spec §9.4). Use verifyObject for hashing.
 pub fn readObject(store: *root.Store, io: Io, digest: Digest, gpa: std.mem.Allocator) ReadError![]u8 {
-    var path_buf: [75]u8 = undefined;
-    return store.dir.readFileAlloc(io, objectFull(digest, &path_buf), gpa, .unlimited) catch |err| switch (err) {
-        error.FileNotFound => error.ObjectNotFound,
-        else => error.Unexpected,
+    var hot_buf: [75]u8 = undefined;
+    if (store.dir.readFileAlloc(io, objectFull(digest, &hot_buf), gpa, .unlimited)) |bytes| {
+        return bytes;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return error.Unexpected,
+    }
+    var cold_buf: [75]u8 = undefined;
+    const cold_full = coldFull(digest, &cold_buf);
+    const z = store.dir.readFileAlloc(io, cold_full, gpa, .unlimited) catch |err| switch (err) {
+        error.FileNotFound => return error.ObjectNotFound,
+        else => return error.Unexpected,
+    };
+    defer gpa.free(z);
+    return cold.gunzipAlloc(gpa, z) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidGzip => return error.Unexpected,
     };
 }
 
 /// Full integrity check: re-hashes the stored bytes. Spec §5.2 invariant 2.
+/// Tier-transparent: reads through `readObject`, so cold objects verify.
 pub fn verifyObject(store: *root.Store, io: Io, digest: Digest) VerifyError!void {
-    var path_buf: [75]u8 = undefined;
-    const full = objectFull(digest, &path_buf);
-    const f = store.dir.openFile(io, full, .{}) catch |err| switch (err) {
-        error.FileNotFound => return error.ObjectNotFound,
+    const bytes = readObject(store, io, digest, std.heap.page_allocator) catch |err| switch (err) {
+        error.ObjectNotFound => return error.ObjectNotFound,
+        error.OutOfMemory => return error.Unexpected,
         else => return error.Unexpected,
     };
-    defer f.close(io);
-    const actual = digest_mod.hashFile(f, io) catch return error.Unexpected;
+    defer std.heap.page_allocator.free(bytes);
+    const actual = digest_mod.hashBytes(bytes);
     if (!std.meta.eql(actual.bytes, digest.bytes)) return error.DigestMismatch;
 }
 

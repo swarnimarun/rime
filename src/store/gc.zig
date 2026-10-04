@@ -4,6 +4,7 @@ const scan = @import("scan.zig");
 const state = @import("state.zig");
 const objects = @import("objects.zig");
 const action_cache = @import("action_cache.zig");
+const cold = @import("cold.zig");
 const manifest_mod = @import("manifest.zig");
 const disk_usage = @import("disk_usage.zig");
 const digest_mod = @import("digest.zig");
@@ -123,11 +124,35 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
         if (!policy.dry_run and !live.contains(obj.digest.bytes) and isOlderThan(obj, now_ms, max_age_ns)) continue;
         hot_used += obj.size;
     }
+    // Cold-tier usage at compressed sizes (spec §9.4 counts demoted bytes
+    // compressed). Same real-run age-trim adjustment as hot_used above.
+    var cold_used: u64 = 0;
+    for (sorted) |obj| {
+        if (obj.tier != .cold) continue;
+        if (!policy.dry_run and !live.contains(obj.digest.bytes) and isOlderThan(obj, now_ms, max_age_ns)) continue;
+        cold_used += obj.size;
+    }
+    const cold_target = store.limits.cold * 90 / 100;
     for (sorted) |obj| {
         if (hot_used <= hot_target) break;
         if (obj.tier != .hot) continue;
         if (live.contains(obj.digest.bytes)) continue;
         if (!policy.dry_run and isOlderThan(obj, now_ms, max_age_ns)) continue; // evicted in phase 2
+        // Demote before evicting: demotable hot objects move to cold while
+        // the cold tier has headroom (spec §9.7 order, step 3 before 4).
+        if (cold.isDemotable(obj.kind) and cold_used < cold_target) {
+            if (!policy.dry_run) {
+                cold.demote(store, io, obj.digest) catch |err| switch (err) {
+                    error.ObjectNotFound => continue, // raced; treat as gone
+                    error.Canceled => return error.Canceled,
+                    else => return error.Unexpected,
+                };
+                cold_used += coldByteSize(store, io, obj.digest);
+            }
+            report.demoted_objects += 1;
+            hot_used -= @min(hot_used, obj.size);
+            continue;
+        }
         try evict(store, io, &report, obj, policy.dry_run);
         hot_used -= @min(hot_used, obj.size);
     }
@@ -181,6 +206,21 @@ fn tierFullPath(digest: digest_mod.Digest, tier: scan.Tier, buf: *[75]u8) []cons
             @memcpy(buf[5..72], rel);
             return buf[0..72];
         },
+    }
+}
+
+/// Compressed size of a cold-tier copy; 0 when the copy is absent.
+/// Used to account demotions against the cold quota (spec §9.4).
+fn coldByteSize(store: *root.Store, io: Io, digest: digest_mod.Digest) u64 {
+    var rbuf: [67]u8 = undefined;
+    const rel = digest.relPath(&rbuf);
+    var buf: [75]u8 = undefined;
+    @memcpy(buf[0..5], "cold/");
+    @memcpy(buf[5..72], rel);
+    if (store.dir.statFile(io, buf[0..72], .{})) |st| {
+        return st.size;
+    } else |_| {
+        return 0;
     }
 }
 
@@ -238,7 +278,9 @@ test "quota sweep evicts oldest unrooted first and stops at 90 percent" {
     var ts = test_support.openTestStore(io, fixedConfig(10));
     defer ts.deinit(io);
     // limits.resolveLimits is not re-run by open with .fixed values:
-    ts.store.limits = .{ .hot = 10, .cold = 100 * root.config.GiB, .reserve = 0 };
+    // Cold is full here so the sweep evicts instead of demoting (spec §9.7
+    // demote-before-evict is covered by the demotion test below).
+    ts.store.limits = .{ .hot = 10, .cold = 1, .reserve = 0 };
     // Disable age trim for this test: the backdated mtimes below are only
     // meant to fix LRU order, and 1970 timestamps would otherwise age-trim.
     ts.store.config.max_age_ns = std.math.maxInt(u64);
@@ -258,6 +300,31 @@ test "quota sweep evicts oldest unrooted first and stops at 90 percent" {
     try std.testing.expect(!ts.store.exists(io, a)); // oldest unrooted gone
     try std.testing.expect(ts.store.exists(io, b)); // pinned survives
     try std.testing.expect(ts.store.exists(io, c)); // newer unrooted kept
+}
+
+test "quota pressure demotes demotable objects before evicting" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = std.testing.allocator;
+    var ts = test_support.openTestStore(io, fixedConfig(10));
+    defer ts.deinit(io);
+    ts.store.limits = .{ .hot = 10, .cold = 100 * root.config.GiB, .reserve = 0 };
+    ts.store.config.max_age_ns = std.math.maxInt(u64);
+
+    const a = try ts.store.putBytes(io, "aaaa", .other); // 4 B
+    _ = try ts.store.putBytes(io, "bbbb", .other); // 4 B
+    _ = try ts.store.putBytes(io, "cccc", .other); // 4 B
+    // 12 B hot over the 9 B target: the oldest unrooted object demotes.
+    try setMtime(io, &ts.store, a, 1_000);
+
+    const report = try ts.store.gc(io, gpa, .{});
+    try std.testing.expectEqual(@as(u64, 1), report.demoted_objects);
+    try std.testing.expectEqual(@as(u64, 0), report.evicted_objects);
+    // Still readable through the cold tier; the hot copy is gone.
+    try std.testing.expect(ts.store.exists(io, a));
+    try std.testing.expect(!ts.store.dirHasHot(io, a));
+    const got = try ts.store.readObject(io, a, gpa);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("aaaa", got);
 }
 
 test "dry run deletes nothing" {
