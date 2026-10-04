@@ -11,6 +11,7 @@ const clone_mod = @import("clone.zig");
 const materialize_mod = @import("materialize.zig");
 const scan_mod = @import("scan.zig");
 const state = @import("state.zig");
+const gc_mod = @import("gc.zig");
 
 const Io = std.Io;
 
@@ -180,6 +181,23 @@ pub const Store = struct {
         return manifest_mod.decode(gpa, bytes);
     }
 
+    pub const GcPolicy = gc_mod.GcPolicy;
+    pub const GcReport = gc_mod.GcReport;
+    pub const GcError = gc_mod.GcError;
+
+    pub fn gc(store: *Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) GcError!GcReport {
+        return gc_mod.gc(store, io, gpa, policy);
+    }
+
+    /// Takes the exclusive GC lock. Returns false if a build holds the
+    /// shared lock (spec §8.2). Callers must `unlock` after a true result.
+    pub fn tryGcLock(store: *Store, io: Io) bool {
+        return store.lock_file.tryLock(io, .exclusive) catch false;
+    }
+    pub fn unlock(store: *Store, io: Io) void {
+        store.lock_file.unlock(io);
+    }
+
     fn sweepTmp(io: Io, dir: Io.Dir) OpenError!void {
         const tmp = try dir.openDir(io, layout.tmp_dir, .{ .iterate = true });
         defer tmp.close(io);
@@ -227,4 +245,5 @@ test {
     _ = @import("materialize.zig");
     _ = @import("scan.zig");
     _ = @import("state.zig");
+    _ = @import("gc.zig");
 }
