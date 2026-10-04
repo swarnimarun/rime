@@ -115,13 +115,16 @@ pub fn query(gpa: std.mem.Allocator, idx: *index_mod.Index, pred: Predicate) ind
         }
         return try all.toOwnedSlice(gpa);
     }
-    var sql_buf: [1024]u8 = undefined;
+    var sql_buf: [4096]u8 = undefined;
     var sql = std.Io.Writer.fixed(&sql_buf);
+    sql.print("SELECT hit.digest FROM (", .{}) catch return error.Unexpected;
     for (filt, 0..) |_, i| {
         if (i > 0) sql.print(" INTERSECT ", .{}) catch return error.Unexpected;
         sql.print("SELECT digest FROM object_tags WHERE key=?{d} AND value=?{d}", .{ 2 * i + 1, 2 * i + 2 }) catch return error.Unexpected;
     }
-    var sql_z: [1088]u8 = undefined;
+    const limit_param: usize = 2 * filt.len + 1;
+    sql.print(") AS hit JOIN objects ON objects.digest = hit.digest ORDER BY objects.last_access_ms DESC LIMIT ?{d}", .{limit_param}) catch return error.Unexpected;
+    var sql_z: [4224]u8 = undefined;
     const z = std.fmt.bufPrintZ(&sql_z, "{s}", .{sql_buf[0..sql.end]}) catch return error.Unexpected;
     var stmt: ?*c.sqlite3_stmt = null;
     if (c.sqlite3_prepare_v2(idx.db, z.ptr, -1, &stmt, null) != c.SQLITE_OK)
@@ -131,6 +134,7 @@ pub fn query(gpa: std.mem.Allocator, idx: *index_mod.Index, pred: Predicate) ind
         bindText(stmt, @intCast(2 * i + 1), t.key);
         bindText(stmt, @intCast(2 * i + 2), t.value);
     }
+    _ = c.sqlite3_bind_int64(stmt, @intCast(limit_param), @intCast(limit));
     var out: std.ArrayList([64]u8) = .empty;
     errdefer out.deinit(gpa);
     while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
@@ -169,6 +173,36 @@ test "tag query conjunction narrows results" {
     defer std.testing.allocator.free(narrow);
     try std.testing.expectEqual(@as(usize, 1), narrow.len);
     try std.testing.expectEqual(a, narrow[0]);
+}
+
+test "tag query respects limit and newest-first order" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var idx = try index_mod.Index.open(io, tmp.dir);
+    defer idx.close();
+
+    const a: [64]u8 = [_]u8{'a'} ** 64;
+    const b: [64]u8 = [_]u8{'b'} ** 64;
+    const cc: [64]u8 = [_]u8{'c'} ** 64;
+    try index_mod.upsertObject(&idx, .{ .digest = a, .size = 1, .compressed_size = null, .tier = .hot, .kind = "rlib", .created_ms = 1, .last_access_ms = 1000 });
+    try index_mod.upsertObject(&idx, .{ .digest = b, .size = 1, .compressed_size = null, .tier = .hot, .kind = "rlib", .created_ms = 1, .last_access_ms = 2000 });
+    try index_mod.upsertObject(&idx, .{ .digest = cc, .size = 1, .compressed_size = null, .tier = .hot, .kind = "rlib", .created_ms = 1, .last_access_ms = 3000 });
+    try tagObject(&idx, &a, &.{.{ .key = "profile", .value = "release" }});
+    try tagObject(&idx, &b, &.{.{ .key = "profile", .value = "release" }});
+    try tagObject(&idx, &cc, &.{.{ .key = "profile", .value = "release" }});
+
+    var q = [_]Tag{.{ .key = "profile", .value = "release" }};
+    const two = try query(std.testing.allocator, &idx, .{ .tags = &q, .limit = 2 });
+    defer std.testing.allocator.free(two);
+    try std.testing.expectEqual(@as(usize, 2), two.len);
+    try std.testing.expectEqual(cc, two[0]);
+    try std.testing.expectEqual(b, two[1]);
+
+    const one = try query(std.testing.allocator, &idx, .{ .tags = &q, .limit = 1 });
+    defer std.testing.allocator.free(one);
+    try std.testing.expectEqual(@as(usize, 1), one.len);
+    try std.testing.expectEqual(cc, one[0]);
 }
 
 test "untag removes the pair and tagsFor lists the rest" {
