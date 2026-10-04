@@ -152,6 +152,7 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
                 cold.demote(store, io, obj.digest) catch |err| switch (err) {
                     error.ObjectNotFound => continue, // raced; treat as gone
                     error.Canceled => return error.Canceled,
+                    error.OutOfMemory => return error.OutOfMemory,
                     else => return error.Unexpected,
                 };
                 cold_used += coldByteSize(store, io, obj.digest);
