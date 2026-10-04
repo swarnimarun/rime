@@ -4,6 +4,7 @@ const config_mod = @import("config.zig");
 const disk_usage_mod = @import("disk_usage.zig");
 const layout = @import("layout.zig");
 const test_support = @import("test_support.zig");
+const ingest = @import("ingest.zig");
 
 const Io = std.Io;
 
@@ -13,6 +14,10 @@ pub const hashFile = digest.hashFile;
 pub const config = config_mod;
 pub const disk_usage = disk_usage_mod;
 pub const disk_usage_pub = disk_usage_mod;
+
+pub const Kind = enum {
+    rlib, rmeta, obj, staticlib, dylib, bin, dep_info, manifest, build_script_out, source, other,
+};
 
 pub const Store = struct {
     dir: Io.Dir,
@@ -79,6 +84,16 @@ pub const Store = struct {
         store.* = undefined;
     }
 
+    pub const PutError = ingest.PutError;
+
+    pub fn putBytes(store: *Store, io: Io, bytes: []const u8, kind: Kind) PutError!Digest {
+        return ingest.putBytes(store, io, bytes, kind);
+    }
+
+    pub fn putFile(store: *Store, io: Io, src: Io.File, kind: Kind) PutError!Digest {
+        return ingest.putFile(store, io, src, kind);
+    }
+
     fn sweepTmp(io: Io, dir: Io.Dir) OpenError!void {
         const tmp = try dir.openDir(io, layout.tmp_dir, .{ .iterate = true });
         defer tmp.close(io);
@@ -119,4 +134,5 @@ test {
     _ = @import("disk_usage.zig");
     _ = @import("layout.zig");
     _ = @import("test_support.zig");
+    _ = @import("ingest.zig");
 }
