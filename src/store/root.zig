@@ -354,4 +354,5 @@ test {
     _ = @import("gc.zig");
     _ = @import("action_cache.zig");
     _ = @import("cold.zig");
+    _ = @import("index_smoke.zig");
 }
