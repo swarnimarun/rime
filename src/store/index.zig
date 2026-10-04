@@ -1,6 +1,11 @@
 const std = @import("std");
 
-const c = @cImport(@cInclude("sqlite3.h"));
+/// Shared C namespace for the vendored amalgamation. Sibling store modules
+/// must alias this (`const c = index_mod.c;`) rather than running their own
+/// `@cImport`: each `@cImport` evaluation mints distinct Zig types, so a
+/// second import's `sqlite3_*` functions reject `Index.db` with a
+/// same-spelling `expected X, found X` error.
+pub const c = @cImport(@cInclude("sqlite3.h"));
 
 const Io = std.Io;
 
@@ -9,7 +14,10 @@ const Io = std.Io;
 /// reject the unaligned -1 address, so we plant the exact bits with
 /// `@memcpy` (never dereferenced — SQLite only compares the sentinel).
 /// Tells SQLite to copy bound text immediately.
-fn sqliteTransient() c.sqlite3_destructor_type {
+/// Pub so sibling store modules (which never touch `sqlite3_*` themselves
+/// except through index-owned helpers... except tags.zig, which prepares
+/// its own tag statements per Plan B Task 5) can bind text the same way.
+pub fn sqliteTransient() c.sqlite3_destructor_type {
     var d: c.sqlite3_destructor_type = undefined;
     const bits: usize = @bitCast(@as(isize, -1));
     @memcpy(std.mem.asBytes(&d), std.mem.asBytes(&bits));

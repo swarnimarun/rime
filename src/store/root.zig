@@ -16,6 +16,7 @@ const gc_mod = @import("gc.zig");
 const action_cache = @import("action_cache.zig");
 const cold_mod = @import("cold.zig");
 const index_mod = @import("index.zig");
+const tags_mod = @import("tags.zig");
 
 const Io = std.Io;
 
@@ -290,6 +291,39 @@ pub const Store = struct {
         return action_cache.getAction(io, gpa, store.dir, key);
     }
 
+    pub const Tag = tags_mod.Tag;
+    pub const Predicate = tags_mod.Predicate;
+    pub const TagError = tags_mod.TagError;
+
+    pub fn tagObject(store: *Store, io: Io, d: Digest, tags: []const Tag) TagError!void {
+        _ = io;
+        const hex = d.toHex();
+        return tags_mod.tagObject(&store.index, &hex, tags);
+    }
+
+    pub fn untag(store: *Store, io: Io, d: Digest, key: []const u8, value: []const u8) TagError!void {
+        _ = io;
+        const hex = d.toHex();
+        return tags_mod.untag(&store.index, &hex, key, value);
+    }
+
+    pub fn tagsFor(store: *Store, io: Io, gpa: std.mem.Allocator, d: Digest) TagError![]Tag {
+        _ = io;
+        const hex = d.toHex();
+        return tags_mod.tagsFor(gpa, &store.index, &hex);
+    }
+
+    /// Storage-v2 §16 canonical lookup: conjunctive tag predicate, newest-first, bounded LIMIT.
+    pub fn lookupObjects(store: *Store, io: Io, gpa: std.mem.Allocator, pred: Predicate) TagError![]Digest {
+        _ = io;
+        const hexes = try tags_mod.query(gpa, &store.index, pred);
+        defer gpa.free(hexes);
+        const out = try gpa.alloc(Digest, hexes.len);
+        errdefer gpa.free(out);
+        for (hexes, out) |h, slot| slot.* = Digest.fromHex(&h) catch return error.Unexpected;
+        return out;
+    }
+
     /// Size of either tier copy of an object; 0 when absent. Pinned-byte
     /// accounting counts cold copies at their compressed size (spec §9.4).
     fn objectByteSize(store: *Store, io: Io, d: Digest) u64 {
@@ -369,4 +403,5 @@ test {
     _ = @import("action_cache.zig");
     _ = @import("cold.zig");
     _ = @import("index.zig");
+    _ = @import("tags.zig");
 }
