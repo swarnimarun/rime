@@ -30,7 +30,11 @@
 //!   `queryCandidates`), so the first complete resolution found -- and hence
 //!   every selected version -- matches cargo; conflict-directed jump-back is
 //!   approximated chronologically (an optimization + error shaper in cargo,
-//!   not a selection rule). Documented O(n^2) snapshot costs are acceptable
+//!   not a selection rule). Per-edge candidate lists are memoized at enqueue
+//!   time (`enqueuePending`): `candidatesFor` depends only on resolution-fixed
+//!   inputs, so sharing the list across picks and backtracking restores is
+//!   exact and turns pick selection into a pure scan. Documented O(n^2)
+//!   snapshot costs are acceptable
 //!   for M3 graph sizes; production memoization of per-`(name, req)`
 //!   candidate lists is an M2 optimization, not M3 semantics.
 //! - `DepEdge.optional` edges are INVISIBLE to resolution (never enqueued,
@@ -205,6 +209,10 @@ const Pending = struct {
     parent_idx: usize,
     edge: DepEdge,
     seq: usize,
+    // Memoized candidate list, computed once at enqueue time (see
+    // `enqueuePending`). Borrowed from `State.cand_bufs`; snapshots duplicate
+    // this struct shallowly and never own the list.
+    cands: []CandNode,
 };
 
 const Resolution = struct { parent: usize, child: usize };
@@ -214,6 +222,9 @@ const State = struct {
     links: std.StringHashMap(usize),
     pending: std.ArrayList(Pending),
     resolutions: std.ArrayList(Resolution),
+    // Owns every memoized `Pending.cands` list (freed whole at the end of
+    // `resolveInner`; snapshots only borrow).
+    cand_bufs: std.ArrayList([]CandNode),
     next_seq: usize,
     next_age: u64,
     links_conflict_seen: bool, // sticky: any links-based skip (drives Conflict vs NoMatchingVersion)
@@ -393,18 +404,52 @@ fn candidatesFor(
         else => unreachable,
     };
     defer gpa.free(sorted);
+    // Version -> first-summary index (replaces an O(CxS) nested scan per
+    // edge; big index files make that scan quadratic. Identical results:
+    // keys use full `eql` equality (build-sensitive, the Locked rule) and
+    // the first summary wins, exactly as the old inner `break` did.
+    var byver = std.HashMap(CandVerKey, usize, CandVerCtx, std.hash_map.default_max_load_percentage).init(gpa);
+    defer byver.deinit();
+    for (summaries, 0..) |s, si| {
+        const gop = byver.getOrPut(CandVerKey.of(s.candidate.version)) catch return OOM;
+        if (!gop.found_existing) gop.value_ptr.* = si;
+    }
     var out: std.ArrayList(CandNode) = .empty;
     errdefer out.deinit(gpa);
     for (sorted) |c| {
-        for (summaries) |s| {
-            if (s.candidate.version.eql(c.version)) {
-                out.append(gpa, .{ .version = c.version, .node = s }) catch return OOM;
-                break;
-            }
+        if (byver.get(CandVerKey.of(c.version))) |si| {
+            out.append(gpa, .{ .version = c.version, .node = summaries[si] }) catch return OOM;
         }
     }
     return out.toOwnedSlice(gpa) catch return OOM;
 }
+
+const CandVerKey = struct {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    pre: []const u8,
+    build: []const u8,
+    fn of(v: semver.Version) CandVerKey {
+        return .{ .major = v.major, .minor = v.minor, .patch = v.patch, .pre = v.pre, .build = v.build };
+    }
+};
+
+const CandVerCtx = struct {
+    pub fn hash(_: CandVerCtx, k: CandVerKey) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(k.pre);
+        h.update(k.build);
+        h.update(std.mem.asBytes(&k.major));
+        h.update(std.mem.asBytes(&k.minor));
+        h.update(std.mem.asBytes(&k.patch));
+        return h.final();
+    }
+    pub fn eql(_: CandVerCtx, a: CandVerKey, b: CandVerKey) bool {
+        return a.major == b.major and a.minor == b.minor and a.patch == b.patch and
+            std.mem.eql(u8, a.pre, b.pre) and std.mem.eql(u8, a.build, b.build);
+    }
+};
 
 // --- main DFS ---
 
@@ -423,16 +468,43 @@ fn activeKeys(gpa: std.mem.Allocator, state: *const State) ResolveError![]IdKey 
     return slice;
 }
 
-/// Pick the pending edge with the fewest viable candidates
-/// (`RemainingDeps::pop_most_constrained` fail-fast heuristic); ties broken
-/// by dep name, then parent name, then insertion order for determinism.
-fn pickMostConstrained(
+/// Enqueue a pending edge with its candidate list computed ONCE. This is a
+/// pure memoization, not a semantic change: `candidatesFor` depends only on
+/// the resolution-fixed inputs (registry data, filter, lock context, and the
+/// (parent, edge) pair) -- never on live search state -- so the list a later
+/// pick (or a backtracking restore of this edge) observes is exactly the
+/// list a fresh computation would produce. The list is owned by
+/// `state.cand_bufs`; the `Pending` borrows it (snapshots duplicate the
+/// struct shallowly and share the borrow).
+fn enqueuePending(
     gpa: std.mem.Allocator,
     registry: Registry,
     filter: index.QueryFilter,
     lockctx: ?*LockCtx,
-    state: *const State,
-) ResolveError!struct { index: usize, candidates: []CandNode } {
+    state: *State,
+    parent_idx: usize,
+    parent_name: []const u8,
+    edge: DepEdge,
+) ResolveError!void {
+    const cands = try candidatesFor(gpa, registry, filter, lockctx, parent_name, edge);
+    errdefer gpa.free(cands);
+    state.pending.append(gpa, .{ .parent_idx = parent_idx, .edge = edge, .seq = state.next_seq, .cands = cands }) catch return OOM;
+    // The pending entry borrows `cands`; register ownership only after its
+    // append succeeds (either `catch return` above frees via the errdefer).
+    state.cand_bufs.append(gpa, cands) catch {
+        _ = state.pending.pop();
+        return OOM;
+    };
+    state.next_seq += 1;
+}
+
+/// Pick the pending edge with the fewest viable candidates
+/// (`RemainingDeps::pop_most_constrained` fail-fast heuristic); ties broken
+/// by dep name, then parent name, then insertion order for determinism.
+/// A pure scan over the memoized per-edge lists (see `enqueuePending`): no
+/// registry traffic, no allocation -- the returned slice is borrowed from
+/// `State.cand_bufs`, never freed by the caller.
+fn pickMostConstrained(state: *const State) struct { index: usize, candidates: []CandNode } {
     var best_idx: usize = 0;
     var best_cands: []CandNode = &.{};
     var best_count: usize = std.math.maxInt(usize);
@@ -440,13 +512,11 @@ fn pickMostConstrained(
     var best_parent: []const u8 = "";
     var best_seq: usize = std.math.maxInt(usize);
     var have_best = false;
-    errdefer if (have_best) gpa.free(best_cands);
     for (state.pending.items, 0..) |*p, i| {
-        const cands = try candidatesFor(gpa, registry, filter, lockctx, state.actives.items[p.parent_idx].name, p.edge);
+        const cands = p.cands;
         const better = !have_best or cands.len < best_count or
             (cands.len == best_count and lessPendingKey(p.edge.name, state.actives.items[p.parent_idx].name, p.seq, best_name, best_parent, best_seq));
         if (better) {
-            if (have_best) gpa.free(best_cands);
             best_idx = i;
             best_cands = cands;
             best_count = cands.len;
@@ -454,8 +524,6 @@ fn pickMostConstrained(
             best_parent = state.actives.items[p.parent_idx].name;
             best_seq = p.seq;
             have_best = true;
-        } else {
-            gpa.free(cands);
         }
     }
     std.debug.assert(have_best);
@@ -477,10 +545,10 @@ fn lessPendingKey(aname: []const u8, aparent: []const u8, aseq: usize, bname: []
 }
 
 var dbg_n: usize = 0;
-fn dbgEv(comptime fmt: []const u8, args: anytype) void {
-    if (dbg_n >= 40) return;
+fn dbgStuck(parent: []const u8, dep: []const u8, ncands: usize) void {
+    if (dbg_n >= 10) return;
     dbg_n += 1;
-    std.debug.print(fmt, args);
+    std.debug.print("STUCK#{d} {s}->{s} nc={d}\n", .{ dbg_n, parent, dep, ncands });
 }
 fn findActive(name: []const u8, version: semver.Version, source: sources.SourceId, state: *const State) ?usize {
     for (state.actives.items, 0..) |*a, i| {
@@ -502,8 +570,7 @@ fn resolveRec(
         try checkDuplicates(state);
         return;
     }
-    const pick = try pickMostConstrained(gpa, registry, filter, lockctx, state);
-    defer gpa.free(pick.candidates);
+    const pick = pickMostConstrained(state);
     const frame = state.pending.items[pick.index];
     const parent_name = state.actives.items[frame.parent_idx].name;
 
@@ -515,7 +582,7 @@ fn resolveRec(
     if (pick.candidates.len == 0) {
         // Zero viable candidates: nothing to record (no candidate version
         // exists to key a conflict on); fail with the sticky kind.
-        dbgEv("STUCK0 {s}->{s}\n", .{ parent_name, frame.edge.name });
+        dbgStuck(parent_name, frame.edge.name, 0);
         return if (state.links_conflict_seen) ResolveError.Conflict else ResolveError.NoMatchingVersion;
     }
 
@@ -590,10 +657,8 @@ fn resolveRec(
         state.resolutions.append(gpa, .{ .parent = frame.parent_idx, .child = child_idx }) catch return OOM;
         for (cand.node.deps) |dep| {
             if (dep.optional) continue; // Task 5 enables these via unifyV1
-            state.pending.append(gpa, .{ .parent_idx = child_idx, .edge = dep, .seq = state.next_seq }) catch return OOM;
-            state.next_seq += 1;
+            try enqueuePending(gpa, registry, filter, lockctx, state, child_idx, frame.edge.name, dep);
         }
-        _ = parent_name;
         if (resolveRec(gpa, registry, filter, lockctx, state, cstore)) {
             snap.deinit(gpa);
             return;
@@ -607,7 +672,7 @@ fn resolveRec(
 
     // Exhausted: record the conflict set (active keys + failed dep) so future
     // frames skip this known-bad combination (conflict_cache.rs semantic).
-    dbgEv("STUCKN {s}->{s} nc={d}\n", .{ parent_name, frame.edge.name, pick.candidates.len });
+    dbgStuck(parent_name, frame.edge.name, pick.candidates.len);
     {
         var ids: std.ArrayList(IdKey) = .empty;
         defer ids.deinit(gpa);
@@ -729,6 +794,7 @@ fn resolveInner(
         .links = std.StringHashMap(usize).init(gpa),
         .pending = .empty,
         .resolutions = .empty,
+        .cand_bufs = .empty,
         .next_seq = 0,
         .next_age = 0,
         .links_conflict_seen = false,
@@ -737,8 +803,13 @@ fn resolveInner(
     defer state.links.deinit();
     defer state.pending.deinit(gpa);
     defer state.resolutions.deinit(gpa);
+    defer {
+        for (state.cand_bufs.items) |b| gpa.free(b);
+        state.cand_bufs.deinit(gpa);
+    }
     var cstore = try ConflictStore.init(gpa);
     defer cstore.deinit();
+    dbg_n = 0;
 
     const root_source: sources.SourceId = .{ .path = "" };
     for (roots) |r| {
@@ -759,8 +830,7 @@ fn resolveInner(
         }
         for (r.deps) |dep| {
             if (dep.optional) continue;
-            state.pending.append(gpa, .{ .parent_idx = idx, .edge = dep, .seq = state.next_seq }) catch return OOM;
-            state.next_seq += 1;
+            try enqueuePending(gpa, registry, filter, lockctx, &state, idx, r.name, dep);
         }
     }
 
