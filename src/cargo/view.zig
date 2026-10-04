@@ -506,6 +506,35 @@ test "view materializes store objects and clean removes only the view" {
     try clean(gpa, io, ws_root, null);
 }
 
+test "view writeViewMeta emits partial tag rows" {
+    // Regression guard: this writer hid a semantic error while dead code
+    // (nothing called it until cli.run landed). It now runs under test.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = std.testing.allocator;
+    var ws_tmp = std.testing.tmpDir(.{});
+    defer ws_tmp.cleanup();
+    const ws_root = try ws_tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(ws_root);
+    const units = [_]UnitPlan{.{
+        .package = "a",
+        .version = "0.1.0",
+        .target = "a",
+        .kind = .lib,
+        .manifest_digest = null,
+        .outputs = &.{"liba.rlib"},
+    }};
+    try writeViewMeta(gpa, io, ws_root, "dev", &units);
+    const meta = try ws_tmp.dir.readFileAlloc(io, "target/debug/.rime-view.json", gpa, .limited(1 << 20));
+    defer gpa.free(meta);
+    // Full v2 §11.3 key set, M1-partial values, never ingested as complete.
+    for ([_][]const u8{ "\"complete\":false", "\"crate\":\"a\"", "\"crate_version\":\"0.1.0\"", "\"toolchain\":null", "\"target\":null", "\"features\":null", "\"action\":\"rustc\"", "\"project\":\"pb3-" }) |needle| {
+        try std.testing.expect(std.mem.indexOf(u8, meta, needle) != null);
+    }
+    const last = try ws_tmp.dir.readFileAlloc(io, "target/debug/last-build.json", gpa, .limited(1024));
+    defer gpa.free(last);
+    try std.testing.expectEqualStrings("{\"manifests\":[]}\n", last);
+}
+
 test "view planUnits orders dependencies first" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var ws = try workspace_mod.discover(std.testing.allocator, io, "testdata/cargo/workspace", null);
