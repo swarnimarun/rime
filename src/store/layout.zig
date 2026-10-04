@@ -9,6 +9,7 @@ pub const tmp_dir = "tmp";
 pub const state_dir = "state";
 pub const format_file = "format.json";
 pub const lock_file = "format-lock";
+pub const index_file = "index.sqlite";
 pub const format_version: u32 = 1;
 
 pub const FormatJson = struct { format: u32 };
