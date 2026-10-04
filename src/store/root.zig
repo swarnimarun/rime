@@ -9,6 +9,7 @@ const objects = @import("objects.zig");
 const manifest_mod = @import("manifest.zig");
 const clone_mod = @import("clone.zig");
 const materialize_mod = @import("materialize.zig");
+const scan_mod = @import("scan.zig");
 
 const Io = std.Io;
 
@@ -121,6 +122,17 @@ pub const Store = struct {
         return materialize_mod.materialize(store, io, d, dest_path, mode, .clone_first);
     }
 
+    pub const ObjectInfo = scan_mod.ObjectInfo;
+    pub const ScanError = scan_mod.ScanError;
+
+    pub fn scan(store: *Store, io: Io, gpa: std.mem.Allocator) ScanError![]scan_mod.ObjectInfo {
+        return scan_mod.scan(store, io, gpa);
+    }
+
+    pub fn touch(store: *Store, io: Io, d: Digest) void {
+        return scan_mod.touch(store, io, d);
+    }
+
     pub const Manifest = manifest_mod.Manifest;
     pub const ManifestOutput = manifest_mod.Output;
     pub const GetManifestError = ReadError || manifest_mod.DecodeError;
@@ -182,4 +194,5 @@ test {
     _ = @import("manifest.zig");
     _ = @import("clone.zig");
     _ = @import("materialize.zig");
+    _ = @import("scan.zig");
 }
