@@ -144,6 +144,109 @@ pub const Index = struct {
     }
 };
 
+pub const Tier = enum { hot, cold, both };
+
+pub const ObjectRow = struct {
+    digest: [64]u8,
+    size: u64,
+    compressed_size: ?u64,
+    tier: Tier,
+    kind: []const u8,
+    created_ms: i64,
+    last_access_ms: i64,
+};
+
+fn bindText(stmt: ?*c.sqlite3_stmt, col: c_int, text: []const u8) void {
+    _ = c.sqlite3_bind_text(stmt, col, text.ptr, @intCast(text.len), sqliteTransient());
+}
+
+/// INSERT OR REPLACE: ingest is idempotent, so re-put of the same digest
+/// refreshes size/tier/kind but never duplicates the row.
+pub fn upsertObject(idx: *Index, row: ObjectRow) DbError!void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db,
+        "INSERT OR REPLACE INTO objects(digest,size,compressed_size,tier,kind,created_ms,last_access_ms)" ++
+        " VALUES(?1,?2,?3,?4,?5,?6,?7);", -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, &row.digest);
+    _ = c.sqlite3_bind_int64(stmt, 2, @intCast(row.size));
+    if (row.compressed_size) |cs| {
+        _ = c.sqlite3_bind_int64(stmt, 3, @intCast(cs));
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 3);
+    }
+    bindText(stmt, 4, if (row.tier == .hot) "hot" else if (row.tier == .cold) "cold" else "both");
+    bindText(stmt, 5, row.kind);
+    _ = c.sqlite3_bind_int64(stmt, 6, row.created_ms);
+    _ = c.sqlite3_bind_int64(stmt, 7, row.last_access_ms);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
+pub fn touchObject(idx: *Index, digest: *const [64]u8, now_ms: i64) DbError!void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db,
+        "UPDATE objects SET last_access_ms=?1 WHERE digest=?2;", -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_int64(stmt, 1, now_ms);
+    bindText(stmt, 2, digest);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
+/// Oldest-first candidate rows for one tier (null tier = both tiers).
+/// Caller frees the slice with freeRows (per-row kind strings are duped).
+pub fn lruCandidates(idx: *Index, gpa: std.mem.Allocator, tier: ?Tier, limit: u32) DbError![]ObjectRow {
+    const sql: [:0]const u8 = if (tier == null)
+        "SELECT digest,size,compressed_size,tier,kind,created_ms,last_access_ms FROM objects ORDER BY last_access_ms ASC LIMIT ?1;"
+    else
+        "SELECT digest,size,compressed_size,tier,kind,created_ms,last_access_ms FROM objects WHERE tier=?2 ORDER BY last_access_ms ASC LIMIT ?1;";
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db, sql.ptr, -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    _ = c.sqlite3_bind_int64(stmt, 1, @intCast(limit));
+    if (tier) |t| bindText(stmt, 2, if (t == .hot) "hot" else if (t == .cold) "cold" else "both");
+
+    var list: std.ArrayList(ObjectRow) = .empty;
+    errdefer list.deinit(gpa);
+    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+        var row = ObjectRow{
+            .digest = undefined,
+            .size = @intCast(c.sqlite3_column_int64(stmt, 1)),
+            .compressed_size = if (c.sqlite3_column_type(stmt, 2) == c.SQLITE_NULL)
+                null
+            else
+                @intCast(c.sqlite3_column_int64(stmt, 2)),
+            .tier = if (std.mem.eql(u8, std.mem.span(c.sqlite3_column_text(stmt, 3)), "hot")) .hot else if (std.mem.eql(u8, std.mem.span(c.sqlite3_column_text(stmt, 3)), "cold")) .cold else .both,
+            .kind = "",
+            .created_ms = c.sqlite3_column_int64(stmt, 5),
+            .last_access_ms = c.sqlite3_column_int64(stmt, 6),
+        };
+        const hex_ptr = c.sqlite3_column_text(stmt, 0);
+        @memcpy(&row.digest, std.mem.span(hex_ptr)[0..64]);
+        row.kind = try gpa.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 4)));
+        // NOTE: kind strings are one dupe per row; freed by freeRows below.
+        try list.append(gpa, row);
+    }
+    return try list.toOwnedSlice(gpa);
+}
+
+/// Frees a slice from lruCandidates (including per-row kind dupes).
+pub fn freeRows(gpa: std.mem.Allocator, rows: []ObjectRow) void {
+    for (rows) |r| gpa.free(r.kind);
+    gpa.free(rows);
+}
+
+pub fn objectCount(idx: *Index) DbError!u64 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db, "SELECT COUNT(*) FROM objects;", -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DbStep;
+    return @intCast(c.sqlite3_column_int64(stmt, 0));
+}
+
 test "index opens inside a store dir and creates the schema" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{});
@@ -171,4 +274,59 @@ test "index reopen is idempotent (IF NOT EXISTS)" {
     var b = try Index.open(io, tmp.dir);
     defer b.close();
     try std.testing.expect(try b.tableExists("objects"));
+}
+
+test "upsert then lru order follows last_access" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var idx = try Index.open(io, tmp.dir);
+    defer idx.close();
+
+    try upsertObject(&idx, .{
+        .digest = [_]u8{'a'} ** 64,
+        .size = 10,
+        .compressed_size = null,
+        .tier = .hot,
+        .kind = "rlib",
+        .created_ms = 1000,
+        .last_access_ms = 3000,
+    });
+    try upsertObject(&idx, .{
+        .digest = [_]u8{'b'} ** 64,
+        .size = 20,
+        .compressed_size = null,
+        .tier = .hot,
+        .kind = "bin",
+        .created_ms = 1000,
+        .last_access_ms = 1000,
+    });
+    const rows = try lruCandidates(&idx, std.testing.allocator, .hot, 10);
+    defer freeRows(std.testing.allocator, rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual([_]u8{'b'} ** 64, rows[0].digest);
+    try std.testing.expectEqual(@as(u64, 2), try objectCount(&idx));
+}
+
+test "touchObject moves the row to the back of lru" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var idx = try Index.open(io, tmp.dir);
+    defer idx.close();
+
+    try upsertObject(&idx, .{
+        .digest = [_]u8{'c'} ** 64,
+        .size = 5,
+        .compressed_size = null,
+        .tier = .cold,
+        .kind = "other",
+        .created_ms = 1000,
+        .last_access_ms = 1000,
+    });
+    const digest_c: [64]u8 = [_]u8{'c'} ** 64;
+    try touchObject(&idx, &digest_c, 9999);
+    const rows = try lruCandidates(&idx, std.testing.allocator, .cold, 10);
+    defer freeRows(std.testing.allocator, rows);
+    try std.testing.expectEqual(@as(i64, 9999), rows[0].last_access_ms);
 }
