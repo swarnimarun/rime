@@ -24,8 +24,24 @@ pub fn putBytes(store: *root.Store, io: Io, bytes: []const u8, kind: root.Kind) 
     var path_buf: [73]u8 = undefined;
     const full = objectFull(d, &path_buf);
 
-    // Fast path: already present.
+    // Fast path: already present. A dedup hit is a cache hit: refresh LRU
+    // (spec §9.2) instead of rewriting identical bytes.
     if (store.dir.statFile(io, full, .{})) |_| {
+        store.touch(io, d);
+        return d;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return error.Unexpected,
+    }
+
+    // Cold-only hit: promote back to hot rather than duplicating tiers.
+    // A missing or unreadable cold copy falls through to a normal store.
+    store.promote(io, d) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {},
+    };
+    if (store.dir.statFile(io, full, .{})) |_| {
+        store.touch(io, d);
         return d;
     } else |err| switch (err) {
         error.FileNotFound => {},
@@ -70,6 +86,27 @@ pub fn putFile(store: *root.Store, io: Io, src: Io.File, kind: root.Kind) PutErr
 
     var path_buf: [73]u8 = undefined;
     const full = objectFull(d, &path_buf);
+    // Dedup hit: the tmp copy is redundant. Drop it and refresh LRU
+    // (spec §9.2) instead of rewriting identical bytes; a cold-only hit
+    // promotes back to hot rather than duplicating tiers.
+    const hot_present = if (store.dir.statFile(io, full, .{})) |_| true else |err| switch (err) {
+        error.FileNotFound => false,
+        else => return error.Unexpected,
+    };
+    if (!hot_present) {
+        store.promote(io, d) catch |perr| switch (perr) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {}, // absent/unreadable cold copy; publish below
+        };
+    }
+    if (store.dir.statFile(io, full, .{})) |_| {
+        store.dir.deleteFile(io, tmp_name) catch {};
+        store.touch(io, d);
+        return d;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return error.Unexpected,
+    }
     try publish(store, io, tmp_name, full);
     try recordKind(store, io, d, kind);
     return d;
@@ -149,6 +186,72 @@ test "putFile hashes the whole file and dedups" {
     const d1 = try ts.store.putFile(io, src, .rlib);
     const d2 = try ts.store.putBytes(io, "same bytes", .rlib);
     try std.testing.expectEqual(d1.bytes, d2.bytes);
+}
+
+fn backdate(io: std.Io, store: *root.Store, d: Digest) !void {
+    var buf: [73]u8 = undefined;
+    const f = try store.dir.openFile(io, objectFull(d, &buf), .{});
+    defer f.close(io);
+    try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(1_000_000_000) } });
+}
+
+test "putBytes dedup hit refreshes LRU" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var ts = test_support.openTestStore(io, .{});
+    defer ts.deinit(io);
+
+    const d = try ts.store.putBytes(io, "hot again", .other);
+    // Age the object past the touch throttle, then re-put identical bytes.
+    try backdate(io, &ts.store, d);
+    const d2 = try ts.store.putBytes(io, "hot again", .other);
+    try std.testing.expectEqual(d.bytes, d2.bytes);
+
+    var buf: [73]u8 = undefined;
+    const st = try ts.store.dir.statFile(io, objectFull(d, &buf), .{});
+    try std.testing.expect(st.mtime.toMilliseconds() > 60_000);
+}
+
+test "putBytes cold hit promotes back to hot" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = std.testing.allocator;
+    var ts = test_support.openTestStore(io, .{});
+    defer ts.deinit(io);
+
+    const d = try ts.store.putBytes(io, "returning", .other);
+    try ts.store.demote(io, d);
+    try std.testing.expect(!ts.store.dirHasHot(io, d));
+
+    const d2 = try ts.store.putBytes(io, "returning", .other);
+    try std.testing.expectEqual(d.bytes, d2.bytes);
+    try std.testing.expect(ts.store.dirHasHot(io, d));
+    // Exactly one tier copy, still intact.
+    const infos = try ts.store.scan(io, gpa);
+    defer gpa.free(infos);
+    try std.testing.expectEqual(@as(usize, 1), infos.len);
+    try std.testing.expect(infos[0].tier == .hot);
+}
+
+test "putFile dedup hit refreshes LRU without rewrite" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var ts = test_support.openTestStore(io, .{});
+    defer ts.deinit(io);
+
+    const src = try ts.store.dir.createFile(io, "src.bin", .{ .read = true });
+    defer {
+        src.close(io);
+        ts.store.dir.deleteFile(io, "src.bin") catch {};
+    }
+    try src.writeStreamingAll(io, "same bytes");
+
+    const d1 = try ts.store.putFile(io, src, .rlib);
+    try backdate(io, &ts.store, d1);
+    const d2 = try ts.store.putFile(io, src, .rlib);
+    try std.testing.expectEqual(d1.bytes, d2.bytes);
+
+    var buf: [73]u8 = undefined;
+    const st = try ts.store.dir.statFile(io, objectFull(d1, &buf), .{});
+    try std.testing.expect(st.mtime.toMilliseconds() > 60_000);
+    try ts.store.verifyObject(io, d1);
 }
 
 test "crash window: tmp files are never objects" {
