@@ -1,0 +1,10 @@
+[package]
+name = "rime-minimal"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1.0"
+
+[dependencies.rime-dep]
+path = "../rime-dep"
