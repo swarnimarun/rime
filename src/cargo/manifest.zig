@@ -227,9 +227,12 @@ fn optionalBuildScript(t: *const toml.TomlTable) ManifestError! ?[]const u8 {
 
 fn checkPackageKeys(t: *const toml.TomlTable) ManifestError!void {
     // Harmless metadata cargo accepts (description, repository, …) parses
-    // and is ignored: the M1 model has no fields for it. Anything else is
-    // still loud (decision D2) — silent divergence is forbidden.
-    const allowed = [_][]const u8{ "name", "version", "edition", "build", "build-script", "rust-version", "description", "license", "authors", "repository", "homepage", "documentation", "readme", "keywords", "categories", "publish", "exclude", "include", "links", "default-run", "autobins", "autoexamples", "autotests", "autobenches", "autolib", "metadata" };
+    // and is ignored: the M1 model has no fields for it. `resolver` (the
+    // "1"/"2" version selector, valid under [package] and [workspace])
+    // is likewise tolerated: it only affects version/feature resolution,
+    // which M3 owns — M1 plans workspace path members only. Anything else
+    // is still loud (decision D2) — silent divergence is forbidden.
+    const allowed = [_][]const u8{ "name", "version", "edition", "build", "build-script", "rust-version", "description", "license", "authors", "repository", "homepage", "documentation", "readme", "keywords", "categories", "publish", "exclude", "include", "links", "default-run", "autobins", "autoexamples", "autotests", "autobenches", "autolib", "metadata", "resolver" };
     var it = t.entries.iterator();
     while (it.next()) |kv| {
         var ok = false;
@@ -349,6 +352,15 @@ test "manifest marks cross-file inheritance pending" {
 
 test "manifest rejects unknown package keys loudly" {
     try std.testing.expectError(ManifestError.UnsupportedKey, parseManifest(std.testing.allocator, "[package]\nname = \"a\"\nversion = \"0.1.0\"\nflux-capacitor = true\n"));
+}
+
+test "manifest tolerates resolver version selector" {
+    // validation/feature-matrix sets `resolver = "2"` under [package];
+    // M1 plans path members only, so the selector parses and is ignored
+    // (resolution semantics belong to M3).
+    var m = try parseManifest(std.testing.allocator, "[package]\nname = \"a\"\nversion = \"0.1.0\"\nresolver = \"2\"\n");
+    defer m.deinit();
+    try std.testing.expectEqualStrings("a", m.pkg.?.name);
 }
 
 test "manifest parses git and workspace-inherit deps" {
