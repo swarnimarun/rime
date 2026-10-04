@@ -74,7 +74,13 @@ pub fn sweepStale(
             // Entry files are named by the full 64-char hex key.
             if (entry.name.len != 64) continue;
             const key = digest_mod.Digest.fromHex(entry.name) catch continue;
-            const got = try getAction(io, gpa, store_dir, key);
+            // Corrupt entries must not abort the sweep (or gc); skip them
+            // like other unreadable state files. Propagate OOM/cancel.
+            const got = getAction(io, gpa, store_dir, key) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Canceled => return error.Canceled,
+                error.Unexpected => continue,
+            };
             const e = got orelse continue;
             if (is_present(ctx, e.manifest)) continue;
             sub.deleteFile(io, entry.name) catch {};
@@ -118,6 +124,38 @@ test "putAction getAction round trip" {
     try ts.store.putAction(io, key, man);
     const entry = (try ts.store.getAction(io, gpa, key)).?;
     try std.testing.expectEqual(man.bytes, entry.manifest.bytes);
+}
+
+test "sweepStale skips corrupt entries without aborting" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = std.testing.allocator;
+    var ts = test_support.openTestStore(io, .{});
+    defer ts.deinit(io);
+
+    const stale_key = root.hashBytes("corrupt-sweep-stale");
+    var no_outputs: [0]root.Store.ManifestOutput = .{};
+    const stale_man = try ts.store.putManifest(io, .{ .kind = .bin, .outputs = &no_outputs });
+    try ts.store.putAction(io, stale_key, stale_man);
+
+    // Delete the manifest so the valid entry is stale.
+    var full_buf: [75]u8 = undefined;
+    var rbuf: [67]u8 = undefined;
+    const rel = stale_man.relPath(&rbuf);
+    @memcpy(full_buf[0..8], "objects/");
+    @memcpy(full_buf[8..], rel);
+    try ts.store.dir.deleteFile(io, full_buf[0..75]);
+
+    // Corrupt entry: valid 64-hex name, invalid JSON body.
+    const corrupt_key = root.hashBytes("corrupt-sweep-bad");
+    var corrupt_full: [75]u8 = undefined;
+    const corrupt_path = entryFull(corrupt_key, &corrupt_full);
+    try ts.store.dir.createDirPath(io, corrupt_path[0..10]);
+    try ts.store.dir.writeFile(io, .{ .sub_path = corrupt_path, .data = "{not json" });
+
+    var cb = ExistsCtx{ .store = &ts.store, .io = io };
+    const removed = try sweepStale(io, gpa, ts.store.dir, ExistsCtx.call, &cb);
+    try std.testing.expectEqual(@as(u64, 1), removed);
+    try std.testing.expect((try ts.store.getAction(io, gpa, stale_key)) == null);
 }
 
 test "sweepStale removes entries whose manifest object is gone" {
