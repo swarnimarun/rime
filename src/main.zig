@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const store = @import("store");
 
 pub const GcOpts = struct { dry_run: bool = false, target_bytes: ?u64 = null, older_than_ns: ?u64 = null };
+pub const MigrateOpts = struct { dry_run: bool = false };
 pub const PinArgs = struct { name: []const u8, digest: []const u8 };
 pub const UnpinArgs = struct { name: []const u8 };
 pub const StorePutArgs = struct { name: []const u8, file: []const u8 };
@@ -10,6 +11,7 @@ pub const StoreGetArgs = struct { name: []const u8, out_file: []const u8 };
 
 pub const Command = union(enum) {
     stat,
+    migrate: MigrateOpts,
     gc: GcOpts,
     pin: PinArgs,
     unpin: UnpinArgs,
@@ -24,6 +26,16 @@ pub fn parseCommand(gpa: std.mem.Allocator, args: []const []const u8) error{Usag
     if (std.mem.eql(u8, args[0], "cache")) {
         if (args.len == 2 and std.mem.eql(u8, args[1], "stat")) return .stat;
         if (args.len == 2 and std.mem.eql(u8, args[1], "verify")) return .verify;
+        // Explicit v1→v2 migration (storage-v2 §14); never auto-runs on open.
+        if (args.len >= 2 and std.mem.eql(u8, args[1], "migrate")) {
+            var opts = MigrateOpts{};
+            for (args[2..]) |a| {
+                if (std.mem.eql(u8, a, "--dry-run")) {
+                    opts.dry_run = true;
+                } else return error.Usage;
+            }
+            return .{ .migrate = opts };
+        }
         return error.Usage;
     }
     if (std.mem.eql(u8, args[0], "gc")) {
@@ -66,12 +78,15 @@ pub fn main(init: std.process.Init) !u8 {
 
     const rest: []const []const u8 = if (argv.items.len > 1) argv.items[1..] else &.{};
     const cmd = parseCommand(gpa, rest) catch {
-        std.debug.print("usage: rime <cache stat|cache verify|gc|pin|unpin|store> …\n", .{});
+        std.debug.print("usage: rime <cache stat|cache verify|cache migrate [--dry-run]|gc|pin|unpin|store> …\n", .{});
         return 2;
     };
 
     var store_dir = try openStoreDir(init, io, gpa);
     defer store_dir.close(io);
+    // Migration runs without Store.open (which refuses format 1 with
+    // MigrationRequired); it holds the exclusive format-lock itself (§14.1).
+    if (cmd == .migrate) return cmdMigrate(io, store_dir, cmd.migrate);
     var s = store.Store.open(io, store_dir, .{}) catch |e| {
         std.debug.print("rime: cannot open store: {t}\n", .{e});
         return 1;
@@ -80,6 +95,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     switch (cmd) {
         .stat => return cmdStat(io, gpa, &s),
+        .migrate => unreachable, // handled before Store.open above
         .gc => |p| return cmdGc(io, gpa, &s, p),
         .pin => |p| return cmdPin(io, &s, p),
         .unpin => |p| return cmdUnpin(io, &s, p),
@@ -109,6 +125,35 @@ fn openStoreDir(init: std.process.Init, io: std.Io, gpa: std.mem.Allocator) !std
     const full = try std.fmt.allocPrint(gpa, "{s}/rime", .{base});
     defer gpa.free(full);
     return std.Io.Dir.cwd().createDirPathOpen(io, full, .{});
+}
+
+/// Explicit v1→v2 migration (storage-v2 §14). Holds the exclusive
+/// format-lock for the whole run; `Store.open` never migrates.
+fn cmdMigrate(io: std.Io, store_dir: std.Io.Dir, opts: MigrateOpts) u8 {
+    const lock = store_dir.createFile(io, "format-lock", .{ .read = true, .truncate = false }) catch {
+        std.debug.print("rime: cannot open format-lock\n", .{});
+        return 1;
+    };
+    defer lock.close(io);
+    lock.lock(io, .exclusive) catch {
+        std.debug.print("rime: cannot hold exclusive format-lock\n", .{});
+        return 1;
+    };
+    defer lock.unlock(io);
+    var idx = store.Index.open(io, store_dir) catch |e| {
+        std.debug.print("rime: cannot open index: {t}\n", .{e});
+        return 1;
+    };
+    defer idx.close();
+    const rep = store.migrate_mod.migrate(io, store_dir, &idx, .{ .dry_run = opts.dry_run }) catch |e| {
+        std.debug.print("rime: migrate failed: {t}\n", .{e});
+        return 1;
+    };
+    std.debug.print(
+        "migrated objects {d} actions {d} roots {d} incremental bytes {d} dry-run {}\n",
+        .{ rep.objects_imported, rep.actions_imported, rep.roots_imported, rep.incremental_rehomed_bytes, opts.dry_run },
+    );
+    return 0;
 }
 
 fn cmdStat(io: std.Io, gpa: std.mem.Allocator, s: *store.Store) u8 {

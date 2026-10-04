@@ -6,6 +6,12 @@ const ns_per_day: u64 = 24 * std.time.ns_per_hour;
 
 pub const Limit = union(enum) { auto, fixed: u64 };
 
+/// Soft per-tag budget entry (storage-v2 §12.3). TOML key is singular
+/// `[store.tag_budget]` with `"key:value" = size` entries (e.g.
+/// `"crate:serde" = "2GiB"`); env `RIME_TAG_BUDGET_<KEY>_<VALUE>`.
+/// Soft caps steer GC eviction order only (never StoreFull, decision D6).
+pub const TagBudgetCfg = struct { key: []const u8, value: []const u8, soft_cap: u64 };
+
 pub const Config = struct {
     hot_limit: Limit = .auto,
     cold_limit: Limit = .auto,
@@ -16,6 +22,19 @@ pub const Config = struct {
     incremental_limit: u64 = 4 * GiB,
     incremental_max_age_ns: u64 = 5 * ns_per_day,
     retain_last_build: bool = true,
+    // Storage-v2 §15 additions (additive only; existing fields untouched):
+    // the one total-budget knob (`store.budget`, auto per §9.1).
+    budget: Limit = .auto,
+    // Explicit class caps (`store.hot_cap` etc., bytes; must sum <= budget).
+    // Null means the default 70/20/5/5 share of the resolved total.
+    hot_cap: ?Limit = null,
+    cold_cap: ?Limit = null,
+    index_state_cap: ?Limit = null,
+    spool_cap: ?Limit = null,
+    // Reservation TTL (`store.reservation_ttl`, §10.2; default 10m).
+    reservation_ttl_ns: u64 = 10 * std.time.ns_per_min,
+    // Soft per-tag budgets (`[store.tag_budget]`, §12.3; steering only).
+    tag_budgets: []const TagBudgetCfg = &.{},
 };
 
 pub const ResolvedLimits = struct { hot: u64, cold: u64, reserve: u64 };

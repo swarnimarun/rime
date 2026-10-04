@@ -465,6 +465,51 @@ pub fn deleteRetainManifests(idx: *Index, project_id: []const u8) DbError!void {
     if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
 }
 
+/// Storage-v2 §9.3 class tags for budget accounting. Object bytes only ever
+/// count toward hot/cold; index_state/spool usage comes from file walks +
+/// live reservations (see budget.classUsage). The strings match the
+/// `reservations.class` CHECK values.
+pub const Class = enum { hot, cold, index_state, spool };
+
+fn className(class: Class) []const u8 {
+    return switch (class) {
+        .hot => "hot",
+        .cold => "cold",
+        .index_state => "index_state",
+        .spool => "spool",
+    };
+}
+
+/// §9.3/§12.3 CASE measure split per class. Hot counts uncompressed sizes
+/// (tier hot + the hot copy of `both` staging rows); cold counts compressed
+/// sizes (tier cold + the cold copy of `both` rows); index_state/spool hold
+/// no object bytes and return 0 (callers add file walks + reservations).
+pub fn classSum(idx: *Index, class: Class) DbError!u64 {
+    const sql: [:0]const u8 = switch (class) {
+        .hot => "SELECT COALESCE(SUM(CASE WHEN tier='hot' THEN size WHEN tier='both' THEN size ELSE 0 END),0) FROM objects;",
+        .cold => "SELECT COALESCE(SUM(CASE WHEN tier='cold' THEN COALESCE(compressed_size,size) WHEN tier='both' THEN COALESCE(compressed_size,0) ELSE 0 END),0) FROM objects;",
+        .index_state, .spool => return 0,
+    };
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db, sql.ptr, -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DbStep;
+    return @intCast(c.sqlite3_column_int64(stmt, 0));
+}
+
+/// SUM(bytes) over live `reservations` rows for one class (§9.3
+/// double-entry rule: reservations count until commit/abort/expiry).
+pub fn reservationSum(idx: *Index, class: Class) DbError!u64 {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db, "SELECT COALESCE(SUM(bytes),0) FROM reservations WHERE class=?1;", -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, className(class));
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.DbStep;
+    return @intCast(c.sqlite3_column_int64(stmt, 0));
+}
+
 test "index opens inside a store dir and creates the schema" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{});

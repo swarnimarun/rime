@@ -12,11 +12,18 @@ const materialize_mod = @import("materialize.zig");
 const scan_mod = @import("scan.zig");
 /// State file helpers (pins/leases/retains); the CLI lists pins through here.
 pub const state = @import("state.zig");
+/// SQLite index handle; the CLI opens it directly for `cache migrate`
+/// (Store.open refuses format 1, so migration cannot go through Store).
+pub const Index = index_mod.Index;
 const gc_mod = @import("gc.zig");
 const action_cache = @import("action_cache.zig");
 const cold_mod = @import("cold.zig");
 const index_mod = @import("index.zig");
 const tags_mod = @import("tags.zig");
+const budget_mod = @import("budget.zig");
+/// Explicit v1→v2 migration (storage-v2 §14); invoked only by
+/// `rime cache migrate`, never by `Store.open`.
+pub const migrate_mod = @import("migrate.zig");
 
 const Io = std.Io;
 
@@ -35,11 +42,17 @@ pub const Store = struct {
     dir: Io.Dir,
     config: config_mod.Config,
     limits: config_mod.ResolvedLimits,
+    /// Resolved total budget + hard 70/20/5/5 class caps (storage-v2 §9.1).
+    /// Kept alongside `limits` (still populated; v1 GC paths use it until
+    /// tag-aware GC replaces them). Invariant: total usage incl.
+    /// reservations <= budget.total at all times.
+    budget: budget_mod.ResolvedBudget,
     lock_file: Io.File,
     index: index_mod.Index,
 
     pub const OpenError = error{
         UnknownFormat,
+        MigrationRequired,
         StatFsFailed,
         Unexpected,
         OutOfMemory,
@@ -57,7 +70,10 @@ pub const Store = struct {
         try dir.createDirPath(io, layout.state_dir ++ "/leases");
         try dir.createDirPath(io, layout.state_dir ++ "/projects");
 
-        // format.json: create or validate.
+        // format.json: create or validate. Format-to-error table per
+        // storage-v2 §14: 1 → MigrationRequired on v2 open (run
+        // `rime cache migrate`), 2 → ok, missing dir state creates 2,
+        // corrupt/other → UnknownFormat. v1 binaries refuse 2 the same way.
         if (dir.readFileAlloc(io, layout.format_file, std.heap.page_allocator, .unlimited)) |bytes| {
             defer std.heap.page_allocator.free(bytes);
             const parsed = std.json.parseFromSlice(
@@ -67,11 +83,12 @@ pub const Store = struct {
                 .{},
             ) catch return error.UnknownFormat;
             defer parsed.deinit();
+            if (parsed.value.format == 1) return error.MigrationRequired;
             if (parsed.value.format != layout.format_version) return error.UnknownFormat;
         } else |err| switch (err) {
             error.FileNotFound => try dir.writeFile(io, .{
                 .sub_path = layout.format_file,
-                .data = "{\"format\":1}\n",
+                .data = "{\"format\":2}\n",
             }),
             else => return error.Unexpected,
         }
@@ -90,6 +107,7 @@ pub const Store = struct {
             .dir = dir,
             .config = cfg,
             .limits = config_mod.resolveLimits(cfg, usage),
+            .budget = budget_mod.resolveBudget(cfg, usage),
             .lock_file = lock,
             .index = index,
         };
@@ -373,7 +391,7 @@ test "store open creates layout and format" {
     try std.testing.expect(ts.store.limits.hot >= 5 * config.GiB);
     const fmt = try ts.store.dir.readFileAlloc(io, "format.json", std.testing.allocator, .unlimited);
     defer std.testing.allocator.free(fmt);
-    try std.testing.expect(std.mem.indexOf(u8, fmt, "\"format\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fmt, "\"format\":2") != null);
 }
 
 test "store open refuses unknown format version" {
@@ -409,4 +427,6 @@ test {
     _ = @import("cold.zig");
     _ = @import("index.zig");
     _ = @import("tags.zig");
+    _ = @import("migrate.zig");
+    _ = @import("budget.zig");
 }
