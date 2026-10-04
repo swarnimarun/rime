@@ -323,21 +323,21 @@ Reference pins (comment above each function): `dep_cache.rs::RegistryQueryer::qu
 test "index filters yanked and prefers locked versions" {
     const all = [_]Candidate{
         .{ .name = "serde", .version = try semver.Version.parse("1.0.200"), .yanked = false, .checksum = null, .rust_version = null, .pubtime = null },
-        .{ .name = "serde", .version = try Version.parse("1.0.201"), .yanked = true, .checksum = null, .rust_version = null, .pubtime = null },
-        .{ .name = "serde", .version = try Version.parse("1.0.150"), .yanked = false, .checksum = null, .rust_version = null, .pubtime = null },
+        .{ .name = "serde", .version = try semver.Version.parse("1.0.201"), .yanked = true, .checksum = null, .rust_version = null, .pubtime = null },
+        .{ .name = "serde", .version = try semver.Version.parse("1.0.150"), .yanked = false, .checksum = null, .rust_version = null, .pubtime = null },
     };
     const req = semver.OptVersionReq{ .req = try semver.VersionReq.parse("^1.0.0") };
     // Yanked 1.0.201 hidden by default; newest non-yanked first.
     const got = try queryCandidates(std.testing.allocator, &all, req, .{ .allow_yanked = &.{}, .max_pubtime = null, .min_versions_first = false, .rust_versions = &.{}, .preferred = &.{} });
     defer std.testing.allocator.free(got);
     try std.testing.expectEqual(@as(usize, 2), got.len);
-    try std.testing.expect(got[0].version.eql(try Version.parse("1.0.200")));
+    try std.testing.expect(got[0].version.eql(try semver.Version.parse("1.0.200")));
     // Pinned yanked version is rescued (lock_to path in dep_cache.rs query).
-    const pinned = [_]semver.Version{try Version.parse("1.0.201")};
+    const pinned = [_]semver.Version{try semver.Version.parse("1.0.201")};
     const got2 = try queryCandidates(std.testing.allocator, &all, req, .{ .allow_yanked = &pinned, .max_pubtime = null, .min_versions_first = false, .rust_versions = &.{}, .preferred = &pinned });
     defer std.testing.allocator.free(got2);
     try std.testing.expectEqual(@as(usize, 3), got2.len);
-    try std.testing.expect(got2[0].version.eql(try Version.parse("1.0.201")));
+    try std.testing.expect(got2[0].version.eql(try semver.Version.parse("1.0.201")));
 }
 ```
 
@@ -358,24 +358,24 @@ Filter loop + `std.mem.sort` with a context struct capturing `filter` (comparato
 test "index orders by msrv compatibility then version" {
     // candidate A v2.0.0 needs rust 1.80, candidate B v1.9.0 needs rust 1.60; workspace rust is 1.70 → B first.
     const all = [_]Candidate{
-        .{ .name = "x", .version = try Version.parse("2.0.0"), .yanked = false, .checksum = null, .rust_version = try Version.parse("1.80.0"), .pubtime = null },
-        .{ .name = "x", .version = try Version.parse("1.9.0"), .yanked = false, .checksum = null, .rust_version = try Version.parse("1.60.0"), .pubtime = null },
+        .{ .name = "x", .version = try semver.Version.parse("2.0.0"), .yanked = false, .checksum = null, .rust_version = try semver.Version.parse("1.80.0"), .pubtime = null },
+        .{ .name = "x", .version = try semver.Version.parse("1.9.0"), .yanked = false, .checksum = null, .rust_version = try semver.Version.parse("1.60.0"), .pubtime = null },
     };
-    const rv = [_]semver.Version{try Version.parse("1.70.0")};
+    const rv = [_]semver.Version{try semver.Version.parse("1.70.0")};
     const got = try queryCandidates(std.testing.allocator, &all, .any, .{ .allow_yanked = &.{}, .max_pubtime = null, .min_versions_first = false, .rust_versions = &rv, .preferred = &.{} });
     defer std.testing.allocator.free(got);
-    try std.testing.expect(got[0].version.eql(try Version.parse("1.9.0")));
+    try std.testing.expect(got[0].version.eql(try semver.Version.parse("1.9.0")));
 }
 
 test "index minimal-versions sorts ascending and pubtime filters" {
     const all = [_]Candidate{
-        .{ .name = "x", .version = try Version.parse("1.2.0"), .yanked = false, .checksum = null, .rust_version = null, .pubtime = 100 },
-        .{ .name = "x", .version = try Version.parse("1.1.0"), .yanked = false, .checksum = null, .rust_version = null, .pubtime = 9999 },
+        .{ .name = "x", .version = try semver.Version.parse("1.2.0"), .yanked = false, .checksum = null, .rust_version = null, .pubtime = 100 },
+        .{ .name = "x", .version = try semver.Version.parse("1.1.0"), .yanked = false, .checksum = null, .rust_version = null, .pubtime = 9999 },
     };
     const got = try queryCandidates(std.testing.allocator, &all, .any, .{ .allow_yanked = &.{}, .max_pubtime = 500, .min_versions_first = true, .rust_versions = &.{}, .preferred = &.{} });
     defer std.testing.allocator.free(got);
     try std.testing.expectEqual(@as(usize, 1), got.len);
-    try std.testing.expect(got[0].version.eql(try Version.parse("1.2.0")) == false);
+    try std.testing.expect(got[0].version.eql(try semver.Version.parse("1.2.0")) == false);
 }
 
 test "index parses a real sparse-index line faithfully" {
@@ -384,8 +384,8 @@ test "index parses a real sparse-index line faithfully" {
     var entry = try parseIndexLine(std.testing.allocator, line);
     defer entry.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("serde", entry.candidate.name);
-    try std.testing.expect(entry.candidate.version.eql(try Version.parse("1.0.200")));
-    try std.testing.expect(entry.candidate.rust_version.?.eql(try Version.parse("1.56.0")));
+    try std.testing.expect(entry.candidate.version.eql(try semver.Version.parse("1.0.200")));
+    try std.testing.expect(entry.candidate.rust_version.?.eql(try semver.Version.parse("1.56.0")));
     try std.testing.expect(!entry.unsupported);
     // features + features2 merged under one key.
     try std.testing.expectEqual(@as(usize, 2), entry.features.len); // default, alloc
@@ -435,13 +435,26 @@ jj commit src/cargo/index.zig src/cargo/root.zig -m "Add candidate query filter 
 
 **Files:**
 - Create: `src/cargo/resolve.zig` (part 1: core types + `resolveGraph`)
+- Create: `src/cargo/sources.zig` (minimal: `SourceId`/`GitRef`/`LockVersion` only — full definitions live here so Tasks 3–6 compile; Task 7 extends the same file)
 - Test: inline tests with hand-built stub graphs (no FS, no network — candidates are `index.Candidate` slices per crate name)
 - Modify: `src/cargo/root.zig` (append `pub const resolve = @import("resolve.zig");`)
 
 **Interfaces:**
-- Consumes: `semver.*` (Task 1), `index.queryCandidates` (Task 2), `manifest.DependencyKind` (M1, for edge reqs), `sources.SourceId` (Task 7 defines `sources.zig`, but the TYPE contract is frozen here so Tasks 3–6 build on source-keyed refs from the start; Task-3 tests use `.path`/`.registry` literals).
+- Consumes: `semver.*` (Task 1), `index.queryCandidates` (Task 2), `manifest.DependencyKind` (M1, for edge reqs), `sources.SourceId` (this task creates `sources.zig` with the `SourceId`/`GitRef`/`LockVersion` contract below so Tasks 3–6 build on source-keyed refs from the start; Task-3 tests use `.path`/`.registry` literals).
 - Produces (used by Tasks 4–7, 9–11):
 ```zig
+// Source identities live in `sources.zig` (created by this task so Tasks 3–6 compile;
+// Task 7 reuses these exact types and adds Platform/cfg/DepEdgeFull).
+pub const SourceId = union(enum) {
+    path: []const u8,                    // normalized absolute dir (arena-owned by caller)
+    registry: []const u8,                // normalized index URL, e.g. "sparse+https://…"
+    git: struct { url: []const u8, ref: GitRef, precise: ?[40]u8 },
+    pub fn isPath(self: SourceId) bool;
+    pub const LockLineError = error{OutOfMemory};
+    pub fn lockSourceLine(gpa: std.mem.Allocator, self: SourceId, version: LockVersion) LockLineError!?[]u8; // caller frees non-null; null for path (portable rule)
+};
+pub const GitRef = union(enum) { branch: []const u8, tag: []const u8, rev: []const u8, default_branch: void };
+pub const LockVersion = enum { v1, v2, v3, v4 };
 pub const ResolveError = error{ NoMatchingVersion, Conflict, Cycle, OutOfMemory };
 pub const DepEdge = struct {
     name: []const u8,             // crate name depended upon
@@ -1340,7 +1353,7 @@ jj commit src/cargo/features.zig -m "Add v2 feature decoupling"
 ### Task 7: Platform gates, workspace/path/git edges, source identities
 
 **Files:**
-- Create: `src/cargo/sources.zig`
+- Modify: `src/cargo/sources.zig` (created in Task 3 with `SourceId`/`GitRef`/`LockVersion`; this task adds `Platform`/`TargetInfo`/`CfgError`/`CfgExpr`/`parseCfg`/`DepEdgeFull`)
 - Test: inline tests in `src/cargo/sources.zig`
 - Modify: `src/cargo/root.zig` (append `pub const sources = @import("sources.zig");`)
 
@@ -1348,22 +1361,22 @@ jj commit src/cargo/features.zig -m "Add v2 feature decoupling"
 - Consumes: `semver` (Task 1), M1 `manifest.DependencyKind/GistSpec` (extends, never redefines).
 - Produces (used by Tasks 8, 10, M2 fetcher seam):
 ```zig
-pub const SourceId = union(enum) {
-    path: []const u8,                    // normalized absolute dir (arena-owned by caller)
-    registry: []const u8,                // normalized index URL, e.g. "sparse+https://…"
-    git: struct { url: []const u8, ref: GitRef, precise: ?[40]u8 },
-    pub fn isPath(self: SourceId) bool;
-    pub const LockLineError = error{OutOfMemory};
-    pub fn lockSourceLine(gpa: std.mem.Allocator, self: SourceId, version: LockVersion) LockLineError!?[]u8; // caller frees non-null; null for path (portable rule)
-};
-pub const GitRef = union(enum) { branch: []const u8, tag: []const u8, rev: []const u8, default_branch: void };
-pub const LockVersion = enum { v1, v2, v3, v4 };
+// `SourceId`/`GitRef`/`LockVersion` are defined in Task 3 (`src/cargo/sources.zig`) and reused here verbatim — not redefined.
 pub const Platform = union(enum) {
     name: []const u8,        // "windows", "unix", … (cfg shorthand cargo supports bare)
     cfg_expr: []const u8,    // raw `cfg(…)` text for exact evaluation
     pub fn matches(self: Platform, target: TargetInfo) bool;
 };
 pub const TargetInfo = struct { triple: []const u8, os: []const u8, arch: []const u8, family: []const u8 };
+pub const CfgError = error{ InvalidCfg, OutOfMemory };
+pub const CfgExpr = union(enum) {
+    flag: []const u8,                        // bare predicate (`unix`, `windows`, `target_os` shorthand)
+    kv: struct { key: []const u8, value: []const u8 }, // `key = "value"` predicate
+    all: []const CfgExpr,                   // `all(…)` conjunction
+    any: []const CfgExpr,                   // `any(…)` disjunction
+    not: *const CfgExpr,                    // `not(…)` negation (arena-owned by the parse caller)
+    pub fn matches(self: CfgExpr, target: TargetInfo) bool;
+};
 pub fn parseCfg(gpa: std.mem.Allocator, text: []const u8) CfgError!CfgExpr; // cfg(all/any/not, key = value, bare)
 pub const DepEdgeFull = struct {
     base: resolve.DepEdge,               // Task-3 edge (name + req + optional + build_only)
@@ -1377,7 +1390,7 @@ pub const DepEdgeFull = struct {
 
 Reference pins: `core/dependency.rs::{platform, target, is_build}` (edge carries BOTH legacy `target` and `platform`; matching is OR-inclusive for resolution: edge active if NO gate or gate matches the build target; `ForceAllTargets::Yes` in feature resolution ignores gates — Task 6 already models it) + `cargo-platform` crate grammar (`cfg(`, `all(`, `any(`, `not(`, `key = "value"`, bare `unix`/`windows`) — rime hand-rolls the tiny parser; test vectors copied from `cargo-platform`'s own tests) + `encode.rs::encodable_source_id` (path → `None`; v4 `as_encoded_url` vs older `as_url` — for rime: registry lock line is the verbatim index URL prefixed `registry+`; v3 writes it unencoded, v4 percent-encodes per `as_encoded_url` — implement the two forms with a test on a URL containing a character that differs) + V≤2 `branch="master"` → default-branch rewrite (comment + test asserting v2 drops `?branch=master` while v4 keeps `?branch=master`).
 
-Semantics (exact): inactive-platform edges are INVISIBLE to resolution (not merely pruned later — they never enqueue; under v1 their absence is still total, matching cargo). Path edges: requirement is the path manifest's version (still checked against `req` — mismatch is a resolve error, not silent); lock records NO source (portable rule) so same-name path packages MUST be unique across the graph (duplicate → `check_duplicate_pkgs_in_lockfile` equivalent error in Task 9). Git edges: req matches the recorded version; lock `source = "git+<url>?<ref>#<precise40>"`. Multiple sources for one name coexist (nodes are keyed by name+version+source FROM Task 3 — `ResolvedRef`/`ResolvedNode` already carry `source: SourceId`; THIS task defines `SourceId` and fills real per-edge values via `DepEdgeFull.source`; no Task-3 test updates needed).
+Semantics (exact): inactive-platform edges are INVISIBLE to resolution (not merely pruned later — they never enqueue; under v1 their absence is still total, matching cargo). Path edges: requirement is the path manifest's version (still checked against `req` — mismatch is a resolve error, not silent); lock records NO source (portable rule) so same-name path packages MUST be unique across the graph (duplicate → `check_duplicate_pkgs_in_lockfile` equivalent error in Task 9). Git edges: req matches the recorded version; lock `source = "git+<url>?<ref>#<precise40>"`. Multiple sources for one name coexist (nodes are keyed by name+version+source FROM Task 3 — `ResolvedRef`/`ResolvedNode` already carry `source: SourceId`; Task 3 defines `SourceId` and THIS task fills real per-edge values via `DepEdgeFull.source`; no Task-3 test updates needed).
 
 - [ ] **Step 1: Write the failing cfg + source-line tests**
 
@@ -1437,9 +1450,10 @@ jj commit src/cargo/sources.zig src/cargo/resolve.zig src/cargo/root.zig -m "Add
 - Test: inline tests + fixtures `testdata/cargo/lock-v4/*` (multi-version + multi-source graph exercising edge shortening)
 
 **Interfaces:**
-- Consumes: `resolve.ResolveGraph` (Tasks 3–4; refs are source-keyed from Task 3, `SourceId` defined in Task 7), `sources.SourceId/lockSourceLine` (Task 7; caller frees each non-null line), `index.Candidate.checksum` (Task 2).
+- Consumes: `resolve.ResolveGraph` (Tasks 3–4; refs are source-keyed from Task 3, `SourceId` defined in Task 3 `sources.zig`), `sources.SourceId/lockSourceLine` (Task 3 defines the type, Task 7 adds the platform/cfg surface; caller frees each non-null line), `index.Candidate.checksum` (Task 2).
 - Produces — ADDITIVE to M1 API (used by Tasks 9–11):
 ```zig
+pub const LockError = error{ InvalidLock, ParseError, UnsupportedType, UnsupportedVersion, OutOfMemory }; // M1 set (`src/cargo/lock.zig`) + `UnsupportedVersion` for v5 input (cargo bails without `-Znext-lockfile-bump`)
 pub const ResolveVersion = enum { v1, v2, v3, v4 }; // mirrors cargo's ResolveVersion (no v5: bail without -Znext-lockfile-bump)
 pub fn versionForRustVersion(lowest_rust_version: ?semver.Version) ResolveVersion; // with_rust_version floors (copy constants from resolve.rs:124-148)
 pub fn writeLock(gpa: std.mem.Allocator, graph: *const resolve.ResolveGraph, checksums: *const std.StringHashMap(?[]const u8), version: ResolveVersion) LockError![]u8;
