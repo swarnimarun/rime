@@ -464,7 +464,7 @@ pub const Store = struct {
         defer gpa.free(hexes);
         const out = try gpa.alloc(Digest, hexes.len);
         errdefer gpa.free(out);
-        for (hexes, out) |h, slot| slot.* = Digest.fromHex(&h) catch return error.Unexpected;
+        for (hexes, out) |h, *slot| slot.* = Digest.fromHex(&h) catch return error.Unexpected;
         return out;
     }
 
