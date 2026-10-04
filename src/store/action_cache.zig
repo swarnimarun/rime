@@ -265,6 +265,19 @@ test "action entries survive through the index mirror" {
     const man = try ts.store.putBytes(io, "manifest-body", .manifest);
     const key = root.hashBytes("action-key");
     try ts.store.putAction(io, key, man);
+    // Index row must exist right after put (proves the mirror ran, not just the file).
+    const ahex = key.toHex();
+    const row = try index_mod.getAction(&ts.store.index, gpa, &ahex);
+    try std.testing.expect(row != null);
+    if (row) |r| {
+        defer gpa.free(r.manifest_digest);
+        const want = man.toHex();
+        try std.testing.expectEqualStrings(want[0..], r.manifest_digest);
+    }
+    // Delete the flat file: the index must still serve the entry.
+    var flat_buf: [73]u8 = undefined;
+    const flat = entryFull(key, &flat_buf);
+    try ts.store.dir.deleteFile(io, flat);
     const got = try ts.store.getAction(io, gpa, key);
     try std.testing.expect(got != null);
     try std.testing.expectEqual(man.bytes, got.?.manifest.bytes);
