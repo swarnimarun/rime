@@ -26,8 +26,20 @@ pub const Manifest = struct {
     targets: []TargetDesc, // explicit [lib]/[[bin]] or defaults
     workspace_members: ?[]const []const u8, // [workspace] members globs, if present
     workspace_exclude: []const []const u8,
+    // Workspace inheritance (same-file [workspace.package] /.
+    // [workspace.dependencies]). `version_inherited`/`edition_inherited`
+    // mark a `{ workspace = true }` field the same file could not satisfy
+    // (version is then the `""` placeholder); `workspace.discover`
+    // fills those from the root manifest. `ws_deps` holds the same-file
+    // [workspace.dependencies] entries for that lookup.
+    version_inherited: bool,
+    edition_inherited: bool,
+    ws_version: ?[]const u8,
+    ws_edition: ?[]const u8,
+    ws_deps: std.StringHashMap(DependencyKind),
     pub fn deinit(self: *Manifest) void {
         self.deps.deinit();
+        self.ws_deps.deinit();
         self.arena.deinit();
     }
 };
@@ -48,22 +60,73 @@ pub fn parseManifest(gpa: std.mem.Allocator, text: []const u8) ManifestError!Man
         .targets = &.{},
         .workspace_members = null,
         .workspace_exclude = &.{},
+        .version_inherited = false,
+        .edition_inherited = false,
+        .ws_version = null,
+        .ws_edition = null,
+        .ws_deps = std.StringHashMap(DependencyKind).init(gpa),
     };
     errdefer {
         m.deps.deinit();
+        m.ws_deps.deinit();
         m.arena.deinit();
     }
     const alloc = m.arena.allocator();
+    // [workspace.package] + [workspace.dependencies] first: member manifests
+    // inherit from these (directly when self-contained, via discover when
+    // the values live in the workspace root).
+    if (doc.root.get("workspace")) |wv| {
+        if (wv.* != .table) return ManifestError.InvalidManifest;
+        const wt = &wv.table;
+        if (wt.get("package")) |wp| {
+            if (wp.* != .table) return ManifestError.InvalidManifest;
+            const pt = &wp.table;
+            if (pt.get("version")) |vv| {
+                if (vv.* != .string) return ManifestError.InvalidManifest;
+                m.ws_version = vv.string;
+            }
+            if (pt.get("edition")) |ev| {
+                if (ev.* != .string) return ManifestError.InvalidManifest;
+                m.ws_edition = ev.string;
+            }
+        }
+        if (wt.get("dependencies")) |wd| {
+            if (wd.* != .table) return ManifestError.InvalidManifest;
+            const wdt = &wd.table;
+            var wit = wdt.entries.iterator();
+            while (wit.next()) |kv| {
+                const dep = try parseDep(&kv.value_ptr.value);
+                if (dep == .workspace_inherit) return ManifestError.InvalidManifest;
+                try m.ws_deps.put(kv.key_ptr.*, dep);
+            }
+        }
+    }
     if (doc.root.get("package")) |pv| {
         if (pv.* != .table) return ManifestError.InvalidManifest;
         const pt = &pv.table; // *const TomlTable: no map-header copy (pv is *const TomlValue)
         try checkPackageKeys(pt);
+        const vf = try packageField(pt, "version");
+        const ef = try packageField(pt, "edition");
         m.pkg = Package{
             .name = try requiredString(pt, "name"),
-            .version = try requiredString(pt, "version"),
-            .edition = optionalString(pt, "edition") orelse "2021",
+            .version = vf.value,
+            .edition = ef.value,
             .build_script = try optionalBuildScript(pt),
         };
+        m.version_inherited = vf.inherited;
+        m.edition_inherited = ef.inherited;
+        // Self-contained roots resolve immediately; member files leave the
+        // flags set for discover to fill from the workspace root.
+        if (m.version_inherited and m.ws_version != null) {
+            m.pkg.?.version = m.ws_version.?;
+            m.version_inherited = false;
+        }
+        if (m.edition_inherited) {
+            if (m.ws_edition) |e| {
+                m.pkg.?.edition = e;
+                m.edition_inherited = false;
+            }
+        }
     }
     if (doc.root.get("dependencies")) |dv| {
         if (dv.* != .table) return ManifestError.InvalidManifest;
@@ -118,6 +181,26 @@ pub fn parseManifest(gpa: std.mem.Allocator, text: []const u8) ManifestError!Man
     return m;
 }
 
+/// A `version`/`edition` field: plain string, absent (edition defaults to
+/// "2021"; version is required), or `{ workspace = true }` (inherited:
+/// value is the "" placeholder for discover to fill). Any other table is
+/// InvalidManifest — cargo forbids inheritance for `name`, enforced by
+/// keeping `requiredString` for it.
+fn packageField(t: *const toml.TomlTable, key: []const u8) ManifestError!struct { value: []const u8, inherited: bool } {
+    const v = t.get(key) orelse return .{
+        .value = if (std.mem.eql(u8, key, "edition")) "2021" else return ManifestError.InvalidManifest,
+        .inherited = false,
+    };
+    if (v.* == .string) return .{ .value = v.string, .inherited = false };
+    if (v.* == .table) {
+        const it = &v.table;
+        if (it.get("workspace")) |w| {
+            if (w.* == .boolean and w.boolean) return .{ .value = "", .inherited = true };
+        }
+    }
+    return ManifestError.InvalidManifest;
+}
+
 fn requiredString(t: *const toml.TomlTable, key: []const u8) ManifestError![]const u8 {
     const v = t.get(key) orelse return ManifestError.InvalidManifest;
     if (v.* != .string) return ManifestError.InvalidManifest;
@@ -143,7 +226,10 @@ fn optionalBuildScript(t: *const toml.TomlTable) ManifestError! ?[]const u8 {
 }
 
 fn checkPackageKeys(t: *const toml.TomlTable) ManifestError!void {
-    const allowed = [_][]const u8{ "name", "version", "edition", "build", "build-script", "rust-version", "description", "license" };
+    // Harmless metadata cargo accepts (description, repository, …) parses
+    // and is ignored: the M1 model has no fields for it. Anything else is
+    // still loud (decision D2) — silent divergence is forbidden.
+    const allowed = [_][]const u8{ "name", "version", "edition", "build", "build-script", "rust-version", "description", "license", "authors", "repository", "homepage", "documentation", "readme", "keywords", "categories", "publish", "exclude", "include", "links", "default-run", "autobins", "autoexamples", "autotests", "autobenches", "autolib", "metadata" };
     var it = t.entries.iterator();
     while (it.next()) |kv| {
         var ok = false;
@@ -235,6 +321,30 @@ test "manifest parses minimal package" {
     try std.testing.expectEqualStrings("rime-minimal", m.pkg.?.name);
     try std.testing.expectEqualStrings("1.0", m.deps.get("serde").?.version_req);
     try std.testing.expectEqualStrings("../rime-dep", m.deps.get("rime-dep").?.path);
+}
+
+test "manifest resolves same-file workspace inheritance" {
+    const text = "[workspace.package]\nversion = \"0.9.0\"\nedition = \"2021\"\n[workspace.dependencies]\nserde = \"1\"\n[package]\nname = \"a\"\nversion.workspace = true\nedition.workspace = true\n[dependencies]\nserde.workspace = true\n";
+    var m = try parseManifest(std.testing.allocator, text);
+    defer m.deinit();
+    // Same-file values resolve immediately (self-contained root).
+    try std.testing.expectEqualStrings("0.9.0", m.pkg.?.version);
+    try std.testing.expectEqualStrings("2021", m.pkg.?.edition);
+    try std.testing.expect(!m.version_inherited);
+    try std.testing.expect(!m.edition_inherited);
+    // Member-level dep inheritance stays marked for discover to resolve.
+    try std.testing.expect(m.deps.get("serde").? == .workspace_inherit);
+    try std.testing.expectEqualStrings("1", m.ws_deps.get("serde").?.version_req);
+}
+
+test "manifest marks cross-file inheritance pending" {
+    const text = "[package]\nname = \"a\"\nversion.workspace = true\n";
+    var m = try parseManifest(std.testing.allocator, text);
+    defer m.deinit();
+    try std.testing.expect(m.version_inherited);
+    try std.testing.expectEqualStrings("", m.pkg.?.version);
+    // cargo forbids name inheritance: a table here is invalid, not pending.
+    try std.testing.expectError(ManifestError.InvalidManifest, parseManifest(std.testing.allocator, "[package]\nname.workspace = true\nversion = \"0.1.0\"\n"));
 }
 
 test "manifest rejects unknown package keys loudly" {

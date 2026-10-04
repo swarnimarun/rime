@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const store = @import("store");
+const cargo = @import("cargo");
 
 /// `cache stat` options: `--by-tag` prints the per-pair table, optionally
 /// narrowed to exact `k=v` pairs. Plan B Task 11.
@@ -14,7 +15,13 @@ pub const UnpinArgs = struct { name: []const u8 };
 pub const StorePutArgs = struct { name: []const u8, file: []const u8 };
 pub const StoreGetArgs = struct { name: []const u8, out_file: []const u8 };
 
+pub const CargoOpts = struct {
+    opts: cargo.cli.Options,
+    argv: []const []const u8, // ["rime"] ++ rest shim; freed with gpa
+};
+
 pub const Command = union(enum) {
+    cargo: CargoOpts,
     stat: StatOpts,
     migrate: MigrateOpts,
     gc: GcOpts,
@@ -27,6 +34,18 @@ pub const Command = union(enum) {
 
 pub fn parseCommand(gpa: std.mem.Allocator, args: []const []const u8) error{ Usage, OutOfMemory }!Command {
     if (args.len == 0) return error.Usage;
+    // Cargo frontend (Plan C): build/check/test/run/bench/clean dispatch to
+    // cli.parseArgs, which expects argv[0] to be the program name.
+    if (isCargoCommand(args[0])) {
+        const shim = try gpa.alloc([]const u8, args.len + 1);
+        shim[0] = "rime";
+        @memcpy(shim[1..], args);
+        const opts = cargo.cli.parseArgs(gpa, shim) catch |e| {
+            gpa.free(shim);
+            return e;
+        };
+        return .{ .cargo = .{ .opts = opts, .argv = shim } };
+    }
     if (std.mem.eql(u8, args[0], "cache")) {
         if (args.len >= 2 and std.mem.eql(u8, args[1], "stat")) return try parseStat(gpa, args[2..]);
         if (args.len == 2 and std.mem.eql(u8, args[1], "verify")) return .verify;
@@ -102,6 +121,19 @@ fn parseStat(gpa: std.mem.Allocator, rest: []const []const u8) error{ Usage, Out
     return .{ .stat = opts };
 }
 
+/// Plan C cargo subcommands (build/check/test/run/bench/clean).
+fn isCargoCommand(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "build") or std.mem.eql(u8, arg, "check") or std.mem.eql(u8, arg, "test") or std.mem.eql(u8, arg, "run") or std.mem.eql(u8, arg, "bench") or std.mem.eql(u8, arg, "clean");
+}
+
+/// Cargo usage line (exit 1 per decision D4; the store path keeps exit 2).
+fn printCargoUsage() void {
+    if (cargo.cli.parseDiagnostic()) |d| {
+        std.debug.print("error: {s}\n", .{d});
+    }
+    std.debug.print("usage: rime <build|check|test|run|bench|clean> [--manifest-path P] [--release|--profile N] [--target T] [--features CSV] [--message-format=json|human] [--offline|--frozen|--locked] [--dry-run] [-p PKG] [-- ARGS…]\n", .{});
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const io = init.io;
@@ -113,19 +145,43 @@ pub fn main(init: std.process.Init) !u8 {
 
     const rest: []const []const u8 = if (argv.items.len > 1) argv.items[1..] else &.{};
     const cmd = parseCommand(gpa, rest) catch {
+        // Cargo usage errors exit 1 with the flag named (decision D4); the
+        // store path keeps its historical exit 2.
+        if (rest.len > 0 and isCargoCommand(rest[0])) {
+            printCargoUsage();
+            return 1;
+        }
         // NOTE (plan adjustment, reported): the plan's replacement usage
         // string dropped `cache migrate`; kept here (still a command).
         std.debug.print("usage: rime <cache stat [--by-tag [k=v …]]|cache verify|cache migrate [--dry-run]|gc [--tag k=v …]|pin|unpin|store> …\n", .{});
         return 2;
     };
-    // parseCommand-owned arrays (stat filters / gc tags; allocated only
-    // when non-empty). Freed here so Debug-allocator runs stay clean.
+    // parseCommand-owned arrays (stat filters / gc tags / cargo opts;
+    // allocated only when non-empty). Freed here so Debug-allocator runs
+    // stay clean.
     defer {
         switch (cmd) {
             .stat => |o| if (o.filters.len > 0) gpa.free(o.filters),
             .gc => |o| if (o.tags.len > 0) gpa.free(o.tags),
+            .cargo => |c| {
+                c.opts.deinit(gpa);
+                gpa.free(c.argv);
+            },
             else => {},
         }
+    }
+
+    // Cargo commands own their store lifecycle (lazy open inside cli.run);
+    // the global store opens only for the store-management commands.
+    if (cmd == .cargo) {
+        var out_buf: [8192]u8 = undefined;
+        var out_w = std.Io.File.stdout().writer(io, &out_buf);
+        var err_buf: [8192]u8 = undefined;
+        var err_w = std.Io.File.stderr().writer(io, &err_buf);
+        const code = cargo.cli.run(gpa, io, cmd.cargo.opts, &out_w.interface, &err_w.interface);
+        out_w.flush() catch {};
+        err_w.flush() catch {};
+        return code;
     }
 
     var store_dir = try openStoreDir(init, io, gpa);
@@ -140,6 +196,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer s.close(io);
 
     switch (cmd) {
+        .cargo => unreachable, // dispatched before the store opens above
         .stat => |o| return cmdStat(io, gpa, &s, o),
         .migrate => unreachable, // handled before Store.open above
         .gc => |p| return cmdGc(io, gpa, &s, p),
@@ -435,6 +492,18 @@ fn cmdVerify(io: std.Io, gpa: std.mem.Allocator, s: *store.Store) u8 {
     }
     std.debug.print("verified {d} of {d} objects, {d} mismatches\n", .{ checked, infos.len, bad });
     return if (bad == 0) 0 else 1;
+}
+
+test "parseCommand routes cargo subcommands" {
+    const gpa = std.testing.allocator;
+    const c = try parseCommand(gpa, &.{ "build", "--dry-run" });
+    defer {
+        c.cargo.opts.deinit(gpa);
+        gpa.free(c.cargo.argv);
+    }
+    try std.testing.expect(c == .cargo);
+    try std.testing.expect(c.cargo.opts.dry_run);
+    try std.testing.expectError(error.Usage, parseCommand(gpa, &.{"build", "--warp-drive"}));
 }
 
 test "parseCommand covers the surface" {

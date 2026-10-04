@@ -94,6 +94,22 @@ pub fn discover(gpa: std.mem.Allocator, io: std.Io, start_dir: []const u8, manif
         }.lt);
         try dirs.appendSlice(alloc, expanded.items);
     }
+    // Workspace inheritance: clone the root's [workspace.package] values
+    // and [workspace.dependencies] entries into the workspace arena. The
+    // root shape parse is released right below, while member manifests
+    // (parsed fresh afterwards) borrow these clones during the inherit
+    // pass. Only the map header is transient; member-borrowed strings live
+    // in the arena.
+    const root_ws_version: ?[]const u8 = if (root_manifest.ws_version) |v| try alloc.dupe(u8, v) else null;
+    const root_ws_edition: ?[]const u8 = if (root_manifest.ws_edition) |v| try alloc.dupe(u8, v) else null;
+    var root_ws_deps = std.StringHashMap(manifest_mod.DependencyKind).init(alloc);
+    defer root_ws_deps.deinit();
+    {
+        var wit = root_manifest.ws_deps.iterator();
+        while (wit.next()) |kv| {
+            try root_ws_deps.put(try alloc.dupe(u8, kv.key_ptr.*), try dupeDep(alloc, kv.value_ptr.*));
+        }
+    }
     // The root shape parse has served its purpose (pkg presence + member
     // patterns, both consumed into `dirs` above). Release it now: every
     // member — including the root package itself — is parsed fresh below so
@@ -120,6 +136,37 @@ pub fn discover(gpa: std.mem.Allocator, io: std.Io, start_dir: []const u8, manif
             .is_root = md.is_root,
         });
         man = null;
+    }
+
+    // Inheritance pass: fill `{ workspace = true }` package fields from the
+    // root clone above, and replace member-level workspace-inherited deps
+    // with the root's [workspace.dependencies] entries. Must precede edge
+    // resolution (inherited path deps shape the member graph).
+    for (members.items) |*m| {
+        if (m.manifest.version_inherited) {
+            const v = root_ws_version orelse return DiscoverError.InvalidManifest;
+            // Member.version is a separate field from pkg.version (both
+            // printed from the former); update both.
+            m.manifest.pkg.?.version = v;
+            m.version = v;
+            m.manifest.version_inherited = false;
+        }
+        if (m.manifest.edition_inherited) {
+            m.manifest.pkg.?.edition = root_ws_edition orelse return DiscoverError.InvalidManifest;
+            m.manifest.edition_inherited = false;
+        }
+        var dit = m.manifest.deps.iterator();
+        while (dit.next()) |kv| {
+            if (kv.value_ptr.* != .workspace_inherit) continue;
+            const rv = root_ws_deps.get(kv.key_ptr.*) orelse return DiscoverError.InvalidManifest;
+            // Inherited path deps are relative to the workspace ROOT (cargo
+            // rule), not the declaring member: absolutize now so the
+            // member-relative edge resolution below stays correct.
+            kv.value_ptr.* = if (rv == .path)
+                .{ .path = try joinAbs(alloc, root_dir, rv.path) }
+            else
+                rv;
+        }
     }
 
     // Depends-on cycles between members are a hard error (cargo refuses them
@@ -359,6 +406,27 @@ fn globMatch(pattern: []const u8, path: []const u8) bool {
     }
 }
 
+/// Deep-dupe a dependency value (keys are duped by the caller). A nested
+/// `{ workspace = true }` inside [workspace.dependencies] is invalid
+/// cargo — loud, never silently kept.
+fn dupeDep(alloc: std.mem.Allocator, dep: manifest_mod.DependencyKind) DiscoverError!manifest_mod.DependencyKind {
+    return switch (dep) {
+        .version_req => |s| .{ .version_req = try alloc.dupe(u8, s) },
+        .path => |s| .{ .path = try alloc.dupe(u8, s) },
+        .git => |g| .{ .git = .{
+            .url = try alloc.dupe(u8, g.url),
+            .ref = if (g.ref) |r| try alloc.dupe(u8, r) else null,
+        } },
+        .workspace_inherit => DiscoverError.InvalidManifest,
+    };
+}
+
+/// Absolute join for inherited path deps (already-absolute stays as-is).
+fn joinAbs(alloc: std.mem.Allocator, root_abs: []const u8, rel: []const u8) DiscoverError![]const u8 {
+    if (std.fs.path.isAbsolute(rel)) return alloc.dupe(u8, rel) catch return DiscoverError.OutOfMemory;
+    return std.fs.path.join(alloc, &.{ root_abs, rel }) catch return DiscoverError.OutOfMemory;
+}
+
 /// Read + parse one manifest file. The returned Manifest owns its arena
 /// (allocated from `gpa`, NOT the workspace arena — see below); the raw
 /// text buffer is always freed here since the TOML parser dupes every string
@@ -533,6 +601,30 @@ test "workspace treats excluded dir as standalone package" {
     try std.testing.expectEqual(@as(usize, 1), ws.members.len);
     try std.testing.expect(ws.findMember("c") != null);
     try std.testing.expect(ws.members[0].is_root);
+}
+
+test "workspace resolves inheritance from the root" {
+    // validation/basic-workspace members inherit version/edition and use
+    // `{ workspace = true }` deps; inherited path deps are root-relative.
+    var ws = try discover(std.testing.allocator, testIo(), "validation/basic-workspace", null);
+    defer ws.deinit();
+    try std.testing.expectEqual(@as(usize, 3), ws.members.len);
+    const cli = ws.findMember("cli-bin").?;
+    try std.testing.expectEqualStrings("0.1.0", cli.version);
+    try std.testing.expect(cli.manifest.version_inherited == false);
+    // Members sort by dir: cli-bin(0), core-lib(1), util(2).
+    try std.testing.expectEqualStrings("cli-bin", ws.members[0].name);
+    const edges = try memberEdges(std.testing.allocator, &ws);
+    defer {
+        for (edges) |e| std.testing.allocator.free(e);
+        std.testing.allocator.free(edges);
+    }
+    // cli-bin -> {core-lib (inherited path)}; registry deps
+    // (serde/anyhow) are not member edges; util is transitive via core-lib.
+    try std.testing.expectEqual(@as(usize, 1), edges[0].len);
+    try std.testing.expectEqual(@as(usize, 1), edges[0][0]);
+    try std.testing.expectEqual(@as(usize, 1), edges[1].len);
+    try std.testing.expectEqual(@as(usize, 0), edges[2].len);
 }
 
 test "segment matching is single-segment only" {
