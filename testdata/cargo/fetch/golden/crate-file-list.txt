@@ -1,0 +1,4 @@
+serde-1.0.0/Cargo.lock
+serde-1.0.0/Cargo.toml
+serde-1.0.0/Cargo.toml.orig
+serde-1.0.0/src/lib.rs
