@@ -165,6 +165,19 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
         hot_used -= @min(hot_used, obj.size);
     }
 
+    // -- Phase 3b: cold-tier quota sweep to 90% hysteresis (spec §9.1,
+    // invariant §11.4). Oldest unrooted cold objects first; the demote
+    // gate above keeps post-demotion cold usage near target, and this
+    // pass trims whatever remains over it.
+    for (sorted) |obj| {
+        if (cold_used <= cold_target) break;
+        if (obj.tier != .cold) continue;
+        if (live.contains(obj.digest.bytes)) continue;
+        if (!policy.dry_run and isOlderThan(obj, now_ms, max_age_ns)) continue; // evicted in phase 2
+        try evict(store, io, &report, obj, policy.dry_run);
+        cold_used -= @min(cold_used, obj.size);
+    }
+
     // -- Phase 4: emergency trim to restore disk_reserve. --
     const usage = try disk_usage.readDiskUsage(io, store.dir);
     if (usage.free_bytes < store.limits.reserve) {
@@ -388,6 +401,17 @@ fn setMtime(io: std.Io, store: *root.Store, d: root.Digest, ms: i64) !void {
     try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(@as(i96, ms) * std.time.ns_per_ms) } });
 }
 
+fn setColdMtime(io: std.Io, store: *root.Store, d: root.Digest, ms: i64) !void {
+    var rbuf: [65]u8 = undefined;
+    const rel = d.relPath(&rbuf);
+    var buf: [73]u8 = undefined;
+    @memcpy(buf[0..5], "cold/");
+    @memcpy(buf[5..70], rel);
+    const f = try store.dir.openFile(io, buf[0..70], .{});
+    defer f.close(io);
+    try f.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(@as(i96, ms) * std.time.ns_per_ms) } });
+}
+
 test "quota sweep evicts oldest unrooted first and stops at 90 percent" {
     const io = std.Io.Threaded.global_single_threaded.io();
     const gpa = std.testing.allocator;
@@ -441,6 +465,43 @@ test "quota pressure demotes demotable objects before evicting" {
     const got = try ts.store.readObject(io, a, gpa);
     defer gpa.free(got);
     try std.testing.expectEqualStrings("aaaa", got);
+}
+
+test "cold quota sweep evicts oldest unrooted first" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const gpa = std.testing.allocator;
+    var ts = test_support.openTestStore(io, fixedConfig(10));
+    defer ts.deinit(io);
+    ts.store.limits = .{ .hot = 100 * root.config.GiB, .cold = 100 * root.config.GiB, .reserve = 0 };
+    ts.store.config.max_age_ns = std.math.maxInt(u64);
+
+    const a = try ts.store.putBytes(io, "aaaa", .other);
+    const b = try ts.store.putBytes(io, "bbbb", .other);
+    const c = try ts.store.putBytes(io, "cccc", .other);
+    try ts.store.pin(io, "keep-b", b);
+    try ts.store.demote(io, a);
+    try ts.store.demote(io, b);
+    try ts.store.demote(io, c);
+    // Size the cold limit at exactly current cold usage: the 90%
+    // hysteresis target then forces one eviction (the oldest unrooted).
+    const pre = try ts.store.scan(io, gpa);
+    defer gpa.free(pre);
+    var cold_total: u64 = 0;
+    for (pre) |obj| {
+        if (obj.tier == .cold) cold_total += obj.size;
+    }
+    try std.testing.expect(cold_total > 0);
+    ts.store.limits.cold = cold_total;
+    // LRU order fixed by backdating (demote stamps fresh mtimes).
+    try setColdMtime(io, &ts.store, a, 1_000);
+    try setColdMtime(io, &ts.store, b, 2_000);
+    try setColdMtime(io, &ts.store, c, 3_000);
+
+    const report = try ts.store.gc(io, gpa, .{});
+    try std.testing.expect(report.evicted_objects >= 1);
+    try std.testing.expect(!ts.store.exists(io, a)); // oldest unrooted gone
+    try std.testing.expect(ts.store.exists(io, b)); // pinned survives
+    try std.testing.expect(ts.store.exists(io, c)); // newer unrooted kept
 }
 
 test "incremental sweep trims old files and counts freed bytes" {
