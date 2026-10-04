@@ -146,7 +146,12 @@ test "touch refreshes mtime only after the throttle interval" {
     defer ts.deinit(io);
 
     const d = try ts.store.putBytes(io, "touched", .other);
+    var pre_buf: [75]u8 = undefined;
+    const pre_mtime = (try ts.store.dir.statFile(io, objectFull(d, &pre_buf), .{})).mtime.toMilliseconds();
     ts.store.touch(io, d); // within 1h of ingest: no change
+    var post_buf: [75]u8 = undefined;
+    const post_mtime = (try ts.store.dir.statFile(io, objectFull(d, &post_buf), .{})).mtime.toMilliseconds();
+    try std.testing.expectEqual(pre_mtime, post_mtime);
 
     // Backdate the object beyond the throttle, then touch must refresh it.
     var buf: [75]u8 = undefined;
