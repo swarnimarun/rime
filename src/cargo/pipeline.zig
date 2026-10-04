@@ -969,6 +969,14 @@ pub fn buildPlan(
         // deterministic spool paths from dep fingerprints — known now).
         var dep_libs: std.ArrayList(invoke_mod.DepLib) = .empty;
         defer dep_libs.deinit(gpa);
+        // Placeholder strings stay owned here through the buildRustcArgs
+        // call below (which dupes them into argv): freeing them any
+        // earlier is use-after-free (the dep_libs entries borrow them).
+        var rlib_paths: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (rlib_paths.items) |s| gpa.free(s);
+            rlib_paths.deinit(gpa);
+        }
         for (u.deps) |d| {
             const dp = &planned[d.unit];
             // Dep output selection (Task 11): check mode links rmeta,
@@ -983,7 +991,10 @@ pub fn buildPlan(
             // and basenames are deterministic from fingerprints — so the
             // planned key EQUALS the execution key.
             const rlib_path = std.fs.path.join(gpa, &.{ "<spool-deps>", dep_file }) catch return PipelineError.OutOfMemory;
-            defer gpa.free(rlib_path);
+            rlib_paths.append(gpa, rlib_path) catch {
+                gpa.free(rlib_path);
+                return PipelineError.OutOfMemory;
+            };
             try dep_libs.append(gpa, .{ .extern_name = d.extern_name, .rlib_path = rlib_path, .is_rmeta = u.mode == .check });
         }
         var inv = invoke_mod.buildRustcArgs(gpa, tc, u, prof, dep_libs.items, "<spool-out>", p.crate_root, null) catch return PipelineError.OutOfMemory;
@@ -1403,16 +1414,31 @@ pub fn buildWorkspace(
             return PipelineError.Io;
         };
 
+        // (a0) Reverse-dep dirtiness: a dependency recompiled in THIS run
+        // may have byte-different output (fingerprints and action keys bind
+        // dep fingerprints and paths, never dep bytes), so this unit must
+        // recompile too — both freshness probes below are skipped. Topo
+        // order guarantees every dep's `compiled` flag is final by now.
+        // (Over-rebuild is always safe; serving a stale cache hit here
+        // would silently link the previous dep output.)
+        var dep_recompiled = false;
+        for (u.deps) |d| {
+            if (compiled[d.unit]) {
+                dep_recompiled = true;
+                break;
+            }
+        }
+
         // (a) mtime fast path: dep-info in the view + recorded output mtime
         // say nothing changed → Fresh without hashing or spawning. View
         // outputs are current by the freshness proof; copy linkables to the
-        // shared deps dir for downstream units.
+        // shared deps dir for downstream units. Skipped when (a0) fired.
         if (history) |*h| {
             if (h.mtimeFor(u.pkg_name, u.target_name)) |recorded| {
                 const view_d = std.fs.path.join(gpa, &.{ ws_root, "target", profile_dir, "deps", p.depinfo_file }) catch return PipelineError.OutOfMemory;
                 defer gpa.free(view_d);
                 const fresh = fingerprint_mod.checkFresh(io, view_d, recorded) catch false;
-                if (fresh and try tryCopyViewOutputs(gpa, io, ws_root, profile_dir, u, p, opts.mode, spool_deps)) {
+                if (!dep_recompiled and fresh and try tryCopyViewOutputs(gpa, io, ws_root, profile_dir, u, p, opts.mode, spool_deps)) {
                     emitCached(out_w, u, opts.profile_name, stderr);
                     if (lease_ok) store.leaseRenew(io, build_id) catch {};
                     continue;
@@ -1421,11 +1447,14 @@ pub fn buildWorkspace(
         }
 
         // (b) Action-key lookup: hit → materialize dep outputs to the shared
-        // deps dir from verified store bytes, no spawn.
-        if (compile_mod.tryIngestCacheHit(gpa, io, store, p.action_key) catch |e| {
+        // deps dir from verified store bytes, no spawn. Skipped when (a0)
+        // fired: a recompiled dep may have byte-different output, so the
+        // recorded hit would silently link the previous dep output.
+        const cache_hit: ?Digest = if (dep_recompiled) null else compile_mod.tryIngestCacheHit(gpa, io, store, p.action_key) catch |e| {
             if (e == error.OutOfMemory) return PipelineError.OutOfMemory;
             return PipelineError.StoreRead;
-        }) |man_digest| {
+        };
+        if (cache_hit) |man_digest| {
             manifests[idx] = man_digest;
             var man = store.getManifest(io, gpa, man_digest) catch |e| {
                 if (e == error.OutOfMemory) return PipelineError.OutOfMemory;
@@ -1453,13 +1482,24 @@ pub fn buildWorkspace(
         // (b) turn, so (i) covers them.
         var dep_libs: std.ArrayList(invoke_mod.DepLib) = .empty;
         defer dep_libs.deinit(gpa);
+        // Pooled dep paths stay owned here through the buildRustcArgs call
+        // below (which dupes them into argv and takes their dirname for
+        // -L); freeing any of them before that call is use-after-free.
+        var dep_paths: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (dep_paths.items) |s| gpa.free(s);
+            dep_paths.deinit(gpa);
+        }
         for (u.deps) |d| {
             const dp = &plan.units[d.unit];
             // Plan-time guard (key loop) already rejected bin-only deps as
             // un-externable; these unwraps are unreachable in practice.
             const dep_file = if (opts.mode == .check) dp.rmeta_file.? else dp.rlib_file orelse dp.rmeta_file.?;
             const pooled = std.fs.path.join(gpa, &.{ spool_deps, dep_file }) catch return PipelineError.OutOfMemory;
-            defer gpa.free(pooled);
+            dep_paths.append(gpa, pooled) catch {
+                gpa.free(pooled);
+                return PipelineError.OutOfMemory;
+            };
             const present = std.Io.Dir.cwd().statFile(io, pooled, .{}) catch null;
             const use_path: []const u8 = if (present != null) pooled else blk: {
                 const dep_out = std.fs.path.join(gpa, &.{ spool_root, "units", dp.out_dir_name, dep_file }) catch return PipelineError.OutOfMemory;
@@ -2275,7 +2315,12 @@ test "committed goldens match cargo metadata when oracle enabled" {
     for (projects) |proj| {
         const dir = try std.fmt.allocPrint(gpa, "validation/{s}", .{proj});
         defer gpa.free(dir);
-        const manifest = try std.fmt.allocPrint(gpa, "validation/{s}/Cargo.toml", .{proj});
+        // Absolute manifest path: cwd is already validation/<p>, so a
+        // repo-relative manifest would double the path and cargo would
+        // report a missing manifest.
+        const dir_abs = try std.Io.Dir.cwd().realPathFileAlloc(io, dir, gpa);
+        defer gpa.free(dir_abs);
+        const manifest = try std.fs.path.join(gpa, &.{ dir_abs, "Cargo.toml" });
         defer gpa.free(manifest);
         const cargo_bin = try toolchain_mod.resolveBinPath(gpa, io, "cargo");
         defer if (cargo_bin) |b| gpa.free(b);

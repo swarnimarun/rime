@@ -564,8 +564,12 @@ fn collectSessionFiles(
 /// pushed remote, standard `max_age` retention.
 /// Sessions are HINTS: `StoreFull` at any point drops the session silently
 /// (the build output is already cached by Task 8); an over-cap session or
-/// a missing dir is likewise skipped quietly. Other store/file failures
-/// are loud.
+/// a missing dir is likewise skipped quietly. A `TagLimit` on either tag
+/// write also drops the session silently: identical session bytes across
+/// builds (e.g. a flag change that leaves incremental state byte-identical)
+/// address the same object under different unit-tag values, and the
+/// single-value-per-key rule would otherwise fail a correct build for a
+/// mere hint. Other store/file failures are loud.
 pub fn ingestSession(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -603,6 +607,13 @@ pub fn ingestSession(
     const owned = files.items;
     const dtos = gpa.alloc(SessionFileJson, owned.len) catch return SessionError.OutOfMemory;
     defer gpa.free(dtos);
+    // Assigned prefix of `dtos` (hint-drop returns below abandon the whole
+    // session, so only the assigned prefix owns digests — freeing all of
+    // `dtos` would free unassigned garbage).
+    var dto_count: usize = 0;
+    defer {
+        for (dtos[0..dto_count]) |dto| gpa.free(dto.digest);
+    }
     for (owned, dtos) |f, *dto| {
         // Strip the "./" walk prefix: manifest paths are sess_dir-relative.
         const rel = if (std.mem.startsWith(u8, f.rel, "./")) f.rel[2..] else f.rel;
@@ -619,16 +630,19 @@ pub fn ingestSession(
             return SessionError.StoreRead;
         };
         store.tagObject(io, digest, blob_tags) catch |e| {
-            if (e == error.StoreFull) return; // drop the session silently
+            // Drop the session silently on StoreFull (no budget) or
+            // TagLimit (same bytes already tagged under another build's
+            // unit-tag values — hints only, never fail the build).
+            if (e == error.StoreFull or e == error.TagLimit) return;
             return e;
         };
         const dhex = digest.toHex();
         const dhex_dup = gpa.dupe(u8, dhex[0..]) catch return SessionError.OutOfMemory;
         dto.* = .{ .path = rel, .digest = dhex_dup, .size = f.size, .mode = f.mode };
+        dto_count += 1;
     }
-    defer for (dtos) |dto| gpa.free(dto.digest);
 
-    const body = std.json.Stringify.valueAlloc(gpa, SessionManifestJson{ .format = 1, .files = dtos }, .{}) catch return SessionError.OutOfMemory;
+    const body = std.json.Stringify.valueAlloc(gpa, SessionManifestJson{ .format = 1, .files = dtos[0..dto_count] }, .{}) catch return SessionError.OutOfMemory;
     defer gpa.free(body);
     const manifest_digest = store.putBytes(io, body, .incremental) catch |e| {
         if (e == error.StoreFull) return; // drop the session silently
@@ -641,7 +655,9 @@ pub fn ingestSession(
     man_tags[tags.len] = .{ .key = "user.session", .value = hex };
     man_tags[tags.len + 1] = .{ .key = "user.session_manifest", .value = hex };
     store.tagObject(io, manifest_digest, man_tags) catch |e| {
-        if (e == error.StoreFull) return; // drop the session silently
+        // Same hint-drop rule as the blob tags above (identical session
+        // manifests across builds share one object under different keys).
+        if (e == error.StoreFull or e == error.TagLimit) return;
         return e;
     };
 }
