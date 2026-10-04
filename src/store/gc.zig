@@ -3,6 +3,7 @@ const root = @import("root.zig");
 const scan = @import("scan.zig");
 const state = @import("state.zig");
 const objects = @import("objects.zig");
+const action_cache = @import("action_cache.zig");
 const manifest_mod = @import("manifest.zig");
 const disk_usage = @import("disk_usage.zig");
 const digest_mod = @import("digest.zig");
@@ -27,7 +28,8 @@ pub const GcReport = struct {
 };
 
 pub const GcError = error{Unexpected, OutOfMemory} || Io.Cancelable ||
-    scan.ScanError || state.StateError || disk_usage.DiskUsageError;
+    Io.Dir.Iterator.Error || scan.ScanError || state.StateError ||
+    action_cache.SweepError || disk_usage.DiskUsageError;
 
 const LiveSet = std.AutoHashMap([32]u8, void);
 
@@ -39,7 +41,6 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
 
     // -- Phase 0: roots (pins, live leases, project retains + manifests). --
     // liveLeases deletes expired lease files as a side effect (expiry).
-    // Stale action entries are swept here once Task 11 wires sweepStale in.
     var live = LiveSet.init(gpa);
     defer live.deinit();
 
@@ -75,7 +76,10 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
         }
     }
 
-    // -- Phase 1: inventory. --
+    // -- Phase 1: inventory + stale action sweep. --
+    var present_cb = PresentCtx{ .store = store, .io = io };
+    report.stale_action_entries = try action_cache.sweepStale(io, gpa, store.dir, PresentCtx.call, &present_cb);
+
     const infos = try scan.scan(store, io, gpa);
     defer gpa.free(infos);
     report.scanned_objects = infos.len;
@@ -134,6 +138,18 @@ pub fn gc(store: *root.Store, io: Io, gpa: std.mem.Allocator, policy: GcPolicy) 
 
     return report;
 }
+
+/// Callback adapter: action entries are stale when their manifest object
+/// no longer exists in either tier.
+const PresentCtx = struct {
+    store: *root.Store,
+    io: Io,
+
+    fn call(ctx: *anyopaque, d: digest_mod.Digest) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        return objects.exists(self.store, self.io, d);
+    }
+};
 
 fn isOlderThan(obj: scan.ObjectInfo, now_ms: i64, max_age_ns: u64) bool {
     const age_ns = @as(u64, @intCast(@max(0, now_ms - obj.mtime_ms))) * std.time.ns_per_ms;

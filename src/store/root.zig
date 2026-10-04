@@ -12,6 +12,7 @@ const materialize_mod = @import("materialize.zig");
 const scan_mod = @import("scan.zig");
 const state = @import("state.zig");
 const gc_mod = @import("gc.zig");
+const action_cache = @import("action_cache.zig");
 
 const Io = std.Io;
 
@@ -198,6 +199,16 @@ pub const Store = struct {
         store.lock_file.unlock(io);
     }
 
+    pub const ActionEntry = action_cache.ActionEntry;
+
+    pub fn putAction(store: *Store, io: Io, key: Digest, manifest: Digest) action_cache.PutError!void {
+        return action_cache.putAction(io, store.dir, key, manifest, Io.Timestamp.now(io, .real).toMilliseconds());
+    }
+
+    pub fn getAction(store: *Store, io: Io, gpa: std.mem.Allocator, key: Digest) action_cache.GetError!?action_cache.ActionEntry {
+        return action_cache.getAction(io, gpa, store.dir, key);
+    }
+
     fn sweepTmp(io: Io, dir: Io.Dir) OpenError!void {
         const tmp = try dir.openDir(io, layout.tmp_dir, .{ .iterate = true });
         defer tmp.close(io);
@@ -246,4 +257,5 @@ test {
     _ = @import("scan.zig");
     _ = @import("state.zig");
     _ = @import("gc.zig");
+    _ = @import("action_cache.zig");
 }
