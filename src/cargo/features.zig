@@ -368,7 +368,7 @@ pub fn pruneOptional(
         for (pn.deps) |d| {
             if (allowed == null or !allowed.?.contains(d.name)) continue;
             for (graph.nodes, 0..) |cn, ci| {
-                if (keep[ci]) break;
+                if (keep[ci]) continue;
                 if (std.mem.eql(u8, cn.name, d.name) and cn.version.eql(d.version) and sourceEql(cn.source, d.source)) {
                     keep[ci] = true;
                     stack.append(gpa, ci) catch return OOM;
