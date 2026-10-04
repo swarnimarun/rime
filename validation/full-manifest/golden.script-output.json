@@ -1,0 +1,7 @@
+{
+  "package": "full-manifest",
+  "cfgs": ["has_build_script"],
+  "rerun_if_changed": [],
+  "link_libs": [],
+  "metadata": {}
+}
