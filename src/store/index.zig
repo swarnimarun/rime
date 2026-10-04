@@ -260,6 +260,55 @@ pub fn objectCount(idx: *Index) DbError!u64 {
     return @intCast(c.sqlite3_column_int64(stmt, 0));
 }
 
+pub fn deleteObject(idx: *Index, digest: *const [64]u8) DbError!void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db, "DELETE FROM objects WHERE digest=?1;", -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, digest);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
+pub fn setTier(idx: *Index, digest: *const [64]u8, tier: Tier, compressed_size: ?u64) DbError!void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db,
+        "UPDATE objects SET tier=?1, compressed_size=?2 WHERE digest=?3;", -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, if (tier == .hot) "hot" else if (tier == .cold) "cold" else "both");
+    if (compressed_size) |cs| {
+        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(cs));
+    } else {
+        _ = c.sqlite3_bind_null(stmt, 2);
+    }
+    bindText(stmt, 3, digest);
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.DbStep;
+}
+
+/// Null when the digest is not indexed. Caller frees `row.kind` with `gpa.free`.
+pub fn getObject(idx: *Index, gpa: std.mem.Allocator, digest: *const [64]u8) DbError!?ObjectRow {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(idx.db,
+        "SELECT size,compressed_size,tier,kind,created_ms,last_access_ms FROM objects WHERE digest=?1;",
+        -1, &stmt, null) != c.SQLITE_OK)
+        return error.DbPrepare;
+    defer _ = c.sqlite3_finalize(stmt);
+    bindText(stmt, 1, digest);
+    if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+    return ObjectRow{
+        .digest = digest.*,
+        .size = @intCast(c.sqlite3_column_int64(stmt, 0)),
+        .compressed_size = if (c.sqlite3_column_type(stmt, 1) == c.SQLITE_NULL)
+            null
+        else
+            @intCast(c.sqlite3_column_int64(stmt, 1)),
+        .tier = if (std.mem.eql(u8, std.mem.span(c.sqlite3_column_text(stmt, 2)), "hot")) .hot else if (std.mem.eql(u8, std.mem.span(c.sqlite3_column_text(stmt, 2)), "cold")) .cold else .both,
+        .kind = try gpa.dupe(u8, std.mem.span(c.sqlite3_column_text(stmt, 3))),
+        .created_ms = c.sqlite3_column_int64(stmt, 4),
+        .last_access_ms = c.sqlite3_column_int64(stmt, 5),
+    };
+}
+
 test "index opens inside a store dir and creates the schema" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{});
@@ -342,4 +391,32 @@ test "touchObject moves the row to the back of lru" {
     const rows = try lruCandidates(&idx, std.testing.allocator, .cold, 10);
     defer freeRows(std.testing.allocator, rows);
     try std.testing.expectEqual(@as(i64, 9999), rows[0].last_access_ms);
+}
+
+test "deleteObject and setTier round trip" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var idx = try Index.open(io, tmp.dir);
+    defer idx.close();
+
+    const digest_d: [64]u8 = [_]u8{'d'} ** 64;
+    try upsertObject(&idx, .{
+        .digest = digest_d,
+        .size = 100,
+        .compressed_size = null,
+        .tier = .hot,
+        .kind = "obj",
+        .created_ms = 1000,
+        .last_access_ms = 1000,
+    });
+    try setTier(&idx, &digest_d, .cold, 30);
+    const got = try getObject(&idx, std.testing.allocator, &digest_d);
+    try std.testing.expect(got != null);
+    defer if (got) |r| std.testing.allocator.free(r.kind);
+    try std.testing.expect(got.?.tier == .cold);
+    try std.testing.expectEqual(@as(?u64, 30), got.?.compressed_size);
+    try deleteObject(&idx, &digest_d);
+    const gone = try getObject(&idx, std.testing.allocator, &digest_d);
+    try std.testing.expect(gone == null);
 }

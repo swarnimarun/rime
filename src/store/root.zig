@@ -15,6 +15,7 @@ pub const state = @import("state.zig");
 const gc_mod = @import("gc.zig");
 const action_cache = @import("action_cache.zig");
 const cold_mod = @import("cold.zig");
+const index_mod = @import("index.zig");
 
 const Io = std.Io;
 
@@ -34,13 +35,14 @@ pub const Store = struct {
     config: config_mod.Config,
     limits: config_mod.ResolvedLimits,
     lock_file: Io.File,
+    index: index_mod.Index,
 
     pub const OpenError = error{
         UnknownFormat,
         StatFsFailed,
         Unexpected,
         OutOfMemory,
-    } || Io.Cancelable || Io.Dir.CreateDirPathError || Io.File.OpenError || Io.File.Writer.Error || Io.Dir.ReadFileAllocError || Io.Dir.WriteFileError || Io.Dir.OpenError || Io.File.LockError || Io.Dir.StatFileError || Io.Dir.DeleteFileError || Io.Dir.Iterator.Error || disk_usage_mod.DiskUsageError;
+    } || Io.Cancelable || Io.Dir.CreateDirPathError || Io.File.OpenError || Io.File.Writer.Error || Io.Dir.ReadFileAllocError || Io.Dir.WriteFileError || Io.Dir.OpenError || Io.File.LockError || Io.Dir.StatFileError || Io.Dir.DeleteFileError || Io.Dir.Iterator.Error || Io.Dir.RealPathError || disk_usage_mod.DiskUsageError || index_mod.DbError;
 
     /// Opens (creating if needed) a store rooted at `dir`. Holds a shared
     /// advisory lock on format-lock until close. Spec: docs/design/storage.md §6, §8.
@@ -79,16 +81,21 @@ pub const Store = struct {
         const lock = try dir.createFile(io, layout.lock_file, .{ .read = true, .truncate = false });
         try lock.lock(io, .shared);
 
+        var index = try index_mod.Index.open(io, dir);
+        errdefer index.close();
+
         const usage = try disk_usage_mod.readDiskUsage(io, dir);
         return .{
             .dir = dir,
             .config = cfg,
             .limits = config_mod.resolveLimits(cfg, usage),
             .lock_file = lock,
+            .index = index,
         };
     }
 
     pub fn close(store: *Store, io: Io) void {
+        store.index.close();
         store.lock_file.unlock(io);
         store.lock_file.close(io);
         store.* = undefined;
@@ -336,6 +343,13 @@ test "store open refuses unknown format version" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "format.json", .data = "{\"format\":99}" });
     try std.testing.expectError(error.UnknownFormat, Store.open(io, tmp.dir, .{}));
+}
+
+test "v2 store open wires the index" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var ts = test_support.openTestStore(io, .{});
+    defer ts.deinit(io);
+    try std.testing.expect(try ts.store.index.tableExists("objects"));
 }
 
 test {
