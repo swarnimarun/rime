@@ -1,0 +1,26 @@
+feature-matrix v0.1.0 (@VALIDATION_ROOT@/feature-matrix)
+anyhow feature "default"
+anyhow v1.0.104
+anyhow feature "std"
+anyhow v1.0.104
+libc feature "default"
+libc v0.2.190
+libc feature "std"
+libc v0.2.190
+serde_json feature "default"
+serde_json v1.0.151
+memchr v2.8.3
+serde_core v1.0.229
+itoa feature "default"
+itoa v1.0.18
+zmij feature "default"
+zmij v1.0.23
+serde_json feature "std"
+serde_json v1.0.151 (*)
+memchr feature "std"
+memchr v2.8.3
+memchr feature "alloc"
+memchr v2.8.3
+serde_core feature "std"
+serde_core v1.0.229
+serde_json feature "default" (*)

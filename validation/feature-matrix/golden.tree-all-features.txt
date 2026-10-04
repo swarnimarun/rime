@@ -1,0 +1,150 @@
+feature-matrix v0.1.0 (@VALIDATION_ROOT@/feature-matrix)
+├── anyhow v1.0.104
+├── libc v0.2.190
+├── serde v1.0.229
+│   ├── serde_core v1.0.229
+│   └── serde_derive v1.0.229 (proc-macro)
+│       ├── proc-macro2 v1.0.107
+│       │   └── unicode-ident v1.0.26
+│       ├── quote v1.0.47
+│       │   └── proc-macro2 v1.0.107 (*)
+│       └── syn v3.0.6
+│           ├── proc-macro2 v1.0.107 (*)
+│           ├── quote v1.0.47 (*)
+│           └── unicode-ident v1.0.26
+├── serde_json v1.0.151
+│   ├── itoa v1.0.18
+│   ├── memchr v2.8.3
+│   ├── serde_core v1.0.229
+│   └── zmij v1.0.23
+├── tokio v1.53.2
+│   ├── bytes v1.12.1
+│   ├── libc v0.2.190
+│   ├── mio v1.2.4
+│   │   └── libc v0.2.190
+│   ├── parking_lot v0.12.5
+│   │   ├── lock_api v0.4.14
+│   │   │   └── scopeguard v1.2.0
+│   │   └── parking_lot_core v0.9.12
+│   │       ├── cfg-if v1.0.5
+│   │       ├── libc v0.2.190
+│   │       └── smallvec v1.16.2
+│   ├── pin-project-lite v0.2.17
+│   ├── signal-hook-registry v1.4.8
+│   │   ├── errno v0.3.14
+│   │   │   └── libc v0.2.190
+│   │   └── libc v0.2.190
+│   ├── socket2 v0.6.5
+│   │   └── libc v0.2.190
+│   └── tokio-macros v2.7.2 (proc-macro)
+│       ├── proc-macro2 v1.0.107 (*)
+│       ├── quote v1.0.47 (*)
+│       └── syn v3.0.6 (*)
+└── ureq v2.12.1
+    ├── base64 v0.22.1
+    ├── flate2 v1.1.10
+    │   ├── crc32fast v1.5.2
+    │   │   └── cfg-if v1.0.5
+    │   └── miniz_oxide v0.9.1
+    │       ├── adler2 v2.0.1
+    │       └── simd-adler32 v0.3.10
+    ├── log v0.4.34
+    ├── once_cell v1.21.4
+    ├── rustls v0.23.45
+    │   ├── log v0.4.34
+    │   ├── once_cell v1.21.4
+    │   ├── ring v0.17.14
+    │   │   ├── cfg-if v1.0.5
+    │   │   ├── getrandom v0.2.17
+    │   │   │   ├── cfg-if v1.0.5
+    │   │   │   └── libc v0.2.190
+    │   │   ├── libc v0.2.190
+    │   │   └── untrusted v0.9.0
+    │   │   [build-dependencies]
+    │   │   └── cc v1.6.0
+    │   │       ├── find-msvc-tools v0.1.14
+    │   │       └── shlex v2.0.1
+    │   ├── rustls-pki-types v1.15.1
+    │   │   └── zeroize v1.9.0
+    │   ├── rustls-webpki v0.103.15
+    │   │   ├── ring v0.17.14 (*)
+    │   │   ├── rustls-pki-types v1.15.1 (*)
+    │   │   └── untrusted v0.9.0
+    │   ├── subtle v2.6.1
+    │   └── zeroize v1.9.0
+    ├── rustls-pki-types v1.15.1 (*)
+    ├── url v2.5.8
+    │   ├── form_urlencoded v1.2.2
+    │   │   └── percent-encoding v2.3.2
+    │   ├── idna v1.1.0
+    │   │   ├── idna_adapter v1.2.2
+    │   │   │   ├── icu_normalizer v2.3.0
+    │   │   │   │   ├── icu_collections v2.3.0
+    │   │   │   │   │   ├── displaydoc v0.2.7 (proc-macro)
+    │   │   │   │   │   │   ├── proc-macro2 v1.0.107 (*)
+    │   │   │   │   │   │   ├── quote v1.0.47 (*)
+    │   │   │   │   │   │   └── syn v3.0.6 (*)
+    │   │   │   │   │   ├── potential_utf v0.1.6
+    │   │   │   │   │   │   └── zerovec v0.11.8
+    │   │   │   │   │   │       ├── yoke v0.8.3
+    │   │   │   │   │   │       │   ├── stable_deref_trait v1.2.1
+    │   │   │   │   │   │       │   ├── yoke-derive v0.8.4 (proc-macro)
+    │   │   │   │   │   │       │   │   ├── proc-macro2 v1.0.107 (*)
+    │   │   │   │   │   │       │   │   ├── quote v1.0.47 (*)
+    │   │   │   │   │   │       │   │   ├── syn v3.0.6 (*)
+    │   │   │   │   │   │       │   │   └── synstructure v0.14.0
+    │   │   │   │   │   │       │   │       ├── proc-macro2 v1.0.107 (*)
+    │   │   │   │   │   │       │   │       ├── quote v1.0.47 (*)
+    │   │   │   │   │   │       │   │       └── syn v3.0.6 (*)
+    │   │   │   │   │   │       │   └── zerofrom v0.1.8
+    │   │   │   │   │   │       │       └── zerofrom-derive v0.1.8 (proc-macro)
+    │   │   │   │   │   │       │           ├── proc-macro2 v1.0.107 (*)
+    │   │   │   │   │   │       │           ├── quote v1.0.47 (*)
+    │   │   │   │   │   │       │           ├── syn v3.0.6 (*)
+    │   │   │   │   │   │       │           └── synstructure v0.14.0 (*)
+    │   │   │   │   │   │       ├── zerofrom v0.1.8 (*)
+    │   │   │   │   │   │       └── zerovec-derive v0.11.6 (proc-macro)
+    │   │   │   │   │   │           ├── proc-macro2 v1.0.107 (*)
+    │   │   │   │   │   │           ├── quote v1.0.47 (*)
+    │   │   │   │   │   │           └── syn v3.0.6 (*)
+    │   │   │   │   │   ├── utf8_iter v1.0.4
+    │   │   │   │   │   ├── yoke v0.8.3 (*)
+    │   │   │   │   │   ├── zerofrom v0.1.8 (*)
+    │   │   │   │   │   └── zerovec v0.11.8 (*)
+    │   │   │   │   ├── icu_normalizer_data v2.3.0
+    │   │   │   │   ├── icu_provider v2.3.1
+    │   │   │   │   │   ├── displaydoc v0.2.7 (proc-macro) (*)
+    │   │   │   │   │   ├── icu_locale_core v2.3.0
+    │   │   │   │   │   │   ├── displaydoc v0.2.7 (proc-macro) (*)
+    │   │   │   │   │   │   ├── litemap v0.8.3
+    │   │   │   │   │   │   ├── tinystr v0.8.4
+    │   │   │   │   │   │   │   ├── displaydoc v0.2.7 (proc-macro) (*)
+    │   │   │   │   │   │   │   └── zerovec v0.11.8 (*)
+    │   │   │   │   │   │   ├── writeable v0.6.4
+    │   │   │   │   │   │   └── zerovec v0.11.8 (*)
+    │   │   │   │   │   ├── writeable v0.6.4
+    │   │   │   │   │   ├── yoke v0.8.3 (*)
+    │   │   │   │   │   ├── zerofrom v0.1.8 (*)
+    │   │   │   │   │   ├── zerotrie v0.2.5
+    │   │   │   │   │   │   ├── displaydoc v0.2.7 (proc-macro) (*)
+    │   │   │   │   │   │   ├── yoke v0.8.3 (*)
+    │   │   │   │   │   │   └── zerofrom v0.1.8 (*)
+    │   │   │   │   │   └── zerovec v0.11.8 (*)
+    │   │   │   │   ├── smallvec v1.16.2
+    │   │   │   │   └── zerovec v0.11.8 (*)
+    │   │   │   └── icu_properties v2.3.0
+    │   │   │       ├── displaydoc v0.2.7 (proc-macro) (*)
+    │   │   │       ├── icu_collections v2.3.0 (*)
+    │   │   │       ├── icu_locale_core v2.3.0 (*)
+    │   │   │       ├── icu_properties_data v2.3.0
+    │   │   │       ├── icu_provider v2.3.1 (*)
+    │   │   │       ├── zerotrie v0.2.5 (*)
+    │   │   │       └── zerovec v0.11.8 (*)
+    │   │   ├── smallvec v1.16.2
+    │   │   └── utf8_iter v1.0.4
+    │   └── percent-encoding v2.3.2
+    └── webpki-roots v0.26.11
+        └── webpki-roots v1.0.9
+            └── rustls-pki-types v1.15.1 (*)
+[dev-dependencies]
+└── serde_json v1.0.151 (*)

@@ -1,0 +1,89 @@
+[package]
+name = "full-manifest"
+version = "0.3.1"
+edition = "2021"
+description = "Breadth fixture: most Cargo.toml sections a real crate uses."
+license = "MIT OR Apache-2.0"
+repository = "https://example.com/rime/full-manifest"
+homepage = "https://example.com/rime"
+documentation = "https://docs.rs/full-manifest"
+readme = "README.md"
+keywords = ["fixture", "manifest", "conformance"]
+categories = ["development-tools::testing"]
+authors = ["Rime Validation <rime@example.com>"]
+rust-version = "1.77"
+build = "build.rs"
+publish = false
+exclude = ["/private-notes"]
+
+[workspace]
+
+[lib]
+name = "full_manifest"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "full-manifest-tool"
+path = "src/bin/tool.rs"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
+
+[[bench]]
+name = "hash_bench"
+path = "benches/hash_bench.rs"
+harness = false
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+smallvec = "1"
+anyhow = "1"
+
+[dev-dependencies]
+serde_json = "1"
+
+[build-dependencies]
+serde = { version = "1" }
+
+[features]
+default = ["std"]
+std = []
+extra = ["dep:serde_json"]
+
+[dependencies.serde_json]
+version = "1"
+optional = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = false
+codegen-units = 16
+
+[profile.dev.package."*"]
+opt-level = 0
+
+[profile.release.package."*"]
+opt-level = 3
+
+[package.metadata.rime]
+conformance-suite = "full-manifest"
+notes = "package.metadata must be tolerated and ignored by rime"
+
+[package.metadata.docsrs]
+all-features = true
+
+[patch.crates-io]
+smallvec = { path = "patched-smallvec" }

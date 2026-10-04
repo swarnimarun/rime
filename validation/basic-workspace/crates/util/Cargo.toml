@@ -1,0 +1,12 @@
+[package]
+name = "util"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "util"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "cli-bin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cli-bin"
+path = "src/main.rs"
+
+[dependencies]
+core-lib.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json = "1"

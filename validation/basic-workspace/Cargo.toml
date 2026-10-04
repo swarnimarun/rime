@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/core-lib", "crates/cli-bin", "crates/util"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Rime Validation <rime@example.com>"]
+repository = "https://example.com/rime/basic-workspace"
+
+[workspace.dependencies]
+core-lib = { path = "crates/core-lib", version = "0.1.0" }
+util = { path = "crates/util", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"

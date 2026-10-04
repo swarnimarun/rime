@@ -1,0 +1,15 @@
+[package]
+name = "lockfile-golden"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Resolver/lockfile golden: pinned well-known crates.io deps."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

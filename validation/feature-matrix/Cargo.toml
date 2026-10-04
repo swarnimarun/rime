@@ -1,0 +1,36 @@
+[package]
+name = "feature-matrix"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Feature unification matrix: optional deps, renames, target deps, weak deps."
+resolver = "2"
+
+[features]
+default = ["json"]
+json = ["dep:serde_json"]
+tls = ["dep:tokio", "tokio/full"]
+# Weak dependency: enables `simd` only if `serde` is already enabled elsewhere.
+simd-json = ["serde?/derive"]
+full = ["json", "tls", "simd-json"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+tokio = { version = "1", features = ["rt"], optional = true }
+anyhow = "1"
+# Renamed dependency: `http_client` in code maps to crates.io `ureq`.
+http_client = { package = "ureq", version = "2", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lib]
+name = "feature_matrix"
+path = "src/lib.rs"

@@ -1,0 +1,31 @@
+lockfile-golden v0.1.0 (@VALIDATION_ROOT@/lockfile-golden)
+├── anyhow v1.0.104
+├── libc v0.2.190
+├── serde v1.0.229
+│   ├── serde_core v1.0.229
+│   └── serde_derive v1.0.229 (proc-macro)
+│       ├── proc-macro2 v1.0.107
+│       │   └── unicode-ident v1.0.26
+│       ├── quote v1.0.47
+│       │   └── proc-macro2 v1.0.107 (*)
+│       └── syn v3.0.6
+│           ├── proc-macro2 v1.0.107 (*)
+│           ├── quote v1.0.47 (*)
+│           └── unicode-ident v1.0.26
+└── serde_json v1.0.151
+    ├── itoa v1.0.18
+    ├── memchr v2.8.3
+    ├── serde_core v1.0.229
+    └── zmij v1.0.23
+[dev-dependencies]
+└── tempfile v3.27.0
+    ├── fastrand v2.5.0
+    ├── getrandom v0.4.3
+    │   ├── cfg-if v1.0.5
+    │   └── libc v0.2.190
+    ├── once_cell v1.21.4
+    └── rustix v1.1.5
+        ├── bitflags v2.13.2
+        ├── errno v0.3.14
+        │   └── libc v0.2.190
+        └── libc v0.2.190

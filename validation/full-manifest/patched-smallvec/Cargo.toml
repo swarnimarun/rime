@@ -1,0 +1,10 @@
+[package]
+name = "smallvec"
+version = "1.15.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Local path patch overriding crates.io smallvec for the breadth fixture."
+
+[lib]
+name = "smallvec"
+path = "src/lib.rs"

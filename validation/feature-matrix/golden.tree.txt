@@ -1,0 +1,10 @@
+feature-matrix v0.1.0 (@VALIDATION_ROOT@/feature-matrix)
+├── anyhow v1.0.104
+├── libc v0.2.190
+└── serde_json v1.0.151
+    ├── itoa v1.0.18
+    ├── memchr v2.8.3
+    ├── serde_core v1.0.229
+    └── zmij v1.0.23
+[dev-dependencies]
+└── serde_json v1.0.151 (*)
